@@ -1,27 +1,33 @@
 #![windows_subsystem = "windows"]
 
-use std::cell::RefCell;
-use std::collections::{HashMap, VecDeque};
+use std::collections::HashMap;
 use std::mem::size_of;
 use std::path::{Path, PathBuf};
-use std::rc::Rc;
+use std::sync::mpsc::{self, Receiver, Sender};
+use std::sync::{Arc, Mutex};
+use std::thread;
 use std::time::{Duration, Instant};
 
 use desklite_core::{
-    DEFAULT_BACKDROP_ALPHA, DisplayTopology, FenceKind, FenceSpec, NativeLayoutConfig, Rect,
-    TopologyError, load_native_layout, save_native_layout,
+    DEFAULT_BACKDROP_ALPHA, DisplayTopology, FenceKind, FenceSpec, MIN_FENCE_HEIGHT,
+    MIN_FENCE_WIDTH, NativeLayoutConfig, Rect, TopologyError, load_native_layout, nearest_monitor,
+    save_native_layout,
 };
 use desklite_legacy::{LegacyOptions, legacy_to_native, load_legacy_dir};
-use desklite_ui::fence_window::{LayoutQueryContext, WM_APP_PROCESS_ACTIONS};
-use desklite_ui::{FenceAction, FenceWindow, SharedUiResources, prompt_fence_name};
-use desklite_win32::{
-    FolderWatcher, TrayIcon, WM_APP_PORTAL_DIRTY, WM_APP_TRAY, enable_per_monitor_dpi_v2,
-    launch_item, pick_folder_dialog, probe_display_topology, resolve_dropped_item,
-    reveal_in_explorer, scan_portal_directory,
+use desklite_ui::fence_view::{FenceCommand, RenamePrompt};
+use desklite_ui::{
+    COLLAPSED_HEIGHT, SharedFenceState, configure_egui_theme, install_chinese_fonts,
+    render_fence_viewport,
 };
+use desklite_win32::{
+    FolderWatcher, IconCache, TrayIcon, WM_APP_PORTAL_DIRTY, WM_APP_TRAY,
+    enable_per_monitor_dpi_v2, pick_folder_dialog, probe_display_topology,
+    scan_portal_directory, strip_alt_tab_from_host,
+};
+use egui::{Pos2, Vec2, ViewportBuilder, ViewportCommand, ViewportId, WindowLevel};
+use raw_window_handle::{HasWindowHandle, RawWindowHandle};
 use windows::Win32::Foundation::{
-    CloseHandle, ERROR_ALREADY_EXISTS, GetLastError, HANDLE, HWND, LPARAM, LRESULT, POINT, RECT,
-    WPARAM,
+    CloseHandle, ERROR_ALREADY_EXISTS, GetLastError, HANDLE, HWND, LPARAM, LRESULT, POINT, WPARAM,
 };
 use windows::Win32::System::Com::{COINIT_APARTMENTTHREADED, CoInitializeEx, CoUninitialize};
 use windows::Win32::System::LibraryLoader::GetModuleHandleW;
@@ -29,18 +35,20 @@ use windows::Win32::System::Threading::CreateMutexW;
 use windows::Win32::UI::Shell::ShellExecuteW;
 use windows::Win32::UI::WindowsAndMessaging::{
     AppendMenuW, CREATESTRUCTW, CreatePopupMenu, CreateWindowExW, DefWindowProcW, DestroyMenu,
-    DestroyWindow, DispatchMessageW, GetCursorPos, GetMessageW, GetWindowLongPtrW, GetWindowRect,
-    GWLP_USERDATA, KillTimer, MSG, MF_SEPARATOR, MF_STRING, PBT_APMRESUMEAUTOMATIC,
-    PostQuitMessage, RegisterClassExW, SW_SHOWNORMAL, SetForegroundWindow, SetTimer,
-    SetWindowLongPtrW, TPM_BOTTOMALIGN, TPM_LEFTALIGN, TPM_RETURNCMD, TrackPopupMenuEx,
-    TranslateMessage, WM_CREATE, WM_DESTROY, WM_DISPLAYCHANGE, WM_DPICHANGED, WM_ENDSESSION,
-    WM_POWERBROADCAST, WM_QUERYENDSESSION, WM_RBUTTONUP, WM_SETTINGCHANGE, WM_TIMER, WNDCLASSEXW,
-    WS_EX_TOOLWINDOW, WS_POPUP,
+    DestroyWindow, DispatchMessageW, GetCursorPos, GetMessageW, GetWindowLongPtrW, GWLP_USERDATA,
+    KillTimer, MF_SEPARATOR, MF_STRING, MSG, PBT_APMRESUMEAUTOMATIC, PostMessageW, PostQuitMessage,
+    RegisterClassExW, SW_SHOWNORMAL, SetForegroundWindow, SetTimer, SetWindowLongPtrW,
+    TPM_BOTTOMALIGN, TPM_LEFTALIGN, TPM_RETURNCMD, TrackPopupMenuEx, TranslateMessage, WM_APP,
+    WM_CREATE, WM_DESTROY, WM_DISPLAYCHANGE, WM_DPICHANGED, WM_ENDSESSION, WM_POWERBROADCAST,
+    WM_QUERYENDSESSION, WM_RBUTTONUP, WM_SETTINGCHANGE, WM_TIMER, WNDCLASSEXW, WS_EX_TOOLWINDOW,
+    WS_POPUP,
 };
 use windows::core::{HSTRING, w};
 
 const DISPLAY_DEBOUNCE_TIMER: usize = 101;
 const DISPLAY_DEBOUNCE_MS: u32 = 150;
+const WM_APP_SYNC_WATCHERS: u32 = WM_APP + 20;
+const WM_APP_SHUTDOWN: u32 = WM_APP + 21;
 
 const TRAY_CMD_NEW_BLANK: u32 = 1001;
 const TRAY_CMD_NEW_PORTAL: u32 = 1002;
@@ -60,7 +68,8 @@ impl Drop for SingleInstanceGuard {
 }
 
 fn acquire_single_instance() -> Option<SingleInstanceGuard> {
-    let handle = unsafe { CreateMutexW(None, false, w!("Local\\DeskLiteAppSingleInstance")) }.ok()?;
+    let handle =
+        unsafe { CreateMutexW(None, false, w!("Local\\DeskLiteAppSingleInstance")) }.ok()?;
     if unsafe { GetLastError() } == ERROR_ALREADY_EXISTS {
         unsafe {
             let _ = CloseHandle(handle);
@@ -80,32 +89,19 @@ fn default_deskgo_dir() -> PathBuf {
     PathBuf::from(appdata).join("Tencent").join("DeskGo")
 }
 
-fn load_or_bootstrap_layout(
-    layout_path: &Path,
-    topo: &DisplayTopology,
-) -> NativeLayoutConfig {
-    if layout_path.exists()
-        && let Ok(mut cfg) = load_native_layout(layout_path)
-    {
-        let _ = cfg.apply_topology(topo, (72, 72));
-        return cfg;
+fn refresh_all_portals(cfg: &mut NativeLayoutConfig) {
+    for f in &mut cfg.fences {
+        if let Some(ref dir) = f.portal_dir {
+            f.items = scan_portal_directory(Path::new(dir));
+        }
     }
+}
 
-    let deskgo_dir = default_deskgo_dir();
-    if deskgo_dir.join("FencesDataFile.dat").exists()
-        && let Ok(bundle) = load_legacy_dir(&deskgo_dir, &LegacyOptions::default())
-        && let Ok(mut cfg) = legacy_to_native(&bundle, Some(topo))
-    {
-        let _ = cfg.apply_topology(topo, (72, 72));
-        let _ = save_native_layout(layout_path, &cfg);
-        return cfg;
-    }
-
+fn create_starter_fence(topo: &DisplayTopology) -> FenceSpec {
     let work = topo.primary().work_area;
     let right = (work.right - 24).max(work.left + 320);
     let left = (right - 300).max(work.left);
-    let mut cfg = NativeLayoutConfig::default();
-    cfg.fences.push(FenceSpec {
+    FenceSpec {
         id: 101,
         name: "桌面整理".to_string(),
         kind: FenceKind::IconGrid,
@@ -114,375 +110,88 @@ fn load_or_bootstrap_layout(
         portal_dir: None,
         backdrop_alpha: DEFAULT_BACKDROP_ALPHA,
         items: Vec::new(),
-    });
+    }
+}
+
+fn load_or_bootstrap_layout(layout_path: &Path, topo: &DisplayTopology) -> NativeLayoutConfig {
+    if layout_path.exists()
+        && let Ok(mut cfg) = load_native_layout(layout_path)
+    {
+        let sanitized = cfg.sanitize_legacy_containers();
+        if cfg.fences.is_empty() {
+            cfg.fences.push(create_starter_fence(topo));
+        }
+        let _ = cfg.apply_topology(topo, (72, 72));
+        refresh_all_portals(&mut cfg);
+        if sanitized {
+            let _ = save_native_layout(layout_path, &cfg);
+        }
+        return cfg;
+    }
+
+    let deskgo_dir = default_deskgo_dir();
+    if deskgo_dir.join("FencesDataFile.dat").exists()
+        && let Ok(bundle) = load_legacy_dir(&deskgo_dir, &LegacyOptions::default())
+        && let Ok(mut cfg) = legacy_to_native(&bundle, Some(topo))
+    {
+        let _ = cfg.sanitize_legacy_containers();
+        if cfg.fences.is_empty() {
+            cfg.fences.push(create_starter_fence(topo));
+        }
+        let _ = cfg.apply_topology(topo, (72, 72));
+        refresh_all_portals(&mut cfg);
+        let _ = save_native_layout(layout_path, &cfg);
+        return cfg;
+    }
+
+    let mut cfg = NativeLayoutConfig::default();
+    cfg.fences.push(create_starter_fence(topo));
     let _ = cfg.apply_topology(topo, (72, 72));
     let _ = save_native_layout(layout_path, &cfg);
     cfg
 }
 
-struct AppController {
+#[derive(Debug, Clone)]
+enum BgEvent {
+    TopologyChanged(DisplayTopology),
+    PortalDirty(i32),
+    TrayNewBlank,
+    TrayNewPortal(String),
+    TrayRealign,
+    BindPortalResult(i32, String),
+    FlushAndExit,
+}
+
+struct HelperState {
     hwnd: HWND,
     layout_path: PathBuf,
-    config: NativeLayoutConfig,
-    topology: DisplayTopology,
-    shared_ui: Rc<RefCell<SharedUiResources>>,
-    pending_actions: Rc<RefCell<VecDeque<FenceAction>>>,
-    query_ctx: Rc<RefCell<LayoutQueryContext>>,
-    windows: HashMap<i32, FenceWindow>,
+    shared: Arc<Mutex<SharedFenceState>>,
+    tx: Sender<BgEvent>,
+    egui_ctx: egui::Context,
     watchers: HashMap<i32, FolderWatcher>,
     last_display_event: Instant,
 }
 
-impl AppController {
-    fn sync_query_context(&self) {
-        let mut q = self.query_ctx.borrow_mut();
-        q.monitors = self.topology.monitors().to_vec();
-        q.fence_rects = self
-            .config
-            .fences
-            .iter()
-            .map(|f| (f.id, f.rect))
-            .collect();
-        q.snap_threshold_px = self.config.preferences.snap_threshold_px;
-        q.cell_w = self.config.preferences.icon_cell_w;
-        q.cell_h = self.config.preferences.icon_cell_h;
-    }
-
-    fn persist_now(&self) {
-        let _ = save_native_layout(&self.layout_path, &self.config);
-    }
-
-    fn refresh_portal_items(&mut self, fence_id: i32) {
-        if let Some(f) = self.config.fence_mut(fence_id)
-            && let Some(ref dir) = f.portal_dir
-        {
-            f.items = scan_portal_directory(Path::new(dir));
-        }
-    }
-
+impl HelperState {
     fn rebuild_watchers(&mut self) {
         self.watchers.clear();
-        for f in &self.config.fences {
-            if let Some(ref dir) = f.portal_dir
-                && let Some(w) = FolderWatcher::start(f.id, Path::new(dir), self.hwnd)
-            {
-                self.watchers.insert(f.id, w);
-            }
-        }
-    }
-
-    fn sync_all_windows(&mut self) {
-        let valid_ids: Vec<i32> = self.config.fences.iter().map(|f| f.id).collect();
-        self.windows.retain(|id, _| valid_ids.contains(id));
-
-        for f in &mut self.config.fences {
-            if let Some(ref dir) = f.portal_dir {
-                f.items = scan_portal_directory(Path::new(dir));
-            }
-        }
-        self.sync_query_context();
-
-        for f in &self.config.fences {
-            if let Some(win) = self.windows.get_mut(&f.id) {
-                win.update_spec(f.clone());
-            } else if let Ok(win) = FenceWindow::create(f.clone(), Rc::clone(&self.shared_ui)) {
-                self.windows.insert(f.id, win);
-            }
-        }
-        self.rebuild_watchers();
-    }
-
-    fn handle_topology_refresh(&mut self) {
-        match probe_display_topology() {
-            Ok(topo) => {
-                self.topology = topo;
-                let _ = self.config.apply_topology(&self.topology, (72, 72));
-                self.sync_all_windows();
-                self.persist_now();
-            }
-            Err(desklite_win32::Win32Error::Topology(TopologyError::EmptyTransient)) => {}
-            Err(_) => {}
-        }
-    }
-
-    fn create_blank_fence(&mut self) {
-        let Some(name) = prompt_fence_name(self.hwnd, "新建空白格子", "新建格子") else {
-            return;
+        let portals: Vec<(i32, String)> = {
+            let guard = self.shared.lock().unwrap();
+            guard
+                .config
+                .fences
+                .iter()
+                .filter_map(|f| f.portal_dir.as_ref().map(|d| (f.id, d.clone())))
+                .collect()
         };
-        let id = self.config.next_fence_id();
-        let work = self.topology.primary().work_area;
-        let offset = ((self.config.fences.len() as i32) % 6) * 28;
-        let rect = Rect::new(
-            (work.left + 80 + offset).min(work.right - 300),
-            (work.top + 80 + offset).min(work.bottom - 260),
-            (work.left + 380 + offset).min(work.right),
-            (work.top + 340 + offset).min(work.bottom),
-        );
-        self.config.upsert_fence(FenceSpec {
-            id,
-            name,
-            kind: FenceKind::IconGrid,
-            rect,
-            collapsed: false,
-            portal_dir: None,
-            backdrop_alpha: DEFAULT_BACKDROP_ALPHA,
-            items: Vec::new(),
-        });
-        let _ = self.config.apply_topology(&self.topology, (72, 72));
-        self.sync_all_windows();
-        self.persist_now();
-    }
-
-    fn create_portal_fence(&mut self) {
-        let Ok(Some(dir)) = pick_folder_dialog(self.hwnd) else {
-            return;
-        };
-        let folder_name = Path::new(&dir)
-            .file_name()
-            .map(|s| s.to_string_lossy().into_owned())
-            .filter(|s| !s.is_empty())
-            .unwrap_or_else(|| dir.clone());
-        let id = self.config.next_fence_id();
-        let work = self.topology.primary().work_area;
-        let offset = ((self.config.fences.len() as i32) % 6) * 28;
-        let rect = Rect::new(
-            (work.left + 100 + offset).min(work.right - 320),
-            (work.top + 100 + offset).min(work.bottom - 280),
-            (work.left + 420 + offset).min(work.right),
-            (work.top + 380 + offset).min(work.bottom),
-        );
-        self.config.upsert_fence(FenceSpec {
-            id,
-            name: folder_name,
-            kind: FenceKind::IconGrid,
-            rect,
-            collapsed: false,
-            portal_dir: Some(dir),
-            backdrop_alpha: DEFAULT_BACKDROP_ALPHA,
-            items: Vec::new(),
-        });
-        let _ = self.config.apply_topology(&self.topology, (72, 72));
-        self.sync_all_windows();
-        self.persist_now();
-    }
-
-    fn process_pending_actions(&mut self) {
-        loop {
-            let next = self.pending_actions.borrow_mut().pop_front();
-            let Some(action) = next else {
-                break;
-            };
-            match action {
-                FenceAction::MovedOrResized { fence_id, rect } => {
-                    if let Some(f) = self.config.fence_mut(fence_id) {
-                        f.rect = rect;
-                    }
-                    self.config.update_active_snapshot_rect(fence_id, rect);
-                    self.sync_query_context();
-                    self.persist_now();
-                }
-                FenceAction::ToggleCollapse { fence_id } => {
-                    if let Some(f) = self.config.fence_mut(fence_id) {
-                        f.collapsed = !f.collapsed;
-                        let clone = f.clone();
-                        if let Some(win) = self.windows.get_mut(&fence_id) {
-                            win.update_spec(clone);
-                        }
-                    }
-                    self.persist_now();
-                }
-                FenceAction::ToggleViewKind { fence_id } => {
-                    if let Some(f) = self.config.fence_mut(fence_id) {
-                        f.kind = match f.kind {
-                            FenceKind::FileList => FenceKind::IconGrid,
-                            _ => FenceKind::FileList,
-                        };
-                        let clone = f.clone();
-                        if let Some(win) = self.windows.get_mut(&fence_id) {
-                            win.update_spec(clone);
-                        }
-                    }
-                    self.persist_now();
-                }
-                FenceAction::RenameFence { fence_id } => {
-                    let current_name = self
-                        .config
-                        .fences
-                        .iter()
-                        .find(|f| f.id == fence_id)
-                        .map(|f| f.name.clone())
-                        .unwrap_or_default();
-                    if let Some(new_name) =
-                        prompt_fence_name(self.hwnd, "重命名格子", &current_name)
-                        && let Some(f) = self.config.fence_mut(fence_id)
-                    {
-                        f.name = new_name;
-                        let clone = f.clone();
-                        if let Some(win) = self.windows.get_mut(&fence_id) {
-                            win.update_spec(clone);
-                        }
-                        self.persist_now();
-                    }
-                }
-                FenceAction::DeleteFence { fence_id } => {
-                    if self.config.remove_fence(fence_id) {
-                        self.sync_all_windows();
-                        self.persist_now();
-                    }
-                }
-                FenceAction::CreateBlankFence => self.create_blank_fence(),
-                FenceAction::CreatePortalFence => self.create_portal_fence(),
-                FenceAction::BindPortalDir { fence_id } => {
-                    if let Ok(Some(dir)) = pick_folder_dialog(self.hwnd)
-                        && let Some(f) = self.config.fence_mut(fence_id)
-                    {
-                        f.portal_dir = Some(dir);
-                        self.sync_all_windows();
-                        self.persist_now();
-                    }
-                }
-                FenceAction::UnbindPortalDir { fence_id } => {
-                    if let Some(f) = self.config.fence_mut(fence_id) {
-                        f.portal_dir = None;
-                        self.sync_all_windows();
-                        self.persist_now();
-                    }
-                }
-                FenceAction::DropFiles { fence_id, paths } => {
-                    if let Some(f) = self.config.fence_mut(fence_id)
-                        && f.portal_dir.is_none()
-                    {
-                        let mut changed = false;
-                        for raw in paths {
-                            let exists = f
-                                .items
-                                .iter()
-                                .any(|it| it.path.eq_ignore_ascii_case(&raw));
-                            if !exists {
-                                let order = f.items.len() as i32;
-                                f.items.push(resolve_dropped_item(Path::new(&raw), order));
-                                changed = true;
-                            }
-                        }
-                        if changed {
-                            let clone = f.clone();
-                            if let Some(win) = self.windows.get_mut(&fence_id) {
-                                win.update_spec(clone);
-                            }
-                            self.persist_now();
-                        }
-                    }
-                }
-                FenceAction::ReorderOrTransferItem {
-                    from_fence_id,
-                    item_index,
-                    screen_pt,
-                } => {
-                    let target_id = self.windows.iter().find_map(|(&id, win)| {
-                        let mut wr = RECT::default();
-                        if unsafe { GetWindowRect(win.hwnd(), &mut wr) }.is_ok()
-                            && screen_pt.x >= wr.left
-                            && screen_pt.x < wr.right
-                            && screen_pt.y >= wr.top
-                            && screen_pt.y < wr.bottom
-                        {
-                            Some(id)
-                        } else {
-                            None
-                        }
-                    });
-
-                    if let Some(dst_id) = target_id {
-                        if dst_id == from_fence_id {
-                            let target_idx = self
-                                .windows
-                                .get(&dst_id)
-                                .and_then(|w| w.item_at_screen_point(screen_pt));
-                            if let Some(dst_idx) = target_idx
-                                && dst_idx != item_index
-                                && let Some(f) = self.config.fence_mut(dst_id)
-                                && f.portal_dir.is_none()
-                                && item_index < f.items.len()
-                                && dst_idx < f.items.len()
-                            {
-                                let item = f.items.remove(item_index);
-                                f.items.insert(dst_idx, item);
-                                for (idx, it) in f.items.iter_mut().enumerate() {
-                                    it.order = idx as i32;
-                                }
-                                let clone = f.clone();
-                                if let Some(win) = self.windows.get_mut(&dst_id) {
-                                    win.update_spec(clone);
-                                }
-                                self.persist_now();
-                            }
-                        } else {
-                            let can_transfer = self
-                                .config
-                                .fences
-                                .iter()
-                                .find(|f| f.id == dst_id)
-                                .is_some_and(|f| f.portal_dir.is_none());
-                            let src_is_non_portal = self
-                                .config
-                                .fences
-                                .iter()
-                                .find(|f| f.id == from_fence_id)
-                                .is_some_and(|f| f.portal_dir.is_none());
-                            if can_transfer
-                                && src_is_non_portal
-                                && let Some(src) = self.config.fence_mut(from_fence_id)
-                                && item_index < src.items.len()
-                            {
-                                let mut item = src.items.remove(item_index);
-                                for (idx, it) in src.items.iter_mut().enumerate() {
-                                    it.order = idx as i32;
-                                }
-                                if let Some(dst) = self.config.fence_mut(dst_id)
-                                    && !dst
-                                        .items
-                                        .iter()
-                                        .any(|it| it.path.eq_ignore_ascii_case(&item.path))
-                                {
-                                    item.order = dst.items.len() as i32;
-                                    dst.items.push(item);
-                                }
-                                self.sync_all_windows();
-                                self.persist_now();
-                            }
-                        }
-                    }
-                }
-                FenceAction::RemoveItem {
-                    fence_id,
-                    item_index,
-                } => {
-                    if let Some(f) = self.config.fence_mut(fence_id)
-                        && f.portal_dir.is_none()
-                        && item_index < f.items.len()
-                    {
-                        f.items.remove(item_index);
-                        for (idx, it) in f.items.iter_mut().enumerate() {
-                            it.order = idx as i32;
-                        }
-                        let clone = f.clone();
-                        if let Some(win) = self.windows.get_mut(&fence_id) {
-                            win.update_spec(clone);
-                        }
-                        self.persist_now();
-                    }
-                }
-                FenceAction::LaunchItem { path } => {
-                    let _ = launch_item(&path);
-                }
-                FenceAction::RevealItem { path } => {
-                    let _ = reveal_in_explorer(&path);
-                }
+        for (id, dir) in portals {
+            if let Some(w) = FolderWatcher::start(id, Path::new(&dir), self.hwnd) {
+                self.watchers.insert(id, w);
             }
         }
     }
 
-    fn show_tray_menu(&mut self) {
+    fn show_tray_menu(&self) {
         let Ok(menu) = (unsafe { CreatePopupMenu() }) else {
             return;
         };
@@ -528,36 +237,48 @@ impl AppController {
         }
 
         match cmd.0 as u32 {
-            TRAY_CMD_NEW_BLANK => self.create_blank_fence(),
-            TRAY_CMD_NEW_PORTAL => self.create_portal_fence(),
-            TRAY_CMD_REALIGN => self.handle_topology_refresh(),
+            TRAY_CMD_NEW_BLANK => {
+                let _ = self.tx.send(BgEvent::TrayNewBlank);
+                self.egui_ctx.request_repaint_of(ViewportId::ROOT);
+            }
+            TRAY_CMD_NEW_PORTAL => {
+                // Run modal folder picker on a dedicated STA worker so helper_wnd_proc never re-enters &mut HelperState.
+                let tx = self.tx.clone();
+                let ctx = self.egui_ctx.clone();
+                thread::spawn(move || {
+                    let _ = unsafe { CoInitializeEx(None, COINIT_APARTMENTTHREADED) };
+                    if let Ok(Some(dir)) = pick_folder_dialog(HWND::default()) {
+                        let _ = tx.send(BgEvent::TrayNewPortal(dir));
+                        ctx.request_repaint_of(ViewportId::ROOT);
+                    }
+                    unsafe {
+                        CoUninitialize();
+                    }
+                });
+            }
+            TRAY_CMD_REALIGN => {
+                let _ = self.tx.send(BgEvent::TrayRealign);
+                self.egui_ctx.request_repaint_of(ViewportId::ROOT);
+            }
             TRAY_CMD_OPEN_CONFIG_DIR => {
                 if let Some(dir) = self.layout_path.parent() {
                     let wdir = HSTRING::from(dir.to_string_lossy().as_ref());
                     unsafe {
-                        let _ = ShellExecuteW(
-                            None,
-                            w!("open"),
-                            &wdir,
-                            None,
-                            None,
-                            SW_SHOWNORMAL,
-                        );
+                        let _ =
+                            ShellExecuteW(None, w!("open"), &wdir, None, None, SW_SHOWNORMAL);
                     }
                 }
             }
             TRAY_CMD_EXIT => {
-                self.persist_now();
-                unsafe {
-                    PostQuitMessage(0);
-                }
+                let _ = self.tx.send(BgEvent::FlushAndExit);
+                self.egui_ctx.request_repaint_of(ViewportId::ROOT);
             }
             _ => {}
         }
     }
 }
 
-unsafe extern "system" fn controller_wnd_proc(
+unsafe extern "system" fn helper_wnd_proc(
     hwnd: HWND,
     msg: u32,
     wparam: WPARAM,
@@ -569,59 +290,69 @@ unsafe extern "system" fn controller_wnd_proc(
         return LRESULT(0);
     }
 
-    let ptr = unsafe { GetWindowLongPtrW(hwnd, GWLP_USERDATA) } as *mut AppController;
+    let ptr = unsafe { GetWindowLongPtrW(hwnd, GWLP_USERDATA) } as *mut HelperState;
     if ptr.is_null() {
         return unsafe { DefWindowProcW(hwnd, msg, wparam, lparam) };
     }
-    let ctrl = unsafe { &mut *ptr };
+    let st = unsafe { &mut *ptr };
 
     match msg {
-        WM_APP_PROCESS_ACTIONS => {
-            ctrl.process_pending_actions();
+        WM_APP_SYNC_WATCHERS => {
+            st.rebuild_watchers();
+            LRESULT(0)
+        }
+        WM_APP_SHUTDOWN => {
+            st.watchers.clear();
+            unsafe { PostQuitMessage(0) };
             LRESULT(0)
         }
         WM_APP_PORTAL_DIRTY => {
-            let fid = wparam.0 as i32;
-            ctrl.refresh_portal_items(fid);
-            if let Some(spec) = ctrl.config.fences.iter().find(|f| f.id == fid).cloned()
-                && let Some(win) = ctrl.windows.get_mut(&fid)
-            {
-                win.update_spec(spec);
-            }
+            let _ = st.tx.send(BgEvent::PortalDirty(wparam.0 as i32));
+            st.egui_ctx.request_repaint_of(ViewportId::ROOT);
             LRESULT(0)
         }
         WM_APP_TRAY => {
-            let event = (lparam.0 & 0xffff) as u32;
-            if event == WM_RBUTTONUP {
-                ctrl.show_tray_menu();
+            let ev = (lparam.0 & 0xffff) as u32;
+            if ev == WM_RBUTTONUP {
+                st.show_tray_menu();
             }
             LRESULT(0)
         }
         WM_DISPLAYCHANGE | WM_DPICHANGED | WM_SETTINGCHANGE => {
-            ctrl.last_display_event = Instant::now();
+            st.last_display_event = Instant::now();
             unsafe { SetTimer(Some(hwnd), DISPLAY_DEBOUNCE_TIMER, DISPLAY_DEBOUNCE_MS, None) };
             LRESULT(0)
         }
         WM_POWERBROADCAST => {
             if wparam.0 as u32 == PBT_APMRESUMEAUTOMATIC {
-                ctrl.last_display_event = Instant::now();
+                st.last_display_event = Instant::now();
                 unsafe { SetTimer(Some(hwnd), DISPLAY_DEBOUNCE_TIMER, DISPLAY_DEBOUNCE_MS, None) };
             }
             LRESULT(1)
         }
         WM_TIMER if wparam.0 == DISPLAY_DEBOUNCE_TIMER => {
-            if ctrl.last_display_event.elapsed() >= Duration::from_millis(u64::from(DISPLAY_DEBOUNCE_MS / 2)) {
+            if st.last_display_event.elapsed()
+                >= Duration::from_millis(u64::from(DISPLAY_DEBOUNCE_MS / 2))
+            {
                 let _ = unsafe { KillTimer(Some(hwnd), DISPLAY_DEBOUNCE_TIMER) };
-                ctrl.handle_topology_refresh();
+                match probe_display_topology() {
+                    Ok(topo) => {
+                        let _ = st.tx.send(BgEvent::TopologyChanged(topo));
+                        st.egui_ctx.request_repaint_of(ViewportId::ROOT);
+                    }
+                    Err(desklite_win32::Win32Error::Topology(TopologyError::EmptyTransient)) => {}
+                    Err(_) => {}
+                }
             }
             LRESULT(0)
         }
         WM_QUERYENDSESSION | WM_ENDSESSION => {
-            ctrl.persist_now();
+            let guard = st.shared.lock().unwrap();
+            let _ = save_native_layout(&st.layout_path, &guard.config);
             LRESULT(1)
         }
         WM_DESTROY => {
-            ctrl.persist_now();
+            st.watchers.clear();
             unsafe { PostQuitMessage(0) };
             LRESULT(0)
         }
@@ -629,96 +360,483 @@ unsafe extern "system" fn controller_wnd_proc(
     }
 }
 
-fn run_app() -> Result<(), Box<dyn std::error::Error>> {
-    let _instance_guard = match acquire_single_instance() {
-        Some(g) => g,
-        None => return Ok(()),
-    };
+fn spawn_win32_helper(
+    layout_path: PathBuf,
+    shared: Arc<Mutex<SharedFenceState>>,
+    tx: Sender<BgEvent>,
+    egui_ctx: egui::Context,
+) -> isize {
+    let (hwnd_tx, hwnd_rx) = mpsc::channel();
+    thread::spawn(move || {
+        let _ = unsafe { CoInitializeEx(None, COINIT_APARTMENTTHREADED) };
+        let Ok(hinst) = (unsafe { GetModuleHandleW(None) }) else {
+            let _ = hwnd_tx.send(0);
+            return;
+        };
+        let cls = w!("DeskLiteBgHelperWnd");
+        let wc = WNDCLASSEXW {
+            cbSize: size_of::<WNDCLASSEXW>() as u32,
+            lpfnWndProc: Some(helper_wnd_proc),
+            hInstance: hinst.into(),
+            lpszClassName: cls,
+            ..Default::default()
+        };
+        let _ = unsafe { RegisterClassExW(&wc) };
 
-    enable_per_monitor_dpi_v2();
-    let _ = unsafe { CoInitializeEx(None, COINIT_APARTMENTTHREADED) };
-    FenceWindow::register_class()?;
+        let hwnd = unsafe {
+            CreateWindowExW(
+                WS_EX_TOOLWINDOW,
+                cls,
+                w!("DeskLite Helper"),
+                WS_POPUP,
+                0,
+                0,
+                0,
+                0,
+                None,
+                None,
+                Some(hinst.into()),
+                None,
+            )
+        };
+        let Ok(hwnd) = hwnd else {
+            let _ = hwnd_tx.send(0);
+            return;
+        };
 
-    let hinst = unsafe { GetModuleHandleW(None) }?;
-    let cls = w!("DeskLiteControllerWnd");
-    let wc = WNDCLASSEXW {
-        cbSize: size_of::<WNDCLASSEXW>() as u32,
-        lpfnWndProc: Some(controller_wnd_proc),
-        hInstance: hinst.into(),
-        lpszClassName: cls,
-        ..Default::default()
-    };
-    let _ = unsafe { RegisterClassExW(&wc) };
+        let mut helper = Box::new(HelperState {
+            hwnd,
+            layout_path,
+            shared,
+            tx,
+            egui_ctx,
+            watchers: HashMap::new(),
+            last_display_event: Instant::now(),
+        });
+        helper.rebuild_watchers();
 
-    let layout_path = default_layout_path();
-    let topology = probe_display_topology()?;
-    let config = load_or_bootstrap_layout(&layout_path, &topology);
-    let pending_actions = Rc::new(RefCell::new(VecDeque::new()));
-    let query_ctx = Rc::new(RefCell::new(LayoutQueryContext::default()));
+        unsafe {
+            SetWindowLongPtrW(hwnd, GWLP_USERDATA, (&raw mut *helper) as isize);
+        }
+        let _tray = TrayIcon::new(hwnd, 1, "DeskLite 桌面整理");
+        let _ = hwnd_tx.send(hwnd.0 as isize);
 
-    // Create controller window with null USERDATA first, then attach Box<AppController>
-    let hwnd = unsafe {
-        CreateWindowExW(
-            WS_EX_TOOLWINDOW,
-            cls,
-            w!("DeskLite Controller"),
-            WS_POPUP,
-            0,
-            0,
-            0,
-            0,
-            None,
-            None,
-            Some(hinst.into()),
-            None,
-        )
-    }?;
+        let mut msg = MSG::default();
+        while unsafe { GetMessageW(&mut msg, None, 0, 0) }.as_bool() {
+            unsafe {
+                let _ = TranslateMessage(&msg);
+                DispatchMessageW(&msg);
+            }
+        }
 
-    let shared_ui = Rc::new(RefCell::new(SharedUiResources::new(
-        hwnd,
-        Rc::clone(&pending_actions),
-        Rc::clone(&query_ctx),
-    )?));
-
-    let mut ctrl = Box::new(AppController {
-        hwnd,
-        layout_path,
-        config,
-        topology,
-        shared_ui,
-        pending_actions,
-        query_ctx,
-        windows: HashMap::new(),
-        watchers: HashMap::new(),
-        last_display_event: Instant::now(),
+        drop(_tray);
+        unsafe {
+            SetWindowLongPtrW(hwnd, GWLP_USERDATA, 0);
+            let _ = DestroyWindow(hwnd);
+            CoUninitialize();
+        }
     });
-    ctrl.sync_all_windows();
+    hwnd_rx.recv().unwrap_or(0)
+}
 
-    unsafe {
-        SetWindowLongPtrW(hwnd, GWLP_USERDATA, (&raw mut *ctrl) as isize);
+struct DeskLiteEguiApp {
+    layout_path: PathBuf,
+    shared: Arc<Mutex<SharedFenceState>>,
+    rx: Receiver<BgEvent>,
+    tx: Sender<BgEvent>,
+    helper_hwnd: isize,
+    host_styled: bool,
+}
+
+impl DeskLiteEguiApp {
+    fn save_now(&self) {
+        let mut guard = self.shared.lock().unwrap();
+        let _ = save_native_layout(&self.layout_path, &guard.config);
+        guard.dirty_layout = false;
+        guard.pending_save_at = None;
     }
 
-    let _tray = TrayIcon::new(hwnd, 1, "DeskLite 桌面整理")?;
-
-    let mut msg = MSG::default();
-    while unsafe { GetMessageW(&mut msg, None, 0, 0) }.as_bool() {
-        unsafe {
-            let _ = TranslateMessage(&msg);
-            DispatchMessageW(&msg);
+    fn sync_watchers(&self) {
+        if self.helper_hwnd != 0 {
+            unsafe {
+                let _ = PostMessageW(
+                    Some(HWND(self.helper_hwnd as *mut _)),
+                    WM_APP_SYNC_WATCHERS,
+                    WPARAM(0),
+                    LPARAM(0),
+                );
+            }
         }
     }
 
-    ctrl.persist_now();
-    ctrl.windows.clear();
-    ctrl.watchers.clear();
-    unsafe {
-        SetWindowLongPtrW(hwnd, GWLP_USERDATA, 0);
-        let _ = DestroyWindow(hwnd);
-        CoUninitialize();
+    fn create_blank_fence(&self) {
+        let mut guard = self.shared.lock().unwrap();
+        let id = guard.config.next_fence_id();
+        let work = guard.topology.primary().work_area;
+        let offset = ((guard.config.fences.len() as i32) % 6) * 28;
+        let rect = Rect::new(
+            (work.left + 90 + offset).min(work.right - 300),
+            (work.top + 90 + offset).min(work.bottom - 260),
+            (work.left + 390 + offset).min(work.right),
+            (work.top + 350 + offset).min(work.bottom),
+        );
+        guard.config.upsert_fence(FenceSpec {
+            id,
+            name: "新建格子".to_string(),
+            kind: FenceKind::IconGrid,
+            rect,
+            collapsed: false,
+            portal_dir: None,
+            backdrop_alpha: DEFAULT_BACKDROP_ALPHA,
+            items: Vec::new(),
+        });
+        let topo = guard.topology.clone();
+        let _ = guard.config.apply_topology(&topo, (72, 72));
+        guard.sync_builder_rects_from_config();
+        guard.rename_prompt = Some(RenamePrompt {
+            fence_id: id,
+            draft: "新建格子".to_string(),
+            needs_focus: true,
+        });
+        guard.dirty_layout = true;
     }
-    Ok(())
+
+    fn create_portal_fence(&self, dir: String) {
+        let folder_name = Path::new(&dir)
+            .file_name()
+            .map(|s| s.to_string_lossy().into_owned())
+            .filter(|s| !s.is_empty())
+            .unwrap_or_else(|| dir.clone());
+        let mut guard = self.shared.lock().unwrap();
+        let id = guard.config.next_fence_id();
+        let work = guard.topology.primary().work_area;
+        let offset = ((guard.config.fences.len() as i32) % 6) * 28;
+        let rect = Rect::new(
+            (work.left + 110 + offset).min(work.right - 320),
+            (work.top + 110 + offset).min(work.bottom - 280),
+            (work.left + 430 + offset).min(work.right),
+            (work.top + 390 + offset).min(work.bottom),
+        );
+        let items = scan_portal_directory(Path::new(&dir));
+        guard.config.upsert_fence(FenceSpec {
+            id,
+            name: folder_name,
+            kind: FenceKind::IconGrid,
+            rect,
+            collapsed: false,
+            portal_dir: Some(dir),
+            backdrop_alpha: DEFAULT_BACKDROP_ALPHA,
+            items,
+        });
+        let topo = guard.topology.clone();
+        let _ = guard.config.apply_topology(&topo, (72, 72));
+        guard.sync_builder_rects_from_config();
+        guard.dirty_layout = true;
+    }
+
+    fn drain_events_and_commands(&self, ctx: &egui::Context) -> bool {
+        let mut needs_save = false;
+        let mut needs_watcher_sync = false;
+
+        while let Ok(ev) = self.rx.try_recv() {
+            match ev {
+                BgEvent::TopologyChanged(topo) => {
+                    let mut guard = self.shared.lock().unwrap();
+                    guard.topology = topo.clone();
+                    let _ = guard.config.apply_topology(&topo, (72, 72));
+                    guard.sync_builder_rects_from_config();
+                    needs_save = true;
+                }
+                BgEvent::PortalDirty(fid) => {
+                    let mut guard = self.shared.lock().unwrap();
+                    if let Some(f) = guard.config.fence_mut(fid)
+                        && let Some(ref dir) = f.portal_dir
+                    {
+                        f.items = scan_portal_directory(Path::new(dir));
+                    }
+                    ctx.request_repaint_of(ViewportId::from_hash_of(("desklite_fence", fid)));
+                }
+                BgEvent::TrayNewBlank => {
+                    self.create_blank_fence();
+                    needs_save = true;
+                }
+                BgEvent::TrayNewPortal(dir) => {
+                    self.create_portal_fence(dir);
+                    needs_save = true;
+                    needs_watcher_sync = true;
+                }
+                BgEvent::TrayRealign => {
+                    if let Ok(topo) = probe_display_topology() {
+                        let mut guard = self.shared.lock().unwrap();
+                        guard.topology = topo.clone();
+                        let _ = guard.config.apply_topology(&topo, (72, 72));
+                        guard.sync_builder_rects_from_config();
+                        needs_save = true;
+                    }
+                }
+                BgEvent::BindPortalResult(fid, dir) => {
+                    let mut guard = self.shared.lock().unwrap();
+                    if let Some(f) = guard.config.fence_mut(fid) {
+                        f.items = scan_portal_directory(Path::new(&dir));
+                        f.portal_dir = Some(dir);
+                        needs_save = true;
+                        needs_watcher_sync = true;
+                    }
+                    ctx.request_repaint_of(ViewportId::from_hash_of(("desklite_fence", fid)));
+                }
+                BgEvent::FlushAndExit => {
+                    self.save_now();
+                    if self.helper_hwnd != 0 {
+                        unsafe {
+                            let _ = PostMessageW(
+                                Some(HWND(self.helper_hwnd as *mut _)),
+                                WM_APP_SHUTDOWN,
+                                WPARAM(0),
+                                LPARAM(0),
+                            );
+                        }
+                    }
+                    ctx.send_viewport_cmd(ViewportCommand::Close);
+                    return false;
+                }
+            }
+        }
+
+        let cmds: Vec<FenceCommand> = {
+            let mut guard = self.shared.lock().unwrap();
+            std::mem::take(&mut guard.pending_commands)
+        };
+        for cmd in cmds {
+            match cmd {
+                FenceCommand::RequestCreateBlank => {
+                    self.create_blank_fence();
+                    needs_save = true;
+                }
+                FenceCommand::RequestCreatePortal => {
+                    let tx = self.tx.clone();
+                    let ctx_clone = ctx.clone();
+                    thread::spawn(move || {
+                        let _ = unsafe { CoInitializeEx(None, COINIT_APARTMENTTHREADED) };
+                        if let Ok(Some(dir)) = pick_folder_dialog(HWND::default()) {
+                            let _ = tx.send(BgEvent::TrayNewPortal(dir));
+                            ctx_clone.request_repaint_of(ViewportId::ROOT);
+                        }
+                        unsafe {
+                            CoUninitialize();
+                        }
+                    });
+                }
+                FenceCommand::RequestBindPortal(fid) => {
+                    let tx = self.tx.clone();
+                    let ctx_clone = ctx.clone();
+                    thread::spawn(move || {
+                        let _ = unsafe { CoInitializeEx(None, COINIT_APARTMENTTHREADED) };
+                        if let Ok(Some(dir)) = pick_folder_dialog(HWND::default()) {
+                            let _ = tx.send(BgEvent::BindPortalResult(fid, dir));
+                            ctx_clone.request_repaint_of(ViewportId::ROOT);
+                        }
+                        unsafe {
+                            CoUninitialize();
+                        }
+                    });
+                }
+                FenceCommand::RequestDelete(fid) => {
+                    let mut guard = self.shared.lock().unwrap();
+                    if guard.config.remove_fence(fid) {
+                        guard.prune_removed_fences();
+                        needs_save = true;
+                        needs_watcher_sync = true;
+                    }
+                }
+                FenceCommand::SyncPortals => {
+                    needs_watcher_sync = true;
+                }
+                FenceCommand::RequestExitApp => {
+                    self.save_now();
+                    if self.helper_hwnd != 0 {
+                        unsafe {
+                            let _ = PostMessageW(
+                                Some(HWND(self.helper_hwnd as *mut _)),
+                                WM_APP_SHUTDOWN,
+                                WPARAM(0),
+                                LPARAM(0),
+                            );
+                        }
+                    }
+                    ctx.send_viewport_cmd(ViewportCommand::Close);
+                    return false;
+                }
+            }
+        }
+
+        if needs_watcher_sync {
+            self.sync_watchers();
+        }
+        let pending_due = {
+            let guard = self.shared.lock().unwrap();
+            guard.pending_save_at
+        };
+        if needs_save {
+            self.save_now();
+        } else if let Some(deadline) = pending_due {
+            let now = Instant::now();
+            if now >= deadline {
+                self.save_now();
+            } else {
+                ctx.request_repaint_after(deadline - now);
+            }
+        }
+        true
+    }
+}
+
+impl eframe::App for DeskLiteEguiApp {
+    fn clear_color(&self, _visuals: &egui::Visuals) -> [f32; 4] {
+        [0.0, 0.0, 0.0, 0.0]
+    }
+
+    fn ui(&mut self, ui: &mut egui::Ui, frame: &mut eframe::Frame) {
+        if let Ok(handle) = frame.window_handle()
+            && let RawWindowHandle::Win32(h) = handle.as_raw()
+        {
+            let clean = strip_alt_tab_from_host(h.hwnd.get());
+            if !self.host_styled {
+                self.host_styled = true;
+                ui.ctx().request_repaint_after(Duration::from_millis(100));
+            } else {
+                let _ = clean;
+            }
+        }
+
+        let ctx = ui.ctx().clone();
+        if !self.drain_events_and_commands(&ctx) {
+            return;
+        }
+
+        let (fences, builder_rects, monitors) = {
+            let guard = self.shared.lock().unwrap();
+            (
+                guard.config.fences.clone(),
+                guard.builder_rects.clone(),
+                guard.topology.monitors().to_vec(),
+            )
+        };
+
+        for spec in fences {
+            let fid = spec.id;
+            let vid = ViewportId::from_hash_of(("desklite_fence", fid));
+            let (brect, bcollapsed) = builder_rects
+                .get(&fid)
+                .copied()
+                .unwrap_or((spec.rect, spec.collapsed));
+            let mon_scale = if monitors.is_empty() {
+                1.0
+            } else {
+                (nearest_monitor(brect.center(), &monitors).dpi_x as f32 / 96.0).max(0.5)
+            };
+            let init_h = if bcollapsed {
+                COLLAPSED_HEIGHT
+            } else {
+                (brect.height().max(MIN_FENCE_HEIGHT) as f32) / mon_scale
+            };
+            let vb = ViewportBuilder::default()
+                .with_title(format!("DeskLite#{fid}"))
+                .with_decorations(false)
+                .with_transparent(true)
+                .with_taskbar(false)
+                .with_window_level(WindowLevel::AlwaysOnBottom)
+                .with_position(Pos2::new(
+                    brect.left as f32 / mon_scale,
+                    brect.top as f32 / mon_scale,
+                ))
+                .with_inner_size(Vec2::new(
+                    (brect.width().max(MIN_FENCE_WIDTH) as f32) / mon_scale,
+                    init_h,
+                ))
+                .with_min_inner_size(Vec2::new(MIN_FENCE_WIDTH as f32, COLLAPSED_HEIGHT));
+
+            let shared = Arc::clone(&self.shared);
+            let layout_path = self.layout_path.clone();
+            ctx.show_viewport_deferred(vid, vb, move |sub_ui, _class| {
+                let res = render_fence_viewport(sub_ui, fid, &shared);
+                if res.needs_immediate_save {
+                    let mut guard = shared.lock().unwrap();
+                    let _ = save_native_layout(&layout_path, &guard.config);
+                    guard.dirty_layout = false;
+                    guard.pending_save_at = None;
+                }
+            });
+        }
+    }
+
+    fn on_exit(&mut self, _gl: Option<&eframe::glow::Context>) {
+        self.save_now();
+        if self.helper_hwnd != 0 {
+            unsafe {
+                let _ = PostMessageW(
+                    Some(HWND(self.helper_hwnd as *mut _)),
+                    WM_APP_SHUTDOWN,
+                    WPARAM(0),
+                    LPARAM(0),
+                );
+            }
+        }
+    }
 }
 
 fn main() {
-    let _ = run_app();
+    let Some(_guard) = acquire_single_instance() else {
+        return;
+    };
+
+    enable_per_monitor_dpi_v2();
+    let Ok(topology) = probe_display_topology() else {
+        return;
+    };
+    let layout_path = default_layout_path();
+    let config = load_or_bootstrap_layout(&layout_path, &topology);
+
+    let Ok(icon_cache) = IconCache::new() else {
+        return;
+    };
+    let shared = Arc::new(Mutex::new(SharedFenceState::new(
+        config,
+        topology,
+        icon_cache,
+    )));
+    let (tx, rx) = mpsc::channel();
+
+    let native_options = eframe::NativeOptions {
+        viewport: ViewportBuilder::default()
+            .with_title("DeskLite Host")
+            .with_decorations(false)
+            .with_transparent(true)
+            .with_taskbar(false)
+            .with_position(Pos2::new(-32000.0, -32000.0))
+            .with_inner_size(Vec2::new(1.0, 1.0)),
+        ..Default::default()
+    };
+
+    let _ = eframe::run_native(
+        "DeskLite",
+        native_options,
+        Box::new(move |cc| {
+            install_chinese_fonts(&cc.egui_ctx);
+            configure_egui_theme(&cc.egui_ctx);
+            let helper_hwnd = spawn_win32_helper(
+                layout_path.clone(),
+                Arc::clone(&shared),
+                tx.clone(),
+                cc.egui_ctx.clone(),
+            );
+            Ok(Box::new(DeskLiteEguiApp {
+                layout_path,
+                shared,
+                rx,
+                tx,
+                helper_hwnd,
+                host_styled: false,
+            }))
+        }),
+    );
 }

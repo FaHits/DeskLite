@@ -58,7 +58,9 @@ fn anonymized_fixtures_roundtrip_and_strip_cloud_box() {
 
     let topo = demo_primary_topology();
     let native = legacy_to_native(&stripped, Some(&topo)).unwrap();
-    assert_eq!(native.fences.len(), 3);
+    // Hidden container box id=1 with empty name must not become a visible fence.
+    assert_eq!(native.fences.len(), 2);
+    assert!(native.fences.iter().all(|f| f.id != 1));
     assert_eq!(native.active_topology.as_ref(), Some(topo.key()));
 }
 

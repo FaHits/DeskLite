@@ -1,13 +1,11 @@
-pub mod fence_window;
+pub mod fence_view;
+pub mod fonts;
 pub mod hit_test;
-pub mod rename_dialog;
 pub mod snap;
-pub mod theme;
 
-pub use fence_window::{FenceAction, FenceWindow, SharedUiResources};
-pub use hit_test::{
-    HitRegion, LIST_ROW_HEIGHT, RESIZE_BORDER, ResizeEdge, TITLE_BAR_HEIGHT, content_height,
-    grid_columns, hit_test_point, item_rect, max_scroll_offset,
+pub use fence_view::{
+    COLLAPSED_HEIGHT, FenceUiOutput, SharedFenceState, configure_egui_theme,
+    render_fence_viewport,
 };
-pub use rename_dialog::prompt_fence_name;
+pub use fonts::install_chinese_fonts;
 pub use snap::snap_move_rect;

@@ -1,3 +1,4 @@
+use std::cell::RefCell;
 use std::collections::HashMap;
 use std::path::Path;
 
@@ -6,7 +7,9 @@ use windows::Win32::Graphics::Imaging::{
     WICBitmapDitherTypeNone, WICBitmapPaletteTypeCustom,
 };
 use windows::Win32::Storage::FileSystem::FILE_ATTRIBUTE_NORMAL;
-use windows::Win32::System::Com::{CLSCTX_INPROC_SERVER, CoCreateInstance, CoTaskMemFree};
+use windows::Win32::System::Com::{
+    CLSCTX_INPROC_SERVER, COINIT_APARTMENTTHREADED, CoCreateInstance, CoInitializeEx, CoTaskMemFree,
+};
 use windows::Win32::UI::Controls::IImageList;
 use windows::Win32::UI::Shell::{
     SHGFI_ICON, SHGFI_LARGEICON, SHGFI_PIDL, SHGFI_SYSICONINDEX, SHGFI_USEFILEATTRIBUTES,
@@ -15,7 +18,7 @@ use windows::Win32::UI::Shell::{
 use windows::Win32::UI::WindowsAndMessaging::{DestroyIcon, HICON};
 use windows::core::{HSTRING, PCWSTR};
 
-use crate::{Win32Error, win_err};
+use crate::Win32Error;
 
 #[derive(Debug, Clone)]
 pub struct DecodedIcon {
@@ -24,20 +27,34 @@ pub struct DecodedIcon {
     pub pbgra: Vec<u8>,
 }
 
+thread_local! {
+    static TLS_WIC: RefCell<Option<IWICImagingFactory>> = const { RefCell::new(None) };
+}
+
+fn with_thread_wic<T>(f: impl FnOnce(&IWICImagingFactory) -> Option<T>) -> Option<T> {
+    TLS_WIC.with(|slot| {
+        let mut borrow = slot.borrow_mut();
+        if borrow.is_none() {
+            unsafe {
+                let _ = CoInitializeEx(None, COINIT_APARTMENTTHREADED);
+            }
+            let wic: IWICImagingFactory =
+                unsafe { CoCreateInstance(&CLSID_WICImagingFactory, None, CLSCTX_INPROC_SERVER) }
+                    .ok()?;
+            *borrow = Some(wic);
+        }
+        borrow.as_ref().and_then(f)
+    })
+}
+
+#[derive(Default)]
 pub struct IconCache {
-    wic: IWICImagingFactory,
     cache: HashMap<String, DecodedIcon>,
 }
 
 impl IconCache {
     pub fn new() -> Result<Self, Win32Error> {
-        let wic: IWICImagingFactory =
-            unsafe { CoCreateInstance(&CLSID_WICImagingFactory, None, CLSCTX_INPROC_SERVER) }
-                .map_err(|e| win_err("CoCreateInstance(WICImagingFactory)", e))?;
-        Ok(Self {
-            wic,
-            cache: HashMap::new(),
-        })
+        Ok(Self::default())
     }
 
     pub fn get_or_load(&mut self, path: &str) -> Option<&DecodedIcon> {
@@ -52,42 +69,42 @@ impl IconCache {
 
     fn extract_icon(&self, path: &str) -> Option<DecodedIcon> {
         let hicon = load_hicon_for_path(path)?;
-        let decoded = self.hicon_to_pbgra(hicon);
+        let decoded = hicon_to_pbgra(hicon);
         unsafe {
             let _ = DestroyIcon(hicon);
         }
         decoded
     }
+}
 
-    fn hicon_to_pbgra(&self, hicon: HICON) -> Option<DecodedIcon> {
-        unsafe {
-            let bmp = self.wic.CreateBitmapFromHICON(hicon).ok()?;
-            let mut width = 0u32;
-            let mut height = 0u32;
-            bmp.GetSize(&mut width, &mut height).ok()?;
-            if width == 0 || height == 0 {
-                return None;
-            }
-            let conv = self.wic.CreateFormatConverter().ok()?;
-            conv.Initialize(
-                &bmp,
-                &GUID_WICPixelFormat32bppPBGRA,
-                WICBitmapDitherTypeNone,
-                None,
-                0.0,
-                WICBitmapPaletteTypeCustom,
-            )
-            .ok()?;
-            let stride = width * 4;
-            let mut pbgra = vec![0u8; (stride * height) as usize];
-            conv.CopyPixels(std::ptr::null(), stride, &mut pbgra).ok()?;
-            Some(DecodedIcon {
-                width,
-                height,
-                pbgra,
-            })
+fn hicon_to_pbgra(hicon: HICON) -> Option<DecodedIcon> {
+    with_thread_wic(|wic| unsafe {
+        let bmp = wic.CreateBitmapFromHICON(hicon).ok()?;
+        let mut width = 0u32;
+        let mut height = 0u32;
+        bmp.GetSize(&mut width, &mut height).ok()?;
+        if width == 0 || height == 0 {
+            return None;
         }
-    }
+        let conv = wic.CreateFormatConverter().ok()?;
+        conv.Initialize(
+            &bmp,
+            &GUID_WICPixelFormat32bppPBGRA,
+            WICBitmapDitherTypeNone,
+            None,
+            0.0,
+            WICBitmapPaletteTypeCustom,
+        )
+        .ok()?;
+        let stride = width * 4;
+        let mut pbgra = vec![0u8; (stride * height) as usize];
+        conv.CopyPixels(std::ptr::null(), stride, &mut pbgra).ok()?;
+        Some(DecodedIcon {
+            width,
+            height,
+            pbgra,
+        })
+    })
 }
 
 fn normalize_cache_key(path: &str) -> String {

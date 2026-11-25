@@ -1,12 +1,14 @@
 pub mod desktop_listview;
 pub mod display;
 pub mod dpi;
+pub mod drag_out;
 pub mod events;
 pub mod fence_poc;
 pub mod folder_watch;
 pub mod icons;
 pub mod shell_ops;
 pub mod tray;
+pub mod window_attach;
 
 use thiserror::Error;
 
@@ -39,6 +41,7 @@ pub use desktop_listview::{
 };
 pub use display::probe_display_topology;
 pub use dpi::enable_per_monitor_dpi_v2;
+pub use drag_out::{DragOutOutcome, start_file_drag_out};
 pub use events::{DisplayEventKind, run_event_monitor};
 pub use fence_poc::{FencePocConfig, run_bottom_fence_poc};
 pub use folder_watch::{FolderWatcher, WM_APP_PORTAL_DIRTY};
@@ -48,3 +51,6 @@ pub use shell_ops::{
     scan_portal_directory,
 };
 pub use tray::{TrayIcon, WM_APP_TRAY};
+pub use window_attach::{
+    attach_desktop_owner_and_rounded_corners, find_window_by_exact_title, strip_alt_tab_from_host,
+};

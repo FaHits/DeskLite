@@ -15,6 +15,9 @@ desklite-core = { path = "../desklite-core" }
 desklite-legacy = { path = "../desklite-legacy" }
 desklite-ui = { path = "../desklite-ui" }
 desklite-win32 = { path = "../desklite-win32" }
+eframe.workspace = true
+egui.workspace = true
+raw-window-handle.workspace = true
 
 [dependencies.windows]
 workspace = true

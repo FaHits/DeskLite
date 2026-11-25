@@ -213,6 +213,24 @@ impl NativeLayoutConfig {
             snap.fences.insert(id, rect);
         }
     }
+
+    /// Removes DeskGo's internal hidden full-screen container box (`id == 1` with empty name)
+    /// if it leaked into a previously imported `layout.json`.
+    pub fn sanitize_legacy_containers(&mut self) -> bool {
+        let mut removed = false;
+        let before = self.fences.len();
+        self.fences
+            .retain(|f| !(f.id == 1 && f.name.trim().is_empty()));
+        if self.fences.len() != before {
+            removed = true;
+        }
+        for snap in self.snapshots.values_mut() {
+            if !self.fences.iter().any(|f| f.id == 1) && snap.fences.remove(&1).is_some() {
+                removed = true;
+            }
+        }
+        removed
+    }
     /// Applies a verified non-empty topology:
     /// - Restores per-topology fence coordinates if previously seen, otherwise uses current rects.
     /// - Always validates and clamps every fence and icon into active work areas (even on 1-monitor wakeup).

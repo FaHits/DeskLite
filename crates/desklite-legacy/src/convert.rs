@@ -138,6 +138,11 @@ pub fn legacy_to_native(
     let mut cfg = NativeLayoutConfig::default();
 
     for b in &bundle.xml.boxes {
+        // DeskGo stores the entire free-desktop canvas as hidden box id=1 with an empty name,
+        // and legacy cloud boxes as Box_ai_cloud. Never turn them into visible fences.
+        if b.tag != "Box" || (b.id == 1 && b.name.trim().is_empty()) {
+            continue;
+        }
         let mut items = Vec::new();
         for it in bundle.xml.items.iter().filter(|it| it.box_id == b.id) {
             items.push(FenceItem {
