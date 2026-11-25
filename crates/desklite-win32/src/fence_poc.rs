@@ -2,7 +2,9 @@ use std::mem::size_of;
 
 use desklite_core::Rect;
 use windows::Win32::Foundation::{HWND, LPARAM, RECT, WPARAM};
-use windows::Win32::Graphics::Direct2D::Common::{D2D_RECT_F, D2D1_COLOR_F};
+use windows::Win32::Graphics::Direct2D::Common::{
+    D2D_RECT_F, D2D1_ALPHA_MODE_PREMULTIPLIED, D2D1_COLOR_F, D2D1_PIXEL_FORMAT,
+};
 use windows::Win32::Graphics::Direct2D::{
     D2D1_FACTORY_TYPE_SINGLE_THREADED, D2D1_HWND_RENDER_TARGET_PROPERTIES,
     D2D1_RENDER_TARGET_PROPERTIES, D2D1_ROUNDED_RECT, D2D1CreateFactory, ID2D1Factory,
@@ -18,25 +20,24 @@ use windows::Win32::Graphics::Dwm::{
     DWMWA_WINDOW_CORNER_PREFERENCE, DWMWCP_ROUND, DwmExtendFrameIntoClientArea,
     DwmSetWindowAttribute,
 };
+use windows::Win32::Graphics::Dxgi::Common::DXGI_FORMAT_B8G8R8A8_UNORM;
 use windows::Win32::Graphics::Gdi::{BeginPaint, EndPaint, PAINTSTRUCT, ValidateRect};
 use windows::Win32::System::Com::{COINIT_APARTMENTTHREADED, CoInitializeEx, CoUninitialize};
 use windows::Win32::System::LibraryLoader::GetModuleHandleW;
 use windows::Win32::UI::Controls::MARGINS;
 use windows::Win32::UI::WindowsAndMessaging::{
     CREATESTRUCTW, CreateWindowExW, DefWindowProcW, DestroyWindow, DispatchMessageW, GetClientRect,
-    GetMessageW, GetWindowLongPtrW, HWND_BOTTOM, KillTimer, PostQuitMessage, RegisterClassExW,
-    SW_SHOWNOACTIVATE, SWP_NOACTIVATE, SWP_NOMOVE, SWP_NOSIZE, SWP_NOZORDER, SetTimer,
-    SetWindowLongPtrW, SetWindowPos, ShowWindow, TranslateMessage, WINDOWPOS, WM_CLOSE, WM_CREATE,
-    WM_DESTROY, WM_NCDESTROY, WM_PAINT, WM_SIZE, WM_TIMER, WM_WINDOWPOSCHANGING, WNDCLASSEXW,
-    WS_EX_NOACTIVATE, WS_EX_TOOLWINDOW, WS_POPUP,
+    GetMessageW, GetWindowLongPtrW, HWND_BOTTOM, MA_NOACTIVATE, PostQuitMessage, RegisterClassExW,
+    SW_SHOWNOACTIVATE, SWP_NOACTIVATE, SWP_NOMOVE, SWP_NOSIZE, SWP_NOZORDER, SetWindowLongPtrW,
+    SetWindowPos, ShowWindow, TranslateMessage, WINDOWPOS, WM_CLOSE, WM_CREATE, WM_DESTROY,
+    WM_ERASEBKGND, WM_MOUSEACTIVATE, WM_NCDESTROY, WM_PAINT, WM_SIZE, WM_WINDOWPOSCHANGING,
+    WNDCLASSEXW, WS_EX_NOACTIVATE, WS_EX_TOOLWINDOW, WS_POPUP,
 };
 use windows::core::{BOOL, HSTRING, Interface, w};
 
 use crate::Win32Error;
 use crate::desktop_listview::probe_desktop_window_tree;
 use crate::win_err;
-
-const REORDER_TIMER_ID: usize = 2;
 
 #[derive(Debug, Clone)]
 pub struct FencePocConfig {
@@ -97,7 +98,13 @@ impl PocWindowState {
             let _ = unsafe { GetClientRect(hwnd, &mut rc) };
             let width = (rc.right - rc.left).max(1) as u32;
             let height = (rc.bottom - rc.top).max(1) as u32;
-            let props = D2D1_RENDER_TARGET_PROPERTIES::default();
+            let props = D2D1_RENDER_TARGET_PROPERTIES {
+                pixelFormat: D2D1_PIXEL_FORMAT {
+                    format: DXGI_FORMAT_B8G8R8A8_UNORM,
+                    alphaMode: D2D1_ALPHA_MODE_PREMULTIPLIED,
+                },
+                ..Default::default()
+            };
             let hwnd_props = D2D1_HWND_RENDER_TARGET_PROPERTIES {
                 hwnd,
                 pixelSize: windows::Win32::Graphics::Direct2D::Common::D2D_SIZE_U { width, height },
@@ -221,7 +228,6 @@ unsafe extern "system" fn poc_wnd_proc(
     if msg == WM_CREATE {
         let cs = unsafe { &*(lparam.0 as *const CREATESTRUCTW) };
         unsafe { SetWindowLongPtrW(hwnd, GWLP_USERDATA, cs.lpCreateParams as isize) };
-        unsafe { SetTimer(Some(hwnd), REORDER_TIMER_ID, 250, None) };
         return LRESULT(0);
     }
 
@@ -232,27 +238,14 @@ unsafe extern "system" fn poc_wnd_proc(
     let state = unsafe { &mut *ptr };
 
     match msg {
+        WM_MOUSEACTIVATE => LRESULT(MA_NOACTIVATE as isize),
+        WM_ERASEBKGND => LRESULT(1),
         WM_WINDOWPOSCHANGING => {
             let wp = unsafe { &mut *(lparam.0 as *mut WINDOWPOS) };
             if (wp.flags & SWP_NOZORDER).0 == 0 {
                 wp.hwndInsertAfter = HWND_BOTTOM;
             }
             wp.flags |= SWP_NOACTIVATE;
-            LRESULT(0)
-        }
-        WM_TIMER if wparam.0 == REORDER_TIMER_ID => {
-            // Keep bottom-most on desktop without stealing focus or responding to Win+D minimize.
-            unsafe {
-                let _ = SetWindowPos(
-                    hwnd,
-                    Some(HWND_BOTTOM),
-                    0,
-                    0,
-                    0,
-                    0,
-                    SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE,
-                );
-            }
             LRESULT(0)
         }
         WM_SIZE => {
@@ -282,7 +275,6 @@ unsafe extern "system" fn poc_wnd_proc(
         }
         WM_CLOSE => {
             unsafe {
-                let _ = KillTimer(Some(hwnd), REORDER_TIMER_ID);
                 let _ = DestroyWindow(hwnd);
             }
             LRESULT(0)
@@ -350,8 +342,8 @@ pub fn run_bottom_fence_poc(cfg: FencePocConfig) -> Result<(), Win32Error> {
     let mut state = Box::new(PocWindowState::new(cfg.title.clone())?);
     let title_w = HSTRING::from(&cfg.title);
 
-    // Ownership/parenting test: keep desktop Progman as owner so Win+D does not hide the fence.
-    let desktop_owner = probe_desktop_window_tree().map(|t| t.progman);
+    // Ownership/parenting test: keep desktop host (WorkerW/Progman) as owner so Win+D does not hide the fence.
+    let desktop_owner = probe_desktop_window_tree().map(|t| t.worker_w.unwrap_or(t.progman));
 
     let hwnd = unsafe {
         CreateWindowExW(
