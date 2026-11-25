@@ -4,7 +4,9 @@ members = [
     "crates/desklite-core",
     "crates/desklite-legacy",
     "crates/desklite-win32",
+    "crates/desklite-ui",
     "crates/desklite-cli",
+    "crates/desklite-app",
 ]
 
 [workspace.package]

@@ -153,6 +153,9 @@ pub fn legacy_to_native(
             name: b.name.clone(),
             kind: FenceKind::from(b.kind),
             rect: b.rect,
+            collapsed: false,
+            portal_dir: None,
+            backdrop_alpha: desklite_core::DEFAULT_BACKDROP_ALPHA,
             items,
         });
     }

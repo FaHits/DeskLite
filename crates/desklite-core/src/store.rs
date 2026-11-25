@@ -108,6 +108,9 @@ mod tests {
             name: "Tools".into(),
             kind: FenceKind::IconGrid,
             rect: Rect::new(100, 100, 400, 400),
+            collapsed: false,
+            portal_dir: None,
+            backdrop_alpha: crate::layout::DEFAULT_BACKDROP_ALPHA,
             items: vec![],
         });
         save_native_layout(&target, &cfg).unwrap();

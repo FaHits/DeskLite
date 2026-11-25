@@ -3,6 +3,10 @@ pub mod display;
 pub mod dpi;
 pub mod events;
 pub mod fence_poc;
+pub mod folder_watch;
+pub mod icons;
+pub mod shell_ops;
+pub mod tray;
 
 use thiserror::Error;
 
@@ -37,3 +41,10 @@ pub use display::probe_display_topology;
 pub use dpi::enable_per_monitor_dpi_v2;
 pub use events::{DisplayEventKind, run_event_monitor};
 pub use fence_poc::{FencePocConfig, run_bottom_fence_poc};
+pub use folder_watch::{FolderWatcher, WM_APP_PORTAL_DIRTY};
+pub use icons::{DecodedIcon, IconCache};
+pub use shell_ops::{
+    launch_item, pick_folder_dialog, resolve_dropped_item, reveal_in_explorer,
+    scan_portal_directory,
+};
+pub use tray::{TrayIcon, WM_APP_TRAY};

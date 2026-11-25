@@ -122,6 +122,17 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "1d07550c9036bf2ae0c684c4297d503f838287c83c53686d05370d0e139ae570"
 
 [[package]]
+name = "desklite-app"
+version = "0.1.0"
+dependencies = [
+ "desklite-core",
+ "desklite-legacy",
+ "desklite-ui",
+ "desklite-win32",
+ "windows",
+]
+
+[[package]]
 name = "desklite-cli"
 version = "0.1.0"
 dependencies = [
@@ -148,6 +159,16 @@ dependencies = [
  "cfb",
  "desklite-core",
  "thiserror",
+]
+
+[[package]]
+name = "desklite-ui"
+version = "0.1.0"
+dependencies = [
+ "desklite-core",
+ "desklite-win32",
+ "thiserror",
+ "windows",
 ]
 
 [[package]]

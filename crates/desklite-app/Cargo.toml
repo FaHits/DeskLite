@@ -1,0 +1,29 @@
+[package]
+name = "desklite-app"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+
+[[bin]]
+name = "desklite-app"
+path = "src/main.rs"
+
+[dependencies]
+desklite-core = { path = "../desklite-core" }
+desklite-legacy = { path = "../desklite-legacy" }
+desklite-ui = { path = "../desklite-ui" }
+desklite-win32 = { path = "../desklite-win32" }
+
+[dependencies.windows]
+workspace = true
+features = [
+    "Win32_Foundation",
+    "Win32_Security",
+    "Win32_System_Com",
+    "Win32_System_LibraryLoader",
+    "Win32_System_Threading",
+    "Win32_UI_Shell",
+    "Win32_UI_WindowsAndMessaging",
+]
