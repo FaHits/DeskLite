@@ -1,0 +1,18 @@
+[package]
+name = "desklite-cli"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+
+[[bin]]
+name = "desklite"
+path = "src/main.rs"
+
+[dependencies]
+desklite-core = { path = "../desklite-core" }
+desklite-legacy = { path = "../desklite-legacy" }
+desklite-win32 = { path = "../desklite-win32" }
+clap.workspace = true
+serde_json.workspace = true

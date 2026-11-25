@@ -1,0 +1,30 @@
+[workspace]
+resolver = "2"
+members = [
+    "crates/desklite-core",
+    "crates/desklite-legacy",
+    "crates/desklite-win32",
+    "crates/desklite-cli",
+]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2024"
+license = "MIT"
+repository = "https://github.com/FaHits/DeskLite"
+authors = ["FaHits"]
+
+[workspace.dependencies]
+serde = { version = "1.0.229", features = ["derive"] }
+serde_json = "1.0.154"
+thiserror = "2.0.21"
+clap = { version = "4.6.10", features = ["derive"] }
+cfb = "0.16.0"
+windows = "0.62.2"
+
+[profile.release]
+opt-level = "s"
+lto = "fat"
+codegen-units = 1
+panic = "abort"
+strip = "symbols"
