@@ -1,4 +1,4 @@
-use std::cell::Cell;
+use std::cell::{Cell, RefCell};
 use std::mem::size_of;
 use std::ptr::copy_nonoverlapping;
 use std::sync::Arc;
@@ -6,14 +6,15 @@ use std::sync::atomic::{AtomicBool, AtomicI32, AtomicIsize, AtomicU8, Ordering};
 use std::sync::mpsc::{self, Receiver};
 
 use windows::Win32::Foundation::{
-    DATA_S_SAMEFORMATETC, DRAGDROP_S_CANCEL, DRAGDROP_S_DROP, DRAGDROP_S_USEDEFAULTCURSORS,
-    DV_E_FORMATETC, E_INVALIDARG, E_NOTIMPL, E_OUTOFMEMORY, GlobalFree, HANDLE, HGLOBAL, HWND,
-    LPARAM, POINT, S_FALSE, S_OK, WPARAM,
+    COLORREF, DATA_S_SAMEFORMATETC, DRAGDROP_S_CANCEL, DRAGDROP_S_DROP,
+    DRAGDROP_S_USEDEFAULTCURSORS, DV_E_FORMATETC, E_INVALIDARG, E_NOTIMPL, E_OUTOFMEMORY,
+    GlobalFree, HANDLE, HGLOBAL, HWND, LPARAM, POINT, S_FALSE, S_OK, SIZE, WPARAM,
 };
-use windows::Win32::Graphics::Gdi::ScreenToClient;
+use windows::Win32::Graphics::Gdi::{DeleteObject, ScreenToClient};
 use windows::Win32::System::Com::{
-    DATADIR_GET, DVASPECT_CONTENT, FORMATETC, IAdviseSink, IDataObject, IDataObject_Impl,
-    IEnumFORMATETC, IEnumFORMATETC_Impl, IEnumSTATDATA, STGMEDIUM, STGMEDIUM_0, TYMED_HGLOBAL,
+    CLSCTX_INPROC_SERVER, CoCreateInstance, DATADIR_GET, DVASPECT_CONTENT, FORMATETC, IAdviseSink,
+    IDataObject, IDataObject_Impl, IEnumFORMATETC, IEnumFORMATETC_Impl, IEnumSTATDATA, STGMEDIUM,
+    STGMEDIUM_0, TYMED_HGLOBAL,
 };
 use windows::Win32::System::DataExchange::{
     CloseClipboard, EmptyClipboard, GetClipboardData, IsClipboardFormatAvailable, OpenClipboard,
@@ -21,12 +22,12 @@ use windows::Win32::System::DataExchange::{
 };
 use windows::Win32::System::Diagnostics::Debug::WriteProcessMemory;
 use windows::Win32::System::Memory::{
-    GMEM_MOVEABLE, GMEM_ZEROINIT, GlobalAlloc, GlobalLock, GlobalUnlock, MEM_COMMIT, MEM_RELEASE,
-    MEM_RESERVE, PAGE_READWRITE, VirtualAllocEx, VirtualFreeEx,
+    GMEM_MOVEABLE, GMEM_ZEROINIT, GlobalAlloc, GlobalLock, GlobalSize, GlobalUnlock, MEM_COMMIT,
+    MEM_RELEASE, MEM_RESERVE, PAGE_READWRITE, VirtualAllocEx, VirtualFreeEx,
 };
 use windows::Win32::System::Ole::{
     CF_HDROP, CF_UNICODETEXT, DROPEFFECT, DROPEFFECT_COPY, DROPEFFECT_LINK, DROPEFFECT_MOVE,
-    DoDragDrop, IDropSource, IDropSource_Impl, OleInitialize, OleUninitialize,
+    DoDragDrop, IDropSource, IDropSource_Impl, OleInitialize, OleUninitialize, ReleaseStgMedium,
 };
 use windows::Win32::System::SystemServices::{MK_LBUTTON, MODIFIERKEYS_FLAGS};
 use windows::Win32::System::Threading::{
@@ -34,15 +35,20 @@ use windows::Win32::System::Threading::{
 };
 use windows::Win32::UI::Controls::{LVHITTESTINFO, LVM_HITTEST};
 use windows::Win32::UI::Input::KeyboardAndMouse::{GetAsyncKeyState, VK_LBUTTON};
-use windows::Win32::UI::Shell::{DROPFILES, DragQueryFileW, HDROP};
+use windows::Win32::UI::Shell::{
+    CLSID_DragDropHelper, DROPFILES, DSH_ALLOWDROPDESCRIPTIONTEXT, DragQueryFileW, HDROP,
+    IDragSourceHelper2, SHDRAGIMAGE,
+};
 use windows::Win32::UI::WindowsAndMessaging::{
     GA_ROOT, GetAncestor, GetClassNameW, GetCursorPos, GetWindowThreadProcessId, PostMessageW,
     SendMessageW, WindowFromPoint,
 };
 use windows::core::{BOOL, HRESULT, Ref, Result as WinResult, implement, w};
 
-use crate::{Win32Error, win_err};
 use crate::desktop_listview::probe_desktop_window_tree;
+use crate::drag_ghost::{DragGhost, render_drag_preview_dib};
+use crate::window_attach::set_file_drag_active;
+use crate::{Win32Error, win_err};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum DragOutOutcome {
@@ -78,43 +84,41 @@ pub enum DragTargetOutcome {
 }
 
 #[implement(IEnumFORMATETC)]
-struct SingleFormatEnum {
-    format: FORMATETC,
+struct FormatListEnum {
+    formats: Vec<FORMATETC>,
     index: Cell<usize>,
 }
 
-impl IEnumFORMATETC_Impl for SingleFormatEnum_Impl {
+impl IEnumFORMATETC_Impl for FormatListEnum_Impl {
     fn Next(&self, celt: u32, rgelt: *mut FORMATETC, pceltfetched: *mut u32) -> HRESULT {
         if rgelt.is_null() {
-            return windows::Win32::Foundation::E_INVALIDARG;
+            return E_INVALIDARG;
         }
-        let idx = self.index.get();
-        if idx == 0 && celt >= 1 {
+        let mut fetched = 0usize;
+        let mut idx = self.index.get();
+        while fetched < celt as usize && idx < self.formats.len() {
             unsafe {
-                *rgelt = self.format;
-                if !pceltfetched.is_null() {
-                    *pceltfetched = 1;
-                }
+                *rgelt.add(fetched) = self.formats[idx];
             }
-            self.index.set(1);
-            if celt == 1 { S_OK } else { S_FALSE }
-        } else {
-            if !pceltfetched.is_null() {
-                unsafe {
-                    *pceltfetched = 0;
-                }
-            }
-            S_FALSE
+            idx += 1;
+            fetched += 1;
         }
+        self.index.set(idx);
+        if !pceltfetched.is_null() {
+            unsafe {
+                *pceltfetched = fetched as u32;
+            }
+        }
+        if fetched == celt as usize { S_OK } else { S_FALSE }
     }
 
     fn Skip(&self, celt: u32) -> WinResult<()> {
         let next = self.index.get().saturating_add(celt as usize);
-        if next <= 1 {
+        if next <= self.formats.len() {
             self.index.set(next);
             Ok(())
         } else {
-            self.index.set(1);
+            self.index.set(self.formats.len());
             Err(windows::core::Error::from(S_FALSE))
         }
     }
@@ -125,8 +129,8 @@ impl IEnumFORMATETC_Impl for SingleFormatEnum_Impl {
     }
 
     fn Clone(&self) -> WinResult<IEnumFORMATETC> {
-        Ok(SingleFormatEnum {
-            format: self.format,
+        Ok(FormatListEnum {
+            formats: self.formats.clone(),
             index: Cell::new(self.index.get()),
         }
         .into())
@@ -140,6 +144,18 @@ struct FileDropDataObject {
     hdrop_payload: Vec<u8>,
     format: FORMATETC,
     get_data_calls: Cell<usize>,
+    extra_data: RefCell<Vec<(FORMATETC, STGMEDIUM)>>,
+}
+
+impl Drop for FileDropDataObject {
+    fn drop(&mut self) {
+        let mut extra = self.extra_data.borrow_mut();
+        for (_, mut med) in extra.drain(..) {
+            unsafe {
+                ReleaseStgMedium(&mut med);
+            }
+        }
+    }
 }
 
 fn encode_hdrop_payload(paths: &[String]) -> Vec<u8> {
@@ -202,6 +218,7 @@ impl FileDropDataObject {
             hdrop_payload: encode_hdrop_payload(&paths),
             format,
             get_data_calls: Cell::new(0),
+            extra_data: RefCell::new(Vec::new()),
         }
     }
 
@@ -219,24 +236,65 @@ impl FileDropDataObject {
     fn build_hdrop(&self) -> WinResult<HGLOBAL> {
         alloc_hglobal_from_bytes(&self.hdrop_payload)
     }
+
+    fn clone_extra_hglobal(src: HGLOBAL) -> WinResult<HGLOBAL> {
+        unsafe {
+            let size = GlobalSize(src);
+            let dst = GlobalAlloc(GMEM_MOVEABLE | GMEM_ZEROINIT, size.max(1))?;
+            let src_ptr = GlobalLock(src);
+            if src_ptr.is_null() {
+                let _ = GlobalFree(Some(dst));
+                return Err(windows::core::Error::from_thread());
+            }
+            let dst_ptr = GlobalLock(dst);
+            if dst_ptr.is_null() {
+                let _ = GlobalUnlock(src);
+                let _ = GlobalFree(Some(dst));
+                return Err(windows::core::Error::from_thread());
+            }
+            if size > 0 {
+                copy_nonoverlapping(src_ptr.cast::<u8>(), dst_ptr.cast::<u8>(), size);
+            }
+            let _ = GlobalUnlock(dst);
+            let _ = GlobalUnlock(src);
+            Ok(dst)
+        }
+    }
 }
 
 impl IDataObject_Impl for FileDropDataObject_Impl {
     fn GetData(&self, pformatetcin: *const FORMATETC) -> WinResult<STGMEDIUM> {
-        if !self.matches(pformatetcin) {
-            return Err(windows::core::Error::from(DV_E_FORMATETC));
+        if self.matches(pformatetcin) {
+            let calls = self.get_data_calls.get();
+            if calls >= MAX_GET_DATA_CALLS {
+                return Err(windows::core::Error::from(E_OUTOFMEMORY));
+            }
+            self.get_data_calls.set(calls + 1);
+            let hglobal = self.build_hdrop()?;
+            return Ok(STGMEDIUM {
+                tymed: TYMED_HGLOBAL.0 as u32,
+                u: STGMEDIUM_0 { hGlobal: hglobal },
+                pUnkForRelease: std::mem::ManuallyDrop::new(None),
+            });
         }
-        let calls = self.get_data_calls.get();
-        if calls >= MAX_GET_DATA_CALLS {
-            return Err(windows::core::Error::from(E_OUTOFMEMORY));
+        if !pformatetcin.is_null() {
+            let want = unsafe { &*pformatetcin };
+            let extra = self.extra_data.borrow();
+            if let Some((_, med)) = extra.iter().find(|(f, _)| {
+                f.cfFormat == want.cfFormat
+                    && (f.tymed & want.tymed) != 0
+                    && f.dwAspect == want.dwAspect
+            }) && (med.tymed & (TYMED_HGLOBAL.0 as u32)) != 0
+            {
+                let hglobal = FileDropDataObject::clone_extra_hglobal(unsafe { med.u.hGlobal })?;
+                return Ok(STGMEDIUM {
+                    tymed: TYMED_HGLOBAL.0 as u32,
+                    u: STGMEDIUM_0 { hGlobal: hglobal },
+                    pUnkForRelease: std::mem::ManuallyDrop::new(None),
+                });
+            }
         }
-        self.get_data_calls.set(calls + 1);
-        let hglobal = self.build_hdrop()?;
-        Ok(STGMEDIUM {
-            tymed: TYMED_HGLOBAL.0 as u32,
-            u: STGMEDIUM_0 { hGlobal: hglobal },
-            pUnkForRelease: std::mem::ManuallyDrop::new(None),
-        })
+        Err(windows::core::Error::from(DV_E_FORMATETC))
     }
 
     fn GetDataHere(&self, _pformatetc: *const FORMATETC, _pmedium: *mut STGMEDIUM) -> WinResult<()> {
@@ -245,10 +303,20 @@ impl IDataObject_Impl for FileDropDataObject_Impl {
 
     fn QueryGetData(&self, pformatetc: *const FORMATETC) -> HRESULT {
         if self.matches(pformatetc) {
-            S_OK
-        } else {
-            DV_E_FORMATETC
+            return S_OK;
         }
+        if !pformatetc.is_null() {
+            let want = unsafe { &*pformatetc };
+            let extra = self.extra_data.borrow();
+            if extra.iter().any(|(f, _)| {
+                f.cfFormat == want.cfFormat
+                    && (f.tymed & want.tymed) != 0
+                    && f.dwAspect == want.dwAspect
+            }) {
+                return S_OK;
+            }
+        }
+        DV_E_FORMATETC
     }
 
     fn GetCanonicalFormatEtc(
@@ -268,19 +336,45 @@ impl IDataObject_Impl for FileDropDataObject_Impl {
 
     fn SetData(
         &self,
-        _pformatetc: *const FORMATETC,
-        _pmedium: *const STGMEDIUM,
-        _frelease: BOOL,
+        pformatetc: *const FORMATETC,
+        pmedium: *const STGMEDIUM,
+        frelease: BOOL,
     ) -> WinResult<()> {
-        Err(windows::core::Error::from(E_NOTIMPL))
+        if pformatetc.is_null() || pmedium.is_null() {
+            return Err(windows::core::Error::from(E_INVALIDARG));
+        }
+        if !frelease.as_bool() {
+            return Err(windows::core::Error::from(E_NOTIMPL));
+        }
+        let mut fmt = unsafe { *pformatetc };
+        fmt.ptd = std::ptr::null_mut();
+        let med = unsafe { std::ptr::read(pmedium) };
+        let mut extra = self.extra_data.borrow_mut();
+        if let Some(idx) = extra
+            .iter()
+            .position(|(f, _)| f.cfFormat == fmt.cfFormat && f.dwAspect == fmt.dwAspect)
+        {
+            let (_, mut old_med) = std::mem::replace(&mut extra[idx], (fmt, med));
+            unsafe {
+                ReleaseStgMedium(&mut old_med);
+            }
+        } else {
+            extra.push((fmt, med));
+        }
+        Ok(())
     }
 
     fn EnumFormatEtc(&self, dwdirection: u32) -> WinResult<IEnumFORMATETC> {
         if dwdirection != DATADIR_GET.0 as u32 {
             return Err(windows::core::Error::from(E_NOTIMPL));
         }
-        Ok(SingleFormatEnum {
-            format: self.format,
+        let mut formats = Vec::with_capacity(1 + self.extra_data.borrow().len());
+        formats.push(self.format);
+        for (f, _) in self.extra_data.borrow().iter() {
+            formats.push(*f);
+        }
+        Ok(FormatListEnum {
+            formats,
             index: Cell::new(0),
         }
         .into())
@@ -492,6 +586,44 @@ fn post_drag_notify(notify_hwnd: Option<isize>, notify_msg: u32, source_fence_id
     }
 }
 
+struct FileDragActiveGuard;
+
+impl Drop for FileDragActiveGuard {
+    fn drop(&mut self) {
+        set_file_drag_active(false);
+    }
+}
+
+unsafe fn initialize_drag_source_helper(paths: &[String], data_obj: &IDataObject) {
+    let Ok(helper2): Result<IDragSourceHelper2, _> =
+        (unsafe { CoCreateInstance(&CLSID_DragDropHelper, None, CLSCTX_INPROC_SERVER) })
+    else {
+        return;
+    };
+    let _ = unsafe { helper2.SetFlags(DSH_ALLOWDROPDESCRIPTIONTEXT.0 as u32) };
+    const SH_DRAG_SIZE: i32 = 96;
+    let Some(hbmp) = render_drag_preview_dib(paths, SH_DRAG_SIZE) else {
+        return;
+    };
+    let shdi = SHDRAGIMAGE {
+        sizeDragImage: SIZE {
+            cx: SH_DRAG_SIZE,
+            cy: SH_DRAG_SIZE,
+        },
+        ptOffset: POINT {
+            x: SH_DRAG_SIZE / 2,
+            y: SH_DRAG_SIZE / 2,
+        },
+        hbmpDragImage: hbmp,
+        crColorKey: COLORREF(0x00FF_00FF),
+    };
+    if unsafe { helper2.InitializeFromBitmap(&shdi, data_obj) }.is_err() {
+        unsafe {
+            let _ = DeleteObject(hbmp.into());
+        }
+    }
+}
+
 /// Runs a non-blocking OLE `DoDragDrop` session on a dedicated STA thread so the UI
 /// event loop (`RedrawRequested`) is never stalled and internal fence/FreeDesktop drops
 /// bypass `winit` `DroppedFile` batching completely.
@@ -503,20 +635,32 @@ pub fn start_file_drag_out_async(
     let (tx, rx) = mpsc::channel();
     let source_fence_id = req.source_fence_id;
     if req.paths.is_empty() {
+        set_file_drag_active(false);
         let _ = tx.send(DragTargetOutcome::Cancelled);
         post_drag_notify(notify_hwnd, notify_msg, source_fence_id);
         return rx;
     }
 
+    set_file_drag_active(true);
+    let active_guard = FileDragActiveGuard;
+
     let tx_fallback = tx.clone();
     let spawn_res = std::thread::Builder::new()
         .name("desklite-drag-out".to_string())
         .spawn(move || {
+            let _active_guard = active_guard;
             let outcome = unsafe {
                 // Phase 1: Pure internal cursor tracking while the cursor stays over DeskLite
                 // windows or the desktop. This avoids calling OLE DoDragDrop on a background
                 // STA thread while hovering same-process winit IDropTarget windows (which would
                 // cause a cross-apartment COM SendMessage deadlock -> Application Hang).
+                let mut init_pt = POINT::default();
+                let mut ghost = if GetCursorPos(&mut init_pt).is_ok() {
+                    DragGhost::show(&req.paths, init_pt.x + 16, init_pt.y + 16)
+                } else {
+                    None
+                };
+
                 let mut enter_external_ole = false;
                 let mut internal_outcome: Option<DragTargetOutcome> = None;
                 loop {
@@ -527,6 +671,9 @@ pub fn start_file_drag_out_async(
                     }
                     let mut pt = POINT::default();
                     let has_pt = GetCursorPos(&mut pt).is_ok();
+                    if has_pt && let Some(ref g) = ghost {
+                        g.move_to(pt.x + 16, pt.y + 16);
+                    }
                     let hit = if has_pt { WindowFromPoint(pt) } else { HWND::default() };
                     let root = if !hit.is_invalid() {
                         GetAncestor(hit, GA_ROOT)
@@ -571,12 +718,16 @@ pub fn start_file_drag_out_async(
                     std::thread::sleep(std::time::Duration::from_millis(12));
                 }
 
+                // Tear down our internal layered ghost before exiting or entering external OLE DoDragDrop.
+                drop(ghost.take());
+
                 if let Some(done) = internal_outcome {
                     done
                 } else if enter_external_ole {
                     let ole_ok = OleInitialize(None).is_ok();
                     let _ole_guard = OleGuard(ole_ok);
-                    let data_obj: IDataObject = FileDropDataObject::new(req.paths).into();
+                    let data_obj: IDataObject = FileDropDataObject::new(req.paths.clone()).into();
+                    initialize_drag_source_helper(&req.paths, &data_obj);
                     let drop_kind = Arc::new(AtomicU8::new(ASYNC_DROP_NONE));
                     let target_hwnd = Arc::new(AtomicIsize::new(0));
                     let drop_x = Arc::new(AtomicI32::new(0));
@@ -626,6 +777,7 @@ pub fn start_file_drag_out_async(
         });
 
     if spawn_res.is_err() {
+        set_file_drag_active(false);
         let _ = tx_fallback.send(DragTargetOutcome::Cancelled);
         post_drag_notify(notify_hwnd, notify_msg, source_fence_id);
     }
@@ -1045,5 +1197,49 @@ mod tests {
         assert_eq!(match_hwnd_in_slice(hit, root, &[20, 30]), Some(20));
         assert_eq!(match_hwnd_in_slice(hit, root, &[10, 20]), Some(10));
         assert_eq!(match_hwnd_in_slice(hit, root, &[30]), None);
+    }
+
+    #[test]
+    fn data_object_set_data_roundtrips_and_enumerates_formats() {
+        let obj: IDataObject = FileDropDataObject::new(vec!["C:\\x.txt".to_string()]).into();
+        let payload = [1u8, 2, 3, 4];
+        let hglobal = alloc_hglobal_from_bytes(&payload).unwrap();
+        let custom_fmt = FORMATETC {
+            cfFormat: 0xC123,
+            ptd: std::ptr::null_mut(),
+            dwAspect: DVASPECT_CONTENT.0,
+            lindex: -1,
+            tymed: TYMED_HGLOBAL.0 as u32,
+        };
+        let med_in = STGMEDIUM {
+            tymed: TYMED_HGLOBAL.0 as u32,
+            u: STGMEDIUM_0 { hGlobal: hglobal },
+            pUnkForRelease: std::mem::ManuallyDrop::new(None),
+        };
+        unsafe { obj.SetData(&custom_fmt, &med_in, true) }.unwrap();
+        assert_eq!(unsafe { obj.QueryGetData(&custom_fmt) }, S_OK);
+        let mut med_out = unsafe { obj.GetData(&custom_fmt) }.unwrap();
+        assert_eq!(med_out.tymed, TYMED_HGLOBAL.0 as u32);
+        unsafe { ReleaseStgMedium(&mut med_out) };
+
+        let enum_fmt = unsafe { obj.EnumFormatEtc(DATADIR_GET.0 as u32) }.unwrap();
+        let mut out_fmts = [FORMATETC::default(); 4];
+        let mut fetched = 0u32;
+        let hr = unsafe { enum_fmt.Next(&mut out_fmts, Some(&mut fetched)) };
+        assert_eq!(hr, S_FALSE);
+        assert_eq!(fetched, 2);
+        assert_eq!(out_fmts[0].cfFormat, CF_HDROP.0);
+        assert_eq!(out_fmts[1].cfFormat, 0xC123);
+    }
+
+    #[test]
+    fn file_drag_active_flag_toggles_cleanly() {
+        use crate::window_attach::{is_file_drag_active, set_file_drag_active};
+        set_file_drag_active(false);
+        assert!(!is_file_drag_active());
+        set_file_drag_active(true);
+        assert!(is_file_drag_active());
+        set_file_drag_active(false);
+        assert!(!is_file_drag_active());
     }
 }

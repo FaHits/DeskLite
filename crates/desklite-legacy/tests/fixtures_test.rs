@@ -176,4 +176,76 @@ fn legacy_to_native_imports_free_desktop_items_and_clamps_boxes() {
     assert_eq!(free_icons[0].display_name, "FreeTwo.txt");
     assert_eq!(free_icons[1].display_name, "FreeOne.lnk");
     assert_ne!(free_icons[0].pos, free_icons[1].pos);
+    assert_eq!(native.unfiled_desktop_fence_id(&[]), None);
+}
+
+#[test]
+fn legacy_to_native_enforces_mutual_exclusion_between_box1_and_buckets() {
+    let topo = demo_primary_topology();
+    let bundle = LegacyBundle {
+        xml: FencesXmlModel {
+            boxes: vec![
+                LegacyBoxRecord {
+                    tag: "Box".into(),
+                    id: 1,
+                    name: String::new(),
+                    rect: Rect::new(0, 0, 2560, 1440),
+                    reserved_6_7: [0, 0],
+                    kind: 3,
+                    reserved_9_22: [0; 14],
+                    tail: String::new(),
+                },
+                LegacyBoxRecord {
+                    tag: "Box".into(),
+                    id: 101,
+                    name: "Desktop".into(),
+                    rect: Rect::new(100, 100, 400, 400),
+                    reserved_6_7: [0, 0],
+                    kind: 3,
+                    reserved_9_22: [0; 14],
+                    tail: String::new(),
+                },
+            ],
+            screens: vec![],
+            items: vec![
+                LegacyItemRecord {
+                    tag: "Item".into(),
+                    display_name: "InBox.lnk".into(),
+                    box_id: 101,
+                    order: 0,
+                    kind: 2,
+                    path: r"C:\Users\Alice\Desktop\InBox.lnk".into(),
+                    reserved: 0,
+                },
+                LegacyItemRecord {
+                    tag: "Item".into(),
+                    display_name: "InBox.lnk".into(),
+                    box_id: 1,
+                    order: 0,
+                    kind: 2,
+                    path: r"C:\Users\Alice\Desktop\InBox.lnk".into(),
+                    reserved: 0,
+                },
+                LegacyItemRecord {
+                    tag: "Item".into(),
+                    display_name: "FreeOnly.lnk".into(),
+                    box_id: 1,
+                    order: 1,
+                    kind: 2,
+                    path: r"C:\Users\Alice\Desktop\FreeOnly.lnk".into(),
+                    reserved: 0,
+                },
+            ],
+        },
+        con: None,
+    };
+
+    let native = legacy_to_native(&bundle, Some(&topo)).unwrap();
+    assert_eq!(native.fences.len(), 1);
+    assert_eq!(native.fences[0].role, Some(FenceRole::DesktopBucket));
+    assert_eq!(native.fences[0].items.len(), 1);
+    assert_eq!(native.fences[0].items[0].display_name, "InBox.lnk");
+    let free_icons = native.active_free_icons();
+    assert_eq!(free_icons.len(), 1);
+    assert_eq!(free_icons[0].display_name, "FreeOnly.lnk");
 }

@@ -9,9 +9,10 @@ use desklite_core::{
 };
 use desklite_win32::{
     all_bucket_fence_hwnds, attach_desktop_owner_and_rounded_corners, find_window_by_exact_title,
-    focus_window_now, foreground_window_handle, is_directly_on_desktop, is_free_desktop_hwnd,
-    live_sizemove_rect_for_hwnd, paste_files_to_directory_detailed, resolve_dropped_item,
-    scan_portal_directory, set_active_text_edit_hwnd, set_hwnd_locked, take_win32_hotkeys,
+    focus_window_now, foreground_window_handle, is_directly_on_desktop, is_file_drag_active,
+    is_free_desktop_hwnd, live_sizemove_rect_for_hwnd, paste_files_to_directory_detailed,
+    resolve_dropped_item, scan_portal_directory, set_active_text_edit_hwnd, set_hwnd_locked,
+    take_win32_hotkeys,
 };
 use egui::{
     Align, Color32, CornerRadius, CursorIcon, Frame, Key, Layout, Margin, PointerButton, Pos2,
@@ -30,21 +31,23 @@ use crate::item_grid::{
 use crate::snap::snap_move_rect;
 use crate::state::{
     MarqueeState, PopupOwnerState, RESIZE_EDGE, TitleDragState, UndoAction, flush_pending_repaints,
-    lock_unpoisoned, request_repaint_free_desktop, resolve_fence_layout,
+    lock_unpoisoned, resolve_fence_layout,
 };
 
 // Re-export public API for backward compatibility with desklite-app and tests.
 pub use crate::actions::apply_collapsed_menu_command;
 pub use crate::free_desktop_view::{
-    apply_free_desktop_menu_command, apply_free_icon_menu_command, render_free_desktop_viewport,
+    FreeDesktopDispatchResult, apply_free_desktop_menu_command, apply_free_icon_menu_command,
+    build_free_desktop_snapshot, handle_free_desktop_event,
 };
 pub use crate::inspector::render_inspector_viewport;
 pub use crate::state::{
     COLLAPSED_HEIGHT, CollapsedMenuCommand, FREE_DESKTOP_TITLE, FenceCommand, FenceUiOutput,
     FreeDesktopMenuCommand, FreeIconMenuCommand, INSPECTOR_HEIGHT, INSPECTOR_TITLE,
-    INSPECTOR_WIDTH, InspectorState, RenamePrompt, SharedFenceState, apply_param_editor_rect,
-    collect_managed_desktop_paths, collect_managed_desktop_paths_for_dirs, configure_egui_theme,
-    duplicate_fence_with_style, format_fence_title,
+    INSPECTOR_WIDTH, InspectorState, RenamePrompt, SelectionScope, SharedFenceState,
+    apply_param_editor_rect, collect_managed_desktop_paths,
+    collect_managed_desktop_paths_for_dirs, configure_egui_theme, duplicate_fence_with_style,
+    format_fence_title,
 };
 
 fn ensure_fence_attached(fence_id: i32, shared: &Arc<Mutex<SharedFenceState>>) {
@@ -333,10 +336,13 @@ fn handle_fence_dropped_files(
         }
     }
 
-    for fid in notify_fences {
-        ctx.request_repaint_of(ViewportId::from_hash_of(("desklite_fence", fid)));
+    {
+        let mut guard = lock_unpoisoned(shared);
+        for fid in notify_fences {
+            guard.request_repaint_fence(ctx, fid);
+        }
+        guard.mark_free_desktop_dirty(Some(ctx));
     }
-    request_repaint_free_desktop(ctx);
     ctx.request_repaint_of(ViewportId::ROOT);
 }
 
@@ -393,6 +399,34 @@ pub fn render_fence_viewport(
             } else {
                 lock_unpoisoned(shared).popup_owners.insert(fence_id, owner);
             }
+        }
+    }
+
+    let (was_focused, has_fence_sel, is_exempt) = {
+        let guard = lock_unpoisoned(shared);
+        let was = guard
+            .last_focused_fences
+            .get(&fence_id)
+            .copied()
+            .unwrap_or(false);
+        let has_sel = guard
+            .selected_items
+            .get(&fence_id)
+            .is_some_and(|s| !s.is_empty());
+        let exempt = guard.is_focus_clear_exempt(SelectionScope::Fence(fence_id), Some(&ctx));
+        (was, has_sel, exempt)
+    };
+    if focused_now {
+        lock_unpoisoned(shared)
+            .last_focused_fences
+            .insert(fence_id, true);
+    } else if (lost_focus_ev || was_focused) && !is_exempt {
+        let mut guard = lock_unpoisoned(shared);
+        guard.last_focused_fences.insert(fence_id, false);
+        if has_fence_sel {
+            guard.selected_items.remove(&fence_id);
+            guard.selection_anchor.remove(&fence_id);
+            ctx.request_repaint();
         }
     }
 
@@ -579,7 +613,7 @@ pub fn render_fence_viewport(
                     .as_ref()
                     .is_some_and(|ins| ins.target_fence_id == fence_id)
                 {
-                    ctx.request_repaint_of(ViewportId::from_hash_of("desklite_inspector"));
+                    guard.request_repaint_inspector(&ctx);
                 }
             }
             ctx.request_repaint();
@@ -615,7 +649,7 @@ pub fn render_fence_viewport(
                     .as_ref()
                     .is_some_and(|ins| ins.target_fence_id == fence_id)
                 {
-                    ctx.request_repaint_of(ViewportId::from_hash_of("desklite_inspector"));
+                    guard.request_repaint_inspector(&ctx);
                 }
             }
         }
@@ -654,12 +688,15 @@ pub fn render_fence_viewport(
     };
     if desklite_win32::is_in_size_move()
         && live_sizemove_rect_for_hwnd(my_hwnd).is_some()
-        && lock_unpoisoned(shared)
+    {
+        let guard = lock_unpoisoned(shared);
+        if guard
             .inspector
             .as_ref()
             .is_some_and(|ins| ins.open && ins.target_fence_id == fence_id)
-    {
-        ctx.request_repaint_of(ViewportId::from_hash_of("desklite_inspector"));
+        {
+            guard.request_repaint_inspector(&ctx);
+        }
     }
     if let Some(cur_phys) = live_phys_rect
         && !topology_settling
@@ -770,14 +807,22 @@ pub fn render_fence_viewport(
                     .as_ref()
                     .is_some_and(|ins| ins.target_fence_id == fence_id)
                 {
-                    ctx.request_repaint_of(ViewportId::from_hash_of("desklite_inspector"));
+                    guard.request_repaint_inspector(&ctx);
                 }
             }
         }
     }
 
     let win_rect = ui.max_rect();
-    let resize_dir = if spec.locked {
+    let drag_suppresses_resize = {
+        let guard = lock_unpoisoned(shared);
+        is_file_drag_active()
+            || guard.active_async_drag.is_some()
+            || !guard.item_reorder.is_empty()
+            || !guard.marquee_drag.is_empty()
+            || guard.title_drag.is_some()
+    };
+    let resize_dir = if spec.locked || drag_suppresses_resize {
         None
     } else {
         ctx.input(|i| i.pointer.hover_pos())
@@ -1136,13 +1181,20 @@ pub fn render_fence_viewport(
                             }
                         }
                     }
-                    if title_resp.clicked() && !focused_now {
-                        focus_window_now(my_hwnd);
+                    if title_resp.clicked() {
+                        if !focused_now {
+                            focus_window_now(my_hwnd);
+                        }
+                        let mods = ctx.input(|i| i.modifiers);
+                        if !mods.ctrl && !mods.shift {
+                            lock_unpoisoned(shared).clear_all_selections_except(None);
+                        }
                     }
                     if title_resp.secondary_clicked() {
                         if !focused_now {
                             focus_window_now(my_hwnd);
                         }
+                        lock_unpoisoned(shared).clear_all_selections_except(None);
                         open_fence_menu(
                             fence_id,
                             my_hwnd,
@@ -1193,18 +1245,21 @@ pub fn render_fence_viewport(
                 }
             } else if spec.items.is_empty() {
                 let mut blank_action: Option<ItemUiAction> = None;
+                let empty_hit_rect = ui.available_rect_before_wrap().expand2(Vec2::new(8.0, 0.0));
                 let empty_resp = ui.interact(
-                    ui.available_rect_before_wrap(),
+                    empty_hit_rect,
                     ui.make_persistent_id(("empty_body", fence_id)),
                     Sense::click(),
                 );
                 if (empty_resp.clicked() || empty_resp.secondary_clicked()) && !focused_now {
                     focus_window_now(my_hwnd);
                 }
-                if empty_resp.clicked() {
-                    let mut guard = lock_unpoisoned(shared);
-                    guard.selected_items.remove(&fence_id);
-                    guard.selection_anchor.remove(&fence_id);
+                if (empty_resp.clicked() || empty_resp.secondary_clicked()) && resize_dir.is_none()
+                {
+                    let mods = ctx.input(|i| i.modifiers);
+                    if !mods.ctrl && !mods.shift {
+                        lock_unpoisoned(shared).clear_all_selections_except(None);
+                    }
                 }
                 if empty_resp.secondary_clicked() {
                     open_fence_menu(
@@ -1288,8 +1343,9 @@ pub fn render_fence_viewport(
             let mut opened_item_popup: Option<egui::Id> = None;
             let mut item_rects: Vec<(usize, egui::Rect)> = Vec::with_capacity(spec.items.len());
             let viewport_clip_rect = ui.available_rect_before_wrap();
+            let blank_hit_rect = viewport_clip_rect.expand2(Vec2::new(8.0, 0.0));
             let blank_resp = ui.interact(
-                viewport_clip_rect,
+                blank_hit_rect,
                 ui.make_persistent_id(("blank_body", fence_id)),
                 Sense::click_and_drag(),
             );
@@ -1299,9 +1355,7 @@ pub fn render_fence_viewport(
                 }
                 let mods = ctx.input(|i| i.modifiers);
                 if !mods.ctrl && !mods.shift {
-                    let mut guard = lock_unpoisoned(shared);
-                    guard.selected_items.remove(&fence_id);
-                    guard.selection_anchor.remove(&fence_id);
+                    lock_unpoisoned(shared).clear_all_selections_except(None);
                 }
                 if blank_resp.secondary_clicked() {
                     open_fence_menu(
@@ -1506,6 +1560,7 @@ pub fn render_fence_viewport(
                     let origin = ctx.input(|i| i.pointer.press_origin()).unwrap_or(pos);
                     let additive = ctx.input(|i| i.modifiers.ctrl || i.modifiers.shift);
                     let mut guard = lock_unpoisoned(shared);
+                    guard.clear_all_selections_except(Some(SelectionScope::Fence(fence_id)));
                     let base_selection = if additive {
                         guard
                             .selected_items
@@ -1584,7 +1639,8 @@ pub fn render_fence_viewport(
             if let Some(reorder) = active_reorder {
                 let pointer_pos = ctx.input(|i| i.pointer.interact_pos());
                 let primary_down = ctx.input(|i| i.pointer.primary_down());
-                let inside_fence = pointer_pos.is_some_and(|p| win_rect.shrink(2.0).contains(p));
+                let inside_fence =
+                    pointer_pos.is_some_and(|p| win_rect.shrink(RESIZE_EDGE + 1.0).contains(p));
                 if primary_down && !inside_fence {
                     lock_unpoisoned(shared).item_reorder.remove(&fence_id);
                     start_async_drag_from_paths(Some(fence_id), reorder.paths, shared);
@@ -2528,5 +2584,208 @@ mod tests {
             g.config.snapshots.get(&dual_key).and_then(|s| s.fences.get(&101)).copied(),
             Some(orig_rect)
         );
+    }
+
+    #[test]
+    fn clear_all_selections_except_enforces_global_single_focus() {
+        let f1 = FenceSpec {
+            id: 101,
+            name: "One".into(),
+            kind: FenceKind::IconGrid,
+            rect: Rect::new(20, 20, 320, 320),
+            collapsed: false,
+            locked: false,
+            role: Some(FenceRole::DesktopBucket),
+            portal_dir: None,
+            backdrop_alpha: 115,
+            layout_override: None,
+            items: Vec::new(),
+        };
+        let f2 = FenceSpec {
+            id: 102,
+            name: "Two".into(),
+            ..f1.clone()
+        };
+        let shared = test_shared(vec![f1, f2]);
+        let mut g = lock_unpoisoned(&shared);
+        g.selected_items.insert(101, [0, 1].into_iter().collect());
+        g.selection_anchor.insert(101, 0);
+        g.selected_items.insert(102, [2].into_iter().collect());
+        g.selection_anchor.insert(102, 2);
+        g.free_selected_paths.insert("desktop/a.txt".into());
+        g.free_selection_anchor = Some("desktop/a.txt".into());
+
+        g.clear_all_selections_except(Some(SelectionScope::Fence(101)));
+        assert_eq!(g.selected_items.get(&101).map(HashSet::len), Some(2));
+        assert!(!g.selected_items.contains_key(&102));
+        assert!(g.free_selected_paths.is_empty());
+
+        g.selected_items.insert(102, [1].into_iter().collect());
+        g.free_selected_paths.insert("desktop/b.txt".into());
+        g.clear_all_selections_except(Some(SelectionScope::FreeDesktop));
+        assert!(g.selected_items.is_empty());
+        assert_eq!(g.free_selected_paths.len(), 1);
+
+        g.selected_items.insert(101, [0].into_iter().collect());
+        g.clear_all_selections_except(None);
+        assert!(g.selected_items.is_empty());
+        assert!(g.free_selected_paths.is_empty());
+    }
+
+    #[test]
+    fn focus_clear_exemption_and_fence_focus_loss_deselect() {
+        let f1 = FenceSpec {
+            id: 101,
+            name: "One".into(),
+            kind: FenceKind::IconGrid,
+            rect: Rect::new(20, 20, 320, 320),
+            collapsed: false,
+            locked: false,
+            role: Some(FenceRole::DesktopBucket),
+            portal_dir: None,
+            backdrop_alpha: 115,
+            layout_override: None,
+            items: vec![FenceItem {
+                display_name: "a.txt".into(),
+                order: 0,
+                kind: ItemKind::File,
+                path: r"C:\Users\Demo\Desktop\a.txt".into(),
+            }],
+        };
+        let shared = test_shared(vec![f1]);
+        {
+            let mut g = lock_unpoisoned(&shared);
+            assert!(!g.is_focus_clear_exempt(SelectionScope::Fence(101), None));
+            g.menu_popup_active = true;
+            assert!(g.is_focus_clear_exempt(SelectionScope::Fence(101), None));
+            assert!(g.is_focus_clear_exempt(SelectionScope::FreeDesktop, None));
+            g.menu_popup_active = false;
+            g.item_rename_prompt = Some(crate::state::ItemRenamePrompt {
+                fence_id: 101,
+                item_idx: 0,
+                original_path: r"C:\Users\Demo\Desktop\a.txt".into(),
+                draft: "a.txt".into(),
+                needs_focus: false,
+            });
+            assert!(g.is_focus_clear_exempt(SelectionScope::Fence(101), None));
+            assert!(!g.is_focus_clear_exempt(SelectionScope::FreeDesktop, None));
+            g.item_rename_prompt = None;
+            g.selected_items.insert(101, [0].into_iter().collect());
+            g.last_focused_fences.insert(101, true);
+        }
+
+        let ctx = egui::Context::default();
+        let unfocused = egui::RawInput {
+            screen_rect: Some(egui::Rect::from_min_size(
+                Pos2::new(0.0, 0.0),
+                Vec2::new(300.0, 300.0),
+            )),
+            focused: false,
+            events: vec![egui::Event::WindowFocused(false)],
+            ..Default::default()
+        };
+        let mut out = ctx.run_ui(unfocused, |ui| {
+            let _ = render_fence_viewport(ui, 101, &shared);
+        });
+        out.textures_delta.clear();
+
+        let g = lock_unpoisoned(&shared);
+        assert!(
+            g.selected_items.get(&101).is_none_or(HashSet::is_empty),
+            "non-exempt focus loss should clear fence selection"
+        );
+    }
+
+    #[test]
+    fn free_desktop_snapshot_and_event_bridge_handle_selection_marquee_and_focus_loss() {
+        let f1 = FenceSpec {
+            id: 101,
+            name: "Bucket".into(),
+            kind: FenceKind::IconGrid,
+            rect: Rect::new(400, 100, 700, 400),
+            collapsed: false,
+            locked: false,
+            role: Some(FenceRole::DesktopBucket),
+            portal_dir: None,
+            backdrop_alpha: 115,
+            layout_override: None,
+            items: Vec::new(),
+        };
+        let shared = test_shared(vec![f1]);
+        {
+            let mut g = lock_unpoisoned(&shared);
+            let snap_key = g.config.active_topology.clone().unwrap();
+            g.config.snapshots.get_mut(&snap_key).unwrap().free_icons = vec![
+                DesktopIconPos {
+                    id: r"C:\Users\Demo\Desktop\alpha.txt".into(),
+                    display_name: "alpha.txt".into(),
+                    pos: Point { x: 20, y: 20 },
+                },
+                DesktopIconPos {
+                    id: r"C:\Users\Demo\Desktop\beta.txt".into(),
+                    display_name: "beta.txt".into(),
+                    pos: Point { x: 140, y: 20 },
+                },
+            ];
+            g.selected_items.insert(101, [0].into_iter().collect());
+            let snap = build_free_desktop_snapshot(&g);
+            assert_eq!(snap.icons.len(), 2);
+            assert!(!snap.hide_all_fences);
+        }
+
+        let r1 = handle_free_desktop_event(
+            desklite_win32::FreeDesktopEvent::IconClicked {
+                path: r"C:\Users\Demo\Desktop\alpha.txt".into(),
+                ctrl: false,
+                shift: false,
+            },
+            &shared,
+        );
+        assert!(r1.needs_snapshot_refresh);
+        assert_eq!(r1.repaint_fences, vec![101]);
+        {
+            let g = lock_unpoisoned(&shared);
+            assert!(g.selected_items.is_empty());
+            let snap = build_free_desktop_snapshot(&g);
+            assert!(snap.icons[0].selected);
+            assert!(!snap.icons[1].selected);
+        }
+
+        let r2 = handle_free_desktop_event(
+            desklite_win32::FreeDesktopEvent::MarqueeSelect {
+                rect: Rect::new(10, 10, 200, 90),
+                additive: false,
+            },
+            &shared,
+        );
+        assert!(r2.needs_snapshot_refresh);
+        assert_eq!(lock_unpoisoned(&shared).free_selected_paths.len(), 2);
+
+        // Exempt while menu_popup_active is true.
+        lock_unpoisoned(&shared).menu_popup_active = true;
+        let r3 = handle_free_desktop_event(desklite_win32::FreeDesktopEvent::FocusLost, &shared);
+        assert!(!r3.needs_snapshot_refresh);
+        assert_eq!(lock_unpoisoned(&shared).free_selected_paths.len(), 2);
+
+        // External FocusLost clears selection once exemption ends.
+        lock_unpoisoned(&shared).menu_popup_active = false;
+        let r4 = handle_free_desktop_event(desklite_win32::FreeDesktopEvent::FocusLost, &shared);
+        assert!(r4.needs_snapshot_refresh);
+        assert!(lock_unpoisoned(&shared).free_selected_paths.is_empty());
+
+        // BlankClicked clears both fence and free desktop selections.
+        {
+            let mut g = lock_unpoisoned(&shared);
+            g.selected_items.insert(101, [0].into_iter().collect());
+            g.free_selected_paths
+                .insert(normalize_path_key(r"C:\Users\Demo\Desktop\alpha.txt"));
+        }
+        let r5 =
+            handle_free_desktop_event(desklite_win32::FreeDesktopEvent::BlankClicked, &shared);
+        assert!(r5.needs_snapshot_refresh);
+        assert_eq!(r5.repaint_fences, vec![101]);
+        let g = lock_unpoisoned(&shared);
+        assert!(g.selected_items.is_empty());
+        assert!(g.free_selected_paths.is_empty());
     }
 }

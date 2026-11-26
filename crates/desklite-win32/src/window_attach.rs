@@ -28,17 +28,16 @@ use windows::Win32::UI::WindowsAndMessaging::{
     GWL_STYLE, GWLP_HWNDPARENT, GWLP_WNDPROC, GetClassNameW, GetCursorPos, GetDesktopWindow,
     GetForegroundWindow, GetTopWindow, GetWindow, GetWindowLongPtrW, GetWindowRect, HTBOTTOM,
     HTBOTTOMLEFT, HTBOTTOMRIGHT, HTLEFT, HTRIGHT, HTTOP, HTTOPLEFT, HTTOPRIGHT, HWND_BOTTOM,
-    HWND_TOP, IsIconic, IsWindow, IsWindowVisible, PostMessageW, SC_MAXIMIZE, SC_MINIMIZE,
-    SC_RESTORE, STYLESTRUCT, SWP_FRAMECHANGED, SWP_NOACTIVATE, SWP_NOMOVE, SWP_NOSIZE,
-    SWP_NOZORDER, SetForegroundWindow, SetWindowLongPtrW, SetWindowPos, WINDOWPOS,
-    WINEVENT_OUTOFCONTEXT, WINEVENT_SKIPOWNPROCESS, WM_APP, WM_CANCELMODE, WM_CAPTURECHANGED,
-    WM_ENTERSIZEMOVE, WM_ERASEBKGND, WM_EXITSIZEMOVE, WM_KEYDOWN, WM_LBUTTONDOWN, WM_MOVING,
-    WM_NCACTIVATE, WM_NCCALCSIZE, WM_NCDESTROY, WM_NCHITTEST, WM_NCPAINT, WM_RBUTTONDOWN,
-    WM_SIZING, WM_STYLECHANGING, WM_SYSCOMMAND, WM_WINDOWPOSCHANGING, WNDPROC, WS_BORDER,
-    WS_CAPTION, WS_DLGFRAME,
-    WS_EX_APPWINDOW, WS_EX_CLIENTEDGE, WS_EX_DLGMODALFRAME, WS_EX_TOOLWINDOW, WS_EX_TOPMOST,
-    WS_EX_WINDOWEDGE, WS_MAXIMIZE, WS_MAXIMIZEBOX, WS_MINIMIZE, WS_MINIMIZEBOX, WS_POPUP,
-    WS_SYSMENU,
+    HWND_TOP, IDC_ARROW, IsIconic, IsWindow, IsWindowVisible, LoadCursorW, PostMessageW,
+    SC_MAXIMIZE, SC_MINIMIZE, SC_RESTORE, STYLESTRUCT, SWP_FRAMECHANGED, SWP_NOACTIVATE,
+    SWP_NOMOVE, SWP_NOSIZE, SWP_NOZORDER, SetCursor, SetForegroundWindow, SetWindowLongPtrW,
+    SetWindowPos, WINDOWPOS, WINEVENT_OUTOFCONTEXT, WINEVENT_SKIPOWNPROCESS, WM_APP, WM_CANCELMODE,
+    WM_CAPTURECHANGED, WM_ENTERSIZEMOVE, WM_ERASEBKGND, WM_EXITSIZEMOVE, WM_KEYDOWN,
+    WM_LBUTTONDOWN, WM_MOVING, WM_NCACTIVATE, WM_NCCALCSIZE, WM_NCDESTROY, WM_NCHITTEST,
+    WM_NCPAINT, WM_RBUTTONDOWN, WM_SETCURSOR, WM_SIZING, WM_STYLECHANGING, WM_SYSCOMMAND,
+    WM_WINDOWPOSCHANGING, WNDPROC, WS_BORDER, WS_CAPTION, WS_DLGFRAME, WS_EX_APPWINDOW,
+    WS_EX_CLIENTEDGE, WS_EX_DLGMODALFRAME, WS_EX_TOOLWINDOW, WS_EX_TOPMOST, WS_EX_WINDOWEDGE,
+    WS_MAXIMIZE, WS_MAXIMIZEBOX, WS_MINIMIZE, WS_MINIMIZEBOX, WS_POPUP, WS_SYSMENU,
 };
 use windows::core::{BOOL, HSTRING, PCSTR, w};
 
@@ -58,10 +57,19 @@ const DISALLOWED_EX_STYLES: u32 =
 
 static IN_SIZE_MOVE_HWND: std::sync::atomic::AtomicIsize = std::sync::atomic::AtomicIsize::new(0);
 static FREE_DESKTOP_HWND: std::sync::atomic::AtomicIsize = std::sync::atomic::AtomicIsize::new(0);
+static FILE_DRAG_ACTIVE: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 static DEFERRED_Z_AFTER_SIZEMOVE: std::sync::atomic::AtomicBool =
     std::sync::atomic::AtomicBool::new(false);
 static LAST_SELF_Z_MS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 static START_MONO: OnceLock<std::time::Instant> = OnceLock::new();
+
+pub fn set_file_drag_active(active: bool) {
+    FILE_DRAG_ACTIVE.store(active, std::sync::atomic::Ordering::Release);
+}
+
+pub fn is_file_drag_active() -> bool {
+    FILE_DRAG_ACTIVE.load(std::sync::atomic::Ordering::Acquire)
+}
 
 fn lock_unpoisoned<T>(m: &Mutex<T>) -> MutexGuard<'_, T> {
     m.lock().unwrap_or_else(|e| e.into_inner())
@@ -243,6 +251,23 @@ pub fn live_sizemove_rect_for_hwnd(raw_hwnd: isize) -> Option<(i32, i32, i32, i3
 
 pub fn set_inspector_hwnd(raw_hwnd: isize) {
     INSPECTOR_HWND.store(raw_hwnd, std::sync::atomic::Ordering::Release);
+}
+
+pub fn inspector_hwnd() -> isize {
+    INSPECTOR_HWND.load(std::sync::atomic::Ordering::Acquire)
+}
+
+pub fn is_popup_menu_hwnd(raw_hwnd: isize) -> bool {
+    if raw_hwnd == 0 {
+        return false;
+    }
+    let hwnd = HWND(raw_hwnd as *mut _);
+    if !unsafe { IsWindow(Some(hwnd)).as_bool() } {
+        return false;
+    }
+    let mut buf = [0u16; 32];
+    let len = unsafe { GetClassNameW(hwnd, &mut buf) } as usize;
+    String::from_utf16_lossy(&buf[..len]) == "#32768"
 }
 
 pub fn set_active_text_edit_hwnd(raw_hwnd: isize) {
@@ -625,7 +650,7 @@ pub fn post_reassert_all_fences_z() {
 }
 
 unsafe fn hit_test_resize_border(hwnd: HWND, lparam: LPARAM) -> Option<LRESULT> {
-    if is_hwnd_locked(hwnd) {
+    if is_file_drag_active() || is_hwnd_locked(hwnd) {
         return None;
     }
     let mut wr = windows::Win32::Foundation::RECT::default();
@@ -799,6 +824,14 @@ unsafe extern "system" fn bottom_subclass_proc(
         && let Some(hit) = unsafe { hit_test_resize_border(hwnd, lparam) }
     {
         return hit;
+    }
+    if msg == WM_SETCURSOR && is_file_drag_active() {
+        if let Ok(arrow) = unsafe { LoadCursorW(None, IDC_ARROW) } {
+            unsafe {
+                let _ = SetCursor(Some(arrow));
+            }
+        }
+        return LRESULT(1);
     }
     if msg == WM_LBUTTONDOWN || msg == WM_RBUTTONDOWN {
         unsafe {

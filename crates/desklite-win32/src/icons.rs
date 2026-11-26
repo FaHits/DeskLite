@@ -148,26 +148,33 @@ impl IconCache {
     }
 
     fn extract_icon(&self, path: &str) -> Option<DecodedIcon> {
-        if Path::new(path).exists()
-            && let Some(jumbo_hicon) = load_sys_image_list_icon(path, SHIL_JUMBO as i32)
-        {
-            let jumbo = hicon_to_pbgra(jumbo_hicon);
-            unsafe {
-                let _ = DestroyIcon(jumbo_hicon);
-            }
-            if let Some(decoded) = jumbo
-                && has_pixels_outside_top_left(&decoded, 64)
-            {
-                return Some(decoded);
-            }
-        }
-        let hicon = load_hicon_for_path(path)?;
-        let decoded = hicon_to_pbgra(hicon);
-        unsafe {
-            let _ = DestroyIcon(hicon);
-        }
-        decoded
+        extract_file_icon_pbgra(Path::new(path))
     }
+}
+
+/// Extracts a 32bpp premultiplied BGRA (`PBGRA`) icon bitmap for `path` on the calling thread.
+pub fn extract_file_icon_pbgra(path: &Path) -> Option<DecodedIcon> {
+    let raw = path.to_string_lossy();
+    let path_str = raw.as_ref();
+    if path.exists()
+        && let Some(jumbo_hicon) = load_sys_image_list_icon(path_str, SHIL_JUMBO as i32)
+    {
+        let jumbo = hicon_to_pbgra(jumbo_hicon);
+        unsafe {
+            let _ = DestroyIcon(jumbo_hicon);
+        }
+        if let Some(decoded) = jumbo
+            && has_pixels_outside_top_left(&decoded, 64)
+        {
+            return Some(decoded);
+        }
+    }
+    let hicon = load_hicon_for_path(path_str)?;
+    let decoded = hicon_to_pbgra(hicon);
+    unsafe {
+        let _ = DestroyIcon(hicon);
+    }
+    decoded
 }
 
 fn has_pixels_outside_top_left(icon: &DecodedIcon, threshold: u32) -> bool {

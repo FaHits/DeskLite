@@ -10,9 +10,11 @@ use desklite_core::{
     clamp_rect_to_monitors, normalize_path_key,
 };
 use desklite_win32::{
-    DragTargetOutcome, IconCache, all_desktop_dirs, is_ctrl_key_down, is_directly_on_desktop,
-    paste_files_to_directory_detailed, resolve_dropped_item, scan_portal_directory,
-    set_window_rect_no_z, trash_files, user_desktop_dir,
+    DragTargetOutcome, FreeDesktopRenderItem, FreeDesktopSnapshot, IconCache, all_desktop_dirs,
+    foreground_window_handle, inspector_hwnd, is_ctrl_key_down, is_directly_on_desktop,
+    is_file_drag_active, is_popup_menu_hwnd, paste_files_to_directory_detailed,
+    resolve_dropped_item, scan_portal_directory, set_window_rect_no_z, trash_files,
+    user_desktop_dir,
 };
 use egui::{
     Color32, ColorImage, CornerRadius, Pos2, Stroke, TextureHandle, TextureOptions, Vec2,
@@ -248,6 +250,12 @@ pub struct InspectorState {
     pub name_edit_initial: Option<(i32, String)>,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SelectionScope {
+    Fence(i32),
+    FreeDesktop,
+}
+
 #[derive(Debug, Clone, Copy)]
 pub struct TitleDragState {
     pub fence_id: i32,
@@ -266,6 +274,11 @@ pub struct SharedFenceState {
     pub attached_hwnds: HashMap<i32, isize>,
     pub hwnd_to_fence: HashMap<isize, i32>,
     pub free_desktop_hwnd: isize,
+    pub free_desktop_notify_hwnd: isize,
+    pub free_desktop_notify_msg: u32,
+    pub helper_hwnd: isize,
+    pub menu_popup_active: bool,
+    pub last_focused_fences: HashMap<i32, bool>,
     pub builder_rects: HashMap<i32, (Rect, bool)>,
     pub rename_prompt: Option<RenamePrompt>,
     pub item_rename_prompt: Option<ItemRenamePrompt>,
@@ -326,6 +339,11 @@ impl SharedFenceState {
             attached_hwnds: HashMap::new(),
             hwnd_to_fence: HashMap::new(),
             free_desktop_hwnd: 0,
+            free_desktop_notify_hwnd: 0,
+            free_desktop_notify_msg: 0,
+            helper_hwnd: 0,
+            menu_popup_active: false,
+            last_focused_fences: HashMap::new(),
             builder_rects,
             rename_prompt: None,
             item_rename_prompt: None,
@@ -375,6 +393,162 @@ impl SharedFenceState {
     pub fn set_drag_notify_target(&mut self, helper_hwnd: isize, notify_msg: u32) {
         self.drag_notify_hwnd = (helper_hwnd != 0).then_some(helper_hwnd);
         self.drag_notify_msg = notify_msg;
+        if helper_hwnd != 0 && self.helper_hwnd == 0 {
+            self.helper_hwnd = helper_hwnd;
+        }
+    }
+
+    pub fn set_free_desktop_notify_target(&mut self, notify_hwnd: isize, notify_msg: u32) {
+        self.free_desktop_notify_hwnd = notify_hwnd;
+        self.free_desktop_notify_msg = notify_msg;
+        if notify_hwnd != 0 && self.helper_hwnd == 0 {
+            self.helper_hwnd = notify_hwnd;
+        }
+    }
+
+    pub fn set_helper_hwnd(&mut self, helper_hwnd: isize) {
+        self.helper_hwnd = helper_hwnd;
+    }
+
+    pub fn fence_viewport_is_mounted(&self, fence_id: i32) -> bool {
+        !self.config.hide_all_fences && self.config.fences.iter().any(|f| f.id == fence_id)
+    }
+
+    pub fn request_repaint_fence(&self, ctx: &egui::Context, fence_id: i32) {
+        if self.fence_viewport_is_mounted(fence_id) {
+            ctx.request_repaint_of(ViewportId::from_hash_of(("desklite_fence", fence_id)));
+        }
+    }
+
+    pub fn request_repaint_inspector(&self, ctx: &egui::Context) {
+        if self.inspector_spawned {
+            ctx.request_repaint_of(ViewportId::from_hash_of("desklite_inspector"));
+        }
+    }
+
+    pub fn mark_free_desktop_dirty(&mut self, ctx: Option<&egui::Context>) {
+        self.pending_repaint_free_desktop = true;
+        if let Some(ctx) = ctx {
+            ctx.request_repaint_of(ViewportId::ROOT);
+        }
+    }
+
+    /// Clears all item selections globally except for the optional active `keep` scope.
+    pub fn clear_all_selections_except(&mut self, keep: Option<SelectionScope>) {
+        match keep {
+            Some(SelectionScope::Fence(keep_fid)) => {
+                self.selected_items.retain(|fid, _| *fid == keep_fid);
+                self.selection_anchor.retain(|fid, _| *fid == keep_fid);
+                self.free_selected_paths.clear();
+                self.free_selection_anchor = None;
+            }
+            Some(SelectionScope::FreeDesktop) => {
+                self.selected_items.clear();
+                self.selection_anchor.clear();
+            }
+            None => {
+                self.selected_items.clear();
+                self.selection_anchor.clear();
+                self.free_selected_paths.clear();
+                self.free_selection_anchor = None;
+            }
+        }
+    }
+
+    /// Returns `true` when focus loss on `scope` must NOT clear its selection (active popup menu,
+    /// drag operation, inline rename, or inspector bound to that fence).
+    pub fn is_focus_clear_exempt(&self, scope: SelectionScope, ctx: Option<&egui::Context>) -> bool {
+        if self.menu_popup_active
+            || self.active_async_drag.is_some()
+            || self.free_icon_drag.is_some()
+            || !self.item_reorder.is_empty()
+            || self.free_marquee.is_some()
+            || !self.marquee_drag.is_empty()
+            || is_file_drag_active()
+        {
+            return true;
+        }
+        if !self.popup_owners.is_empty() {
+            return true;
+        }
+        if let Some(ctx) = ctx
+            && egui::Popup::is_any_open(ctx)
+        {
+            return true;
+        }
+        match scope {
+            SelectionScope::Fence(fid) => {
+                if self
+                    .item_rename_prompt
+                    .as_ref()
+                    .is_some_and(|r| r.fence_id == fid)
+                    || self
+                        .rename_prompt
+                        .as_ref()
+                        .is_some_and(|r| r.fence_id == fid)
+                {
+                    return true;
+                }
+            }
+            SelectionScope::FreeDesktop => {
+                if self.free_rename_prompt.is_some() {
+                    return true;
+                }
+            }
+        }
+        let fg = foreground_window_handle();
+        if fg != 0 {
+            if (self.helper_hwnd != 0 && fg == self.helper_hwnd) || is_popup_menu_hwnd(fg) {
+                return true;
+            }
+            if let SelectionScope::Fence(fid) = scope
+                && self.inspector_spawned
+                && self
+                    .inspector
+                    .as_ref()
+                    .is_some_and(|ins| ins.open && ins.target_fence_id == fid)
+            {
+                let insp_hwnd = inspector_hwnd();
+                if insp_hwnd != 0 && fg == insp_hwnd {
+                    return true;
+                }
+            }
+        }
+        false
+    }
+
+    pub fn build_free_desktop_snapshot(&self) -> FreeDesktopSnapshot {
+        let cell_w = self.config.preferences.icon_cell_w.clamp(48, 180);
+        let cell_h = self.config.preferences.icon_cell_h.clamp(56, 200);
+        let icons = if self.config.hide_all_fences {
+            Vec::new()
+        } else {
+            self.config
+                .active_free_icons()
+                .iter()
+                .map(|icon| {
+                    let key = normalize_path_key(&icon.id);
+                    let display_name = Path::new(&icon.id)
+                        .file_name()
+                        .map(|n| n.to_string_lossy().into_owned())
+                        .filter(|s| !s.is_empty())
+                        .unwrap_or_else(|| icon.id.clone());
+                    FreeDesktopRenderItem {
+                        path: icon.id.clone(),
+                        display_name,
+                        pos: icon.pos,
+                        selected: self.free_selected_paths.contains(&key),
+                        is_cut: self.cut_paths.contains(&key),
+                    }
+                })
+                .collect()
+        };
+        FreeDesktopSnapshot {
+            virtual_bounds: self.topology.virtual_bounds(),
+            cell_size: (cell_w, cell_h),
+            hide_all_fences: self.config.hide_all_fences,
+            icons,
+        }
     }
 
     pub fn begin_topology_settling(&mut self, duration: Duration) {
@@ -495,6 +669,9 @@ impl SharedFenceState {
         self.scroll_to_item.retain(|id, _| active_ids.contains(id));
         self.type_ahead.retain(|id, _| active_ids.contains(id));
         self.toast_msg.retain(|id, _| active_ids.contains(id));
+        self.last_title_click.retain(|id, _| active_ids.contains(id));
+        self.last_focused_fences.retain(|id, _| active_ids.contains(id));
+        self.pending_repaint_fences.retain(|id| active_ids.contains(id));
         self.popup_owners.retain(|id, _| active_ids.contains(id));
         self.pending_toggle_collapse.retain(|id| active_ids.contains(id));
         self.pending_collapse_until.retain(|id, _| active_ids.contains(id));
@@ -751,6 +928,7 @@ impl SharedFenceState {
                             }
                         }
                         if changed {
+                            self.clear_all_selections_except(None);
                             self.refresh_all_unfiled_from_disk_if_present();
                             self.pending_repaint_fences.insert(target_fid);
                             self.pending_repaint_free_desktop = true;
@@ -885,6 +1063,7 @@ impl SharedFenceState {
                                 added_paths: Vec::new(),
                                 is_portal: true,
                             });
+                            self.clear_all_selections_except(None);
                             self.pending_repaint_fences.insert(target_fid);
                             self.pending_repaint_free_desktop = true;
                             return true;
@@ -978,10 +1157,14 @@ impl SharedFenceState {
                         None => {}
                     }
                 } else {
+                    self.clear_all_selections_except(Some(SelectionScope::FreeDesktop));
                     self.place_released_icons_on_free_desktop(&paths, Some((screen_x, screen_y)));
                     changed = true;
                 }
                 if changed {
+                    if source_fence_id.is_some() {
+                        self.clear_all_selections_except(None);
+                    }
                     self.refresh_all_unfiled_from_disk_if_present();
                     self.pending_repaint_free_desktop = true;
                 }
@@ -1006,6 +1189,7 @@ impl SharedFenceState {
                     self.pending_repaint_fences.insert(src_fid);
                 }
                 if changed {
+                    self.clear_all_selections_except(None);
                     self.refresh_all_unfiled_from_disk_if_present();
                     self.pending_repaint_free_desktop = true;
                 }
@@ -1287,31 +1471,44 @@ pub fn apply_param_editor_rect(
             );
         }
     }
-    ctx.request_repaint_of(ViewportId::from_hash_of(("desklite_fence", fence_id)));
+    let mounted = lock_unpoisoned(shared).fence_viewport_is_mounted(fence_id);
+    if mounted {
+        ctx.request_repaint_of(ViewportId::from_hash_of(("desklite_fence", fence_id)));
+    }
     final_rect
 }
 
 pub fn request_repaint_all_fences(shared: &Arc<Mutex<SharedFenceState>>, ctx: &egui::Context) {
-    let ids: Vec<i32> = lock_unpoisoned(shared)
-        .config
-        .fences
-        .iter()
-        .map(|f| f.id)
-        .collect();
+    let ids: Vec<i32> = {
+        let guard = lock_unpoisoned(shared);
+        if guard.config.hide_all_fences {
+            return;
+        }
+        guard.config.fences.iter().map(|f| f.id).collect()
+    };
     for fid in ids {
         ctx.request_repaint_of(ViewportId::from_hash_of(("desklite_fence", fid)));
     }
 }
 
 pub fn request_repaint_free_desktop(ctx: &egui::Context) {
-    ctx.request_repaint_of(ViewportId::from_hash_of("desklite_free_desktop"));
+    ctx.request_repaint_of(ViewportId::ROOT);
 }
 
 pub fn flush_pending_repaints(shared: &Arc<Mutex<SharedFenceState>>, ctx: &egui::Context) {
     let (fids, free) = {
         let mut guard = lock_unpoisoned(shared);
-        let fids: Vec<i32> = guard.pending_repaint_fences.drain().collect();
-        let free = std::mem::take(&mut guard.pending_repaint_free_desktop);
+        let fids: Vec<i32> = if guard.config.hide_all_fences {
+            guard.pending_repaint_fences.clear();
+            Vec::new()
+        } else {
+            let drained: Vec<i32> = guard.pending_repaint_fences.drain().collect();
+            drained
+                .into_iter()
+                .filter(|fid| guard.config.fences.iter().any(|f| f.id == *fid))
+                .collect()
+        };
+        let free = guard.pending_repaint_free_desktop;
         (fids, free)
     };
     for fid in fids {

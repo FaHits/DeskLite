@@ -7,9 +7,7 @@ use desklite_core::{FenceItem, normalize_path_key};
 use desklite_win32::{move_path_in_place, rename_file_in_place, scan_portal_directory, trash_files};
 use egui::ViewportId;
 
-use crate::state::{
-    FenceUiOutput, SharedFenceState, UndoAction, lock_unpoisoned, request_repaint_free_desktop,
-};
+use crate::state::{FenceUiOutput, SharedFenceState, UndoAction, lock_unpoisoned};
 
 fn push_undo_toast(guard: &mut SharedFenceState, caller_fence_id: Option<i32>, msg: String) {
     if let Some(fid) = caller_fence_id {
@@ -328,12 +326,12 @@ pub fn execute_undo(
     {
         let mut guard = lock_unpoisoned(shared);
         push_undo_toast(&mut guard, caller_fence_id, label.to_string());
-    }
-    for fid in notify_fences {
-        ctx.request_repaint_of(ViewportId::from_hash_of(("desklite_fence", fid)));
-    }
-    if notify_free {
-        request_repaint_free_desktop(ctx);
+        for fid in notify_fences {
+            guard.request_repaint_fence(ctx, fid);
+        }
+        if notify_free {
+            guard.mark_free_desktop_dirty(Some(ctx));
+        }
     }
     ctx.request_repaint_of(ViewportId::ROOT);
 }

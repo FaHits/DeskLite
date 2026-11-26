@@ -13,17 +13,17 @@ use desklite_win32::{
     is_ctrl_key_down, is_directly_on_desktop, launch_as_admin, launch_item,
     paste_files_to_directory_detailed, read_clipboard_files, rename_file_in_place,
     resolve_dropped_item, reveal_in_explorer, scan_portal_directory,
-    set_clipboard_files_for_window, set_hwnd_locked, show_file_properties,
+    set_clipboard_files_for_window, set_file_drag_active, set_hwnd_locked, show_file_properties,
     start_file_drag_out_async, trash_files, user_desktop_dir,
 };
-use egui::{Key, Vec2, ViewportCommand, ViewportId};
+use egui::{Key, Vec2, ViewportCommand};
 
 use crate::inspector::open_param_editor_for_fence;
 use crate::item_grid::ItemUiAction;
 use crate::state::{
     AsyncDragSession, COLLAPSED_HEIGHT, CollapsedMenuCommand, DragSourceState, FenceCommand,
-    FenceUiOutput, ItemRenamePrompt, RenamePrompt, ReorderDragState, SharedFenceState, UndoAction,
-    duplicate_fence_with_style, lock_unpoisoned, request_repaint_free_desktop,
+    FenceUiOutput, ItemRenamePrompt, RenamePrompt, ReorderDragState, SelectionScope,
+    SharedFenceState, UndoAction, duplicate_fence_with_style, lock_unpoisoned,
 };
 use crate::undo::execute_undo;
 
@@ -39,6 +39,7 @@ pub fn dispatch_win32_hotkey(
         Win32Hotkey::SelectAll => {
             if !spec.items.is_empty() {
                 let mut guard = lock_unpoisoned(shared);
+                guard.clear_all_selections_except(Some(SelectionScope::Fence(fence_id)));
                 guard
                     .selected_items
                     .insert(fence_id, (0..spec.items.len()).collect());
@@ -323,6 +324,7 @@ fn update_selection_for_drag_start(
     ctrl: bool,
     shift: bool,
 ) -> Vec<usize> {
+    guard.clear_all_selections_except(Some(SelectionScope::Fence(fence_id)));
     let cur_set = guard
         .selected_items
         .get(&fence_id)
@@ -394,6 +396,7 @@ pub fn start_async_drag_from_paths(
             guard.drag_notify_msg,
         )
     };
+    set_file_drag_active(true);
     let rx = start_file_drag_out_async(
         AsyncDragRequest {
             source_fence_id,
@@ -428,6 +431,7 @@ pub fn execute_item_action(
     match act {
         ItemUiAction::Select { idx, ctrl, shift } => {
             let mut guard = lock_unpoisoned(shared);
+            guard.clear_all_selections_except(Some(SelectionScope::Fence(fence_id)));
             let anchor = guard.selection_anchor.get(&fence_id).copied();
             let set = guard.selected_items.entry(fence_id).or_default();
             if shift {
@@ -451,6 +455,7 @@ pub fn execute_item_action(
         }
         ItemUiAction::ContextSelect(idx) => {
             let mut guard = lock_unpoisoned(shared);
+            guard.clear_all_selections_except(Some(SelectionScope::Fence(fence_id)));
             let set = guard.selected_items.entry(fence_id).or_default();
             if !set.contains(&idx) {
                 set.clear();
@@ -620,9 +625,9 @@ pub fn execute_item_action(
                 }
             };
             if removed_any {
-                ctx.request_repaint_of(ViewportId::from_hash_of(("desklite_fence", fence_id)));
-                request_repaint_free_desktop(ctx);
-                ctx.request_repaint_of(ViewportId::ROOT);
+                let mut guard = lock_unpoisoned(shared);
+                guard.request_repaint_fence(ctx, fence_id);
+                guard.mark_free_desktop_dirty(Some(ctx));
             }
         }
         ItemUiAction::TrashSelected => {
@@ -648,9 +653,8 @@ pub fn execute_item_action(
                     guard.selection_anchor.remove(&fence_id);
                     guard.dirty_layout = true;
                     out.needs_immediate_save = true;
-                    ctx.request_repaint_of(ViewportId::from_hash_of(("desklite_fence", fence_id)));
-                    request_repaint_free_desktop(ctx);
-                    ctx.request_repaint_of(ViewportId::ROOT);
+                    guard.request_repaint_fence(ctx, fence_id);
+                    guard.mark_free_desktop_dirty(Some(ctx));
                 }
                 Ok(false) => {}
                 Err(e) => {
@@ -782,7 +786,7 @@ pub fn handle_paste_action(
                 guard.dirty_layout = true;
                 out.needs_immediate_save = true;
                 ctx.request_repaint();
-                request_repaint_free_desktop(ctx);
+                guard.mark_free_desktop_dirty(Some(ctx));
             }
         }
         FenceRole::UnfiledDesktop => {
@@ -869,7 +873,7 @@ pub fn handle_paste_action(
                 guard.dirty_layout = true;
                 out.needs_immediate_save = true;
                 ctx.request_repaint();
-                request_repaint_free_desktop(ctx);
+                guard.mark_free_desktop_dirty(Some(ctx));
             }
         }
         FenceRole::DesktopBucket => {
@@ -990,9 +994,9 @@ pub fn handle_paste_action(
                     .insert(fence_id, (format!("已粘贴 {count} 项"), Instant::now()));
                 guard.dirty_layout = true;
                 out.needs_immediate_save = true;
+                guard.mark_free_desktop_dirty(Some(ctx));
             }
             ctx.request_repaint();
-            request_repaint_free_desktop(ctx);
         }
     }
 }
@@ -1041,7 +1045,7 @@ pub fn commit_item_rename(
             guard.dirty_layout = true;
             out.needs_immediate_save = true;
             ctx.request_repaint();
-            request_repaint_free_desktop(ctx);
+            guard.mark_free_desktop_dirty(Some(ctx));
         }
         Err(e) => {
             let mut guard = lock_unpoisoned(shared);
@@ -1212,13 +1216,14 @@ pub fn apply_collapsed_menu_command(
     ctx: &egui::Context,
 ) -> bool {
     let mut out = FenceUiOutput::default();
-    let fence_vid = ViewportId::from_hash_of(("desklite_fence", fence_id));
+    let repaint_fence = |shared: &Arc<Mutex<SharedFenceState>>| {
+        lock_unpoisoned(shared).request_repaint_fence(ctx, fence_id);
+    };
     match cmd {
         CollapsedMenuCommand::ToggleCollapse => {
-            lock_unpoisoned(shared)
-                .pending_toggle_collapse
-                .insert(fence_id);
-            ctx.request_repaint_of(fence_vid);
+            let mut guard = lock_unpoisoned(shared);
+            guard.pending_toggle_collapse.insert(fence_id);
+            guard.request_repaint_fence(ctx, fence_id);
         }
         CollapsedMenuCommand::RenameFence => {
             let mut guard = lock_unpoisoned(shared);
@@ -1234,7 +1239,7 @@ pub fn apply_collapsed_menu_command(
                     draft: name,
                     needs_focus: true,
                 });
-                ctx.request_repaint_of(fence_vid);
+                guard.request_repaint_fence(ctx, fence_id);
             }
         }
         CollapsedMenuCommand::ToggleKind => {
@@ -1247,7 +1252,7 @@ pub fn apply_collapsed_menu_command(
                 guard.dirty_layout = true;
                 out.needs_immediate_save = true;
             }
-            ctx.request_repaint_of(fence_vid);
+            guard.request_repaint_fence(ctx, fence_id);
         }
         CollapsedMenuCommand::ToggleLock => {
             let mut guard = lock_unpoisoned(shared);
@@ -1268,16 +1273,19 @@ pub fn apply_collapsed_menu_command(
                     set_hwnd_locked(my_hwnd, locked);
                 }
             }
-            ctx.request_repaint_of(fence_vid);
+            guard.request_repaint_fence(ctx, fence_id);
         }
         CollapsedMenuCommand::DuplicateStyle => {
             if duplicate_fence_with_style(fence_id, shared, ctx).is_some() {
-                lock_unpoisoned(shared)
+                let mut guard = lock_unpoisoned(shared);
+                guard
                     .toast_msg
                     .insert(fence_id, ("已复制样式格子".to_string(), Instant::now()));
+                guard.request_repaint_fence(ctx, fence_id);
                 out.needs_immediate_save = true;
+            } else {
+                repaint_fence(shared);
             }
-            ctx.request_repaint_of(fence_vid);
         }
         CollapsedMenuCommand::OpenParamsEditor => {
             open_param_editor_for_fence(fence_id, shared, ctx);
@@ -1311,23 +1319,23 @@ pub fn apply_collapsed_menu_command(
                     out.needs_immediate_save = true;
                 }
                 guard.push_command(ctx, FenceCommand::SyncPortals);
+                guard.request_repaint_fence(ctx, fence_id);
             }
-            ctx.request_repaint_of(fence_vid);
         }
         CollapsedMenuCommand::BindPortal => {
             lock_unpoisoned(shared).push_command(ctx, FenceCommand::RequestBindPortal(fence_id));
         }
         CollapsedMenuCommand::SortName => {
             sort_fence_items(fence_id, shared, &mut out, SortMode::Name);
-            ctx.request_repaint_of(fence_vid);
+            repaint_fence(shared);
         }
         CollapsedMenuCommand::SortKind => {
             sort_fence_items(fence_id, shared, &mut out, SortMode::Kind);
-            ctx.request_repaint_of(fence_vid);
+            repaint_fence(shared);
         }
         CollapsedMenuCommand::SortModified => {
             sort_fence_items(fence_id, shared, &mut out, SortMode::Modified);
-            ctx.request_repaint_of(fence_vid);
+            repaint_fence(shared);
         }
         CollapsedMenuCommand::PasteFromClipboard => {
             let spec_opt = lock_unpoisoned(shared)
@@ -1338,12 +1346,12 @@ pub fn apply_collapsed_menu_command(
                 .cloned();
             if let Some(spec) = spec_opt {
                 handle_paste_action(fence_id, &spec, shared, ctx, &mut out);
-                ctx.request_repaint_of(fence_vid);
+                repaint_fence(shared);
             }
         }
         CollapsedMenuCommand::UndoLast => {
             execute_undo(Some(fence_id), shared, ctx, &mut out);
-            ctx.request_repaint_of(fence_vid);
+            repaint_fence(shared);
         }
         CollapsedMenuCommand::SelectAll => {
             let mut guard = lock_unpoisoned(shared);
@@ -1355,34 +1363,33 @@ pub fn apply_collapsed_menu_command(
                 .map(|f| f.items.len())
                 .unwrap_or(0);
             if count > 0 {
+                guard.clear_all_selections_except(Some(SelectionScope::Fence(fence_id)));
                 guard.selected_items.insert(fence_id, (0..count).collect());
                 guard.selection_anchor.insert(fence_id, 0);
             }
-            ctx.request_repaint_of(fence_vid);
+            guard.request_repaint_fence(ctx, fence_id);
         }
         CollapsedMenuCommand::RefreshPortal => {
-            {
-                let mut guard = lock_unpoisoned(shared);
-                let desktop_dirs = guard.desktop_dirs.clone();
-                let role = guard
-                    .config
-                    .fences
-                    .iter()
-                    .find(|f| f.id == fence_id)
-                    .map(|f| f.effective_role(&desktop_dirs));
-                match role {
-                    Some(FenceRole::ExternalPortal { dir }) => {
-                        if let Some(f) = guard.config.fence_mut(fence_id) {
-                            f.items = scan_portal_directory(Path::new(&dir));
-                        }
+            let mut guard = lock_unpoisoned(shared);
+            let desktop_dirs = guard.desktop_dirs.clone();
+            let role = guard
+                .config
+                .fences
+                .iter()
+                .find(|f| f.id == fence_id)
+                .map(|f| f.effective_role(&desktop_dirs));
+            match role {
+                Some(FenceRole::ExternalPortal { dir }) => {
+                    if let Some(f) = guard.config.fence_mut(fence_id) {
+                        f.items = scan_portal_directory(Path::new(&dir));
                     }
-                    Some(FenceRole::UnfiledDesktop) => {
-                        guard.refresh_all_unfiled_from_disk_if_present();
-                    }
-                    _ => {}
                 }
+                Some(FenceRole::UnfiledDesktop) => {
+                    guard.refresh_all_unfiled_from_disk_if_present();
+                }
+                _ => {}
             }
-            ctx.request_repaint_of(fence_vid);
+            guard.request_repaint_fence(ctx, fence_id);
         }
         CollapsedMenuCommand::CreateBlank => {
             lock_unpoisoned(shared).push_command(ctx, FenceCommand::RequestCreateBlank);

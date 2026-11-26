@@ -17,21 +17,22 @@ use desklite_core::{
 };
 use desklite_legacy::{LegacyOptions, legacy_to_native, load_legacy_dir};
 use desklite_ui::fence_view::{
-    CollapsedMenuCommand, FREE_DESKTOP_TITLE, FenceCommand, FreeDesktopMenuCommand,
-    FreeIconMenuCommand, RenamePrompt, apply_collapsed_menu_command,
-    apply_free_desktop_menu_command, apply_free_icon_menu_command, format_fence_title,
+    CollapsedMenuCommand, FenceCommand, FreeDesktopMenuCommand, FreeIconMenuCommand, RenamePrompt,
+    apply_collapsed_menu_command, apply_free_desktop_menu_command, apply_free_icon_menu_command,
+    format_fence_title,
 };
 use desklite_ui::state::lock_unpoisoned;
 use desklite_ui::{
     COLLAPSED_HEIGHT, INSPECTOR_HEIGHT, INSPECTOR_TITLE, INSPECTOR_WIDTH, SharedFenceState,
-    configure_egui_theme, install_chinese_fonts, render_fence_viewport,
-    render_free_desktop_viewport, render_inspector_viewport,
+    build_free_desktop_snapshot, configure_egui_theme, handle_free_desktop_event,
+    install_chinese_fonts, pending_free_rename, render_fence_viewport, render_inspector_viewport,
 };
 use desklite_win32::{
-    FolderWatcher, IconCache, TrayIcon, WM_APP_PORTAL_DIRTY, WM_APP_TRAY, all_desktop_dirs,
-    clipboard_has_files, enable_dark_popup_menus, enable_per_monitor_dpi_v2,
-    install_desktop_z_win_event_hooks, is_desktop_dir_path, is_display_wake_power_broadcast,
-    is_vault_path, migrate_vault_item_to_desktop, pick_folder_dialog, post_reassert_all_fences_z,
+    FolderWatcher, FreeDesktopController, FreeDesktopEvent, IconCache, TrayIcon,
+    WM_APP_PORTAL_DIRTY, WM_APP_TRAY, all_desktop_dirs, clipboard_has_files,
+    enable_dark_popup_menus, enable_per_monitor_dpi_v2, install_desktop_z_win_event_hooks,
+    is_desktop_dir_path, is_display_wake_power_broadcast, is_vault_path, launch_item,
+    migrate_vault_item_to_desktop, pick_folder_dialog, post_reassert_all_fences_z,
     probe_display_topology, register_power_and_session_notifications, restore_all_desktop_icons,
     scan_portal_directory, set_shell_desktop_icons_visible, set_window_rect_no_z,
     strip_alt_tab_from_host, unregister_power_and_session_notifications,
@@ -48,13 +49,13 @@ use windows::Win32::UI::Shell::ShellExecuteW;
 use windows::Win32::UI::WindowsAndMessaging::{
     AppendMenuW, CREATESTRUCTW, CreatePopupMenu, CreateWindowExW, DefWindowProcW, DestroyMenu,
     DestroyWindow, DispatchMessageW, GetCursorPos, GetMessageW, GetWindowLongPtrW, GWLP_USERDATA,
-    KillTimer, MF_CHECKED, MF_GRAYED, MF_POPUP, MF_SEPARATOR, MF_STRING, MSG, PostMessageW,
-    PostQuitMessage, RegisterClassExW, RegisterWindowMessageW, SPI_SETWORKAREA, SW_SHOWNORMAL,
-    SetForegroundWindow, SetTimer, SetWindowLongPtrW, TPM_BOTTOMALIGN, TPM_LEFTALIGN,
-    TPM_RETURNCMD, TPM_TOPALIGN, TrackPopupMenuEx, TranslateMessage, WM_APP, WM_CREATE,
-    WM_DESTROY, WM_DISPLAYCHANGE, WM_DPICHANGED, WM_ENDSESSION, WM_POWERBROADCAST,
-    WM_QUERYENDSESSION, WM_RBUTTONUP, WM_SETTINGCHANGE, WM_TIMER, WM_WTSSESSION_CHANGE,
-    WNDCLASSEXW, WS_EX_TOOLWINDOW, WS_POPUP, WTS_SESSION_UNLOCK,
+    KillTimer, MB_ICONINFORMATION, MB_OK, MF_CHECKED, MF_GRAYED, MF_POPUP, MF_SEPARATOR, MF_STRING,
+    MSG, MessageBoxW, PostMessageW, PostQuitMessage, RegisterClassExW, RegisterWindowMessageW,
+    SPI_SETWORKAREA, SW_SHOWNORMAL, SetForegroundWindow, SetTimer, SetWindowLongPtrW,
+    TPM_BOTTOMALIGN, TPM_LEFTALIGN, TPM_RETURNCMD, TPM_TOPALIGN, TrackPopupMenuEx,
+    TranslateMessage, WM_APP, WM_CREATE, WM_DESTROY, WM_DISPLAYCHANGE, WM_DPICHANGED,
+    WM_ENDSESSION, WM_POWERBROADCAST, WM_QUERYENDSESSION, WM_RBUTTONUP, WM_SETTINGCHANGE, WM_TIMER,
+    WM_WTSSESSION_CHANGE, WNDCLASSEXW, WS_EX_TOOLWINDOW, WS_POPUP, WTS_SESSION_UNLOCK,
 };
 use windows::core::{HSTRING, w};
 
@@ -78,9 +79,10 @@ const WM_APP_DRAG_DONE: u32 = WM_APP + 24;
 const WM_APP_SHOW_FREE_DESKTOP_MENU: u32 = WM_APP + 25;
 const WM_APP_SHOW_FREE_ICON_MENU: u32 = WM_APP + 26;
 const WM_APP_SCHEDULE_SHELL_VERIFY: u32 = WM_APP + 27;
+const WM_APP_FREE_DESKTOP_EVENT: u32 = WM_APP + 28;
+const WM_APP_REFRESH_FREE_DESKTOP: u32 = WM_APP + 29;
 
 const TRAY_CMD_NEW_BLANK: u32 = 1001;
-const TRAY_CMD_NEW_UNFILED: u32 = 1002;
 const TRAY_CMD_NEW_PORTAL: u32 = 1003;
 const TRAY_CMD_TOGGLE_HIDE_ALL: u32 = 1004;
 const TRAY_CMD_ARRANGE_NAME: u32 = 1005;
@@ -100,7 +102,6 @@ const FENCE_CMD_SORT_NAME: u32 = 2007;
 const FENCE_CMD_SORT_KIND: u32 = 2008;
 const FENCE_CMD_SORT_MODIFIED: u32 = 2009;
 const FENCE_CMD_NEW_BLANK: u32 = 2010;
-const FENCE_CMD_NEW_UNFILED: u32 = 2011;
 const FENCE_CMD_NEW_PORTAL: u32 = 2012;
 const FENCE_CMD_DELETE: u32 = 2013;
 const FENCE_CMD_EXIT: u32 = 2014;
@@ -113,7 +114,6 @@ const FENCE_CMD_SELECT_ALL: u32 = 2020;
 const FENCE_CMD_REFRESH_PORTAL: u32 = 2021;
 
 const FREE_CMD_NEW_BLANK: u32 = 3001;
-const FREE_CMD_NEW_UNFILED: u32 = 3002;
 const FREE_CMD_NEW_PORTAL: u32 = 3003;
 const FREE_CMD_TOGGLE_HIDE_ALL: u32 = 3004;
 const FREE_CMD_ARRANGE_NAME: u32 = 3005;
@@ -146,6 +146,19 @@ impl Drop for SingleInstanceGuard {
                 let _ = CloseHandle(self.0);
             }
         }
+    }
+}
+
+struct MenuPopupActiveGuard<'a>(&'a Arc<Mutex<SharedFenceState>>);
+impl<'a> MenuPopupActiveGuard<'a> {
+    fn enter(shared: &'a Arc<Mutex<SharedFenceState>>) -> Self {
+        lock_unpoisoned(shared).menu_popup_active = true;
+        Self(shared)
+    }
+}
+impl Drop for MenuPopupActiveGuard<'_> {
+    fn drop(&mut self) {
+        lock_unpoisoned(self.0).menu_popup_active = false;
     }
 }
 
@@ -206,39 +219,12 @@ fn scan_all_desktop_items(desktop_dirs: &[String]) -> Vec<FenceItem> {
     items
 }
 
-fn refresh_unfiled_views_in_config(
-    cfg: &mut NativeLayoutConfig,
-    desktop_dirs: &[String],
-    scanned_desktop: &[FenceItem],
-) {
-    let owned = cfg.all_bucket_desktop_paths(desktop_dirs);
-    for f in &mut cfg.fences {
-        if f.is_unfiled_desktop(desktop_dirs) {
-            let mut next_items = Vec::new();
-            for it in scanned_desktop {
-                let key = normalize_path_key(&it.path);
-                if !key.is_empty() && !owned.contains(&key) {
-                    let mut item = it.clone();
-                    item.order = next_items.len() as i32;
-                    next_items.push(item);
-                }
-            }
-            f.items = next_items;
-        }
-    }
-}
-
-fn refresh_all_portals(
-    cfg: &mut NativeLayoutConfig,
-    desktop_dirs: &[String],
-    scanned_desktop: &[FenceItem],
-) {
+fn refresh_all_portals(cfg: &mut NativeLayoutConfig, desktop_dirs: &[String]) {
     for f in &mut cfg.fences {
         if let Some(dir) = f.external_portal_dir(desktop_dirs) {
             f.items = scan_portal_directory(Path::new(&dir));
         }
     }
-    refresh_unfiled_views_in_config(cfg, desktop_dirs, scanned_desktop);
 }
 
 fn reconcile_free_icons_in_config(
@@ -355,7 +341,7 @@ fn load_or_bootstrap_layout(layout_path: &Path, topo: &DisplayTopology) -> Nativ
         if let Err(err) = cfg.apply_topology(topo, (72, 72)) {
             eprintln!("[desklite] apply_topology failed at startup: {err}");
         }
-        refresh_all_portals(&mut cfg, &desktop_dirs, &scanned_desktop);
+        refresh_all_portals(&mut cfg, &desktop_dirs);
         let reconciled =
             reconcile_free_icons_in_config(&mut cfg, topo, &desktop_dirs, &scanned_desktop);
         if sanitized || vault_cleaned || deduped > 0 || reconciled > 0 {
@@ -380,7 +366,7 @@ fn load_or_bootstrap_layout(layout_path: &Path, topo: &DisplayTopology) -> Nativ
         if let Err(err) = cfg.apply_topology(topo, (72, 72)) {
             eprintln!("[desklite] apply_topology failed during legacy import: {err}");
         }
-        refresh_all_portals(&mut cfg, &desktop_dirs, &scanned_desktop);
+        refresh_all_portals(&mut cfg, &desktop_dirs);
         let _ = reconcile_free_icons_in_config(&mut cfg, topo, &desktop_dirs, &scanned_desktop);
         save_config_logged(layout_path, &cfg, "legacy_import");
         return cfg;
@@ -428,7 +414,6 @@ fn move_live_windows_to_topology(
     topo: &DisplayTopology,
     fences: &[FenceSpec],
     hwnd_to_fence: &HashMap<isize, i32>,
-    free_hwnd: isize,
 ) {
     let monitors = topo.monitors();
     for (&raw_hwnd, &fid) in hwnd_to_fence {
@@ -450,16 +435,23 @@ fn move_live_windows_to_topology(
             set_window_rect_no_z(raw_hwnd, spec.rect.left, spec.rect.top, w, h);
         }
     }
-    if free_hwnd != 0 {
-        let vb = topo.virtual_bounds();
-        set_window_rect_no_z(free_hwnd, vb.left, vb.top, vb.width().max(1), vb.height().max(1));
-    }
 }
 
 fn open_dir_in_explorer(dir: &Path) {
     let wdir = HSTRING::from(dir.to_string_lossy().as_ref());
     unsafe {
         let _ = ShellExecuteW(None, w!("open"), &wdir, None, None, SW_SHOWNORMAL);
+    }
+}
+
+fn show_desktop_portal_forbidden_dialog() {
+    unsafe {
+        let _ = MessageBoxW(
+            None,
+            w!("桌面目录已由自由桌面与桌面格子直接管理，不能作为外部文件夹映射。"),
+            w!("DeskLite"),
+            MB_OK | MB_ICONINFORMATION,
+        );
     }
 }
 
@@ -488,7 +480,6 @@ enum BgEvent {
     PortalDirty(i32),
     DesktopDirty,
     TrayNewBlank,
-    TrayNewUnfiled,
     TrayNewPortal(String),
     TrayRealign,
     ToggleHideAllFences,
@@ -505,6 +496,7 @@ struct HelperState {
     hwnd: HWND,
     layout_path: PathBuf,
     shared: Arc<Mutex<SharedFenceState>>,
+    free_desktop_ctrl: Arc<Mutex<Option<FreeDesktopController>>>,
     free_icon_menu_paths: Arc<Mutex<Vec<String>>>,
     tx: Sender<BgEvent>,
     egui_ctx: egui::Context,
@@ -538,6 +530,22 @@ impl HelperState {
         }
         if let Some(w) = FolderWatcher::start_desktop(-100, self.hwnd) {
             self.watchers.insert(-100, w);
+        }
+    }
+
+    fn push_free_desktop_snapshot_if_dirty(&self) {
+        let snap_opt = {
+            let mut guard = lock_unpoisoned(&self.shared);
+            if std::mem::take(&mut guard.pending_repaint_free_desktop) {
+                Some(build_free_desktop_snapshot(&guard))
+            } else {
+                None
+            }
+        };
+        if let Some(snap) = snap_opt
+            && let Some(ctrl) = lock_unpoisoned(&self.free_desktop_ctrl).as_ref().cloned()
+        {
+            ctrl.update_snapshot(snap);
         }
     }
 
@@ -603,8 +611,12 @@ impl HelperState {
         thread::spawn(move || {
             let _ = unsafe { CoInitializeEx(None, COINIT_APARTMENTTHREADED) };
             if let Ok(Some(dir)) = pick_folder_dialog(HWND::default()) {
-                let _ = tx.send(BgEvent::TrayNewPortal(dir));
-                ctx.request_repaint_of(ViewportId::ROOT);
+                if is_desktop_dir_path(Path::new(&dir)) {
+                    show_desktop_portal_forbidden_dialog();
+                } else {
+                    let _ = tx.send(BgEvent::TrayNewPortal(dir));
+                    ctx.request_repaint_of(ViewportId::ROOT);
+                }
             }
             unsafe {
                 CoUninitialize();
@@ -619,12 +631,6 @@ impl HelperState {
         };
         unsafe {
             let _ = AppendMenuW(menu, MF_STRING, TRAY_CMD_NEW_BLANK as usize, w!("新建空白格子"));
-            let _ = AppendMenuW(
-                menu,
-                MF_STRING,
-                TRAY_CMD_NEW_UNFILED as usize,
-                w!("新建未归档桌面视图"),
-            );
             let _ = AppendMenuW(
                 menu,
                 MF_STRING,
@@ -682,16 +688,19 @@ impl HelperState {
 
         let mut pt = POINT::default();
         let _ = unsafe { GetCursorPos(&mut pt) };
-        let cmd = unsafe {
-            let _ = SetForegroundWindow(self.hwnd);
-            TrackPopupMenuEx(
-                menu,
-                (TPM_LEFTALIGN | TPM_BOTTOMALIGN | TPM_RETURNCMD).0,
-                pt.x,
-                pt.y,
-                self.hwnd,
-                None,
-            )
+        let cmd = {
+            let _popup_guard = MenuPopupActiveGuard::enter(&self.shared);
+            unsafe {
+                let _ = SetForegroundWindow(self.hwnd);
+                TrackPopupMenuEx(
+                    menu,
+                    (TPM_LEFTALIGN | TPM_BOTTOMALIGN | TPM_RETURNCMD).0,
+                    pt.x,
+                    pt.y,
+                    self.hwnd,
+                    None,
+                )
+            }
         };
         unsafe {
             let _ = DestroyMenu(menu);
@@ -700,10 +709,6 @@ impl HelperState {
         match cmd.0 as u32 {
             TRAY_CMD_NEW_BLANK => {
                 let _ = self.tx.send(BgEvent::TrayNewBlank);
-                self.egui_ctx.request_repaint_of(ViewportId::ROOT);
-            }
-            TRAY_CMD_NEW_UNFILED => {
-                let _ = self.tx.send(BgEvent::TrayNewUnfiled);
                 self.egui_ctx.request_repaint_of(ViewportId::ROOT);
             }
             TRAY_CMD_NEW_PORTAL => {
@@ -755,13 +760,11 @@ impl HelperState {
             let desktop_dirs = &guard.desktop_dirs;
             guard.config.fences.iter().find(|f| f.id == fence_id).map(|f| {
                 let is_ext_portal = f.external_portal_dir(desktop_dirs).is_some();
-                let is_unfiled = f.is_unfiled_desktop(desktop_dirs);
                 let is_bucket = f.is_desktop_bucket(desktop_dirs);
                 (
                     f.collapsed,
                     f.locked,
                     is_ext_portal,
-                    is_ext_portal || is_unfiled,
                     matches!(f.kind, FenceKind::FileList),
                     is_bucket && f.items.len() > 1,
                     !f.items.is_empty(),
@@ -769,16 +772,7 @@ impl HelperState {
                 )
             })
         };
-        let Some((
-            collapsed,
-            locked,
-            is_ext_portal,
-            can_refresh,
-            is_list,
-            can_sort,
-            has_items,
-            has_undo,
-        )) = info
+        let Some((collapsed, locked, is_ext_portal, is_list, can_sort, has_items, has_undo)) = info
         else {
             return;
         };
@@ -807,7 +801,7 @@ impl HelperState {
                         w!("全选\tCtrl+A"),
                     );
                 }
-                if can_refresh {
+                if is_ext_portal {
                     let _ = AppendMenuW(
                         menu,
                         MF_STRING,
@@ -888,12 +882,6 @@ impl HelperState {
             let _ = AppendMenuW(
                 menu,
                 MF_STRING,
-                FENCE_CMD_NEW_UNFILED as usize,
-                w!("新建未归档桌面视图"),
-            );
-            let _ = AppendMenuW(
-                menu,
-                MF_STRING,
                 FENCE_CMD_NEW_PORTAL as usize,
                 w!("新建外部文件夹格子..."),
             );
@@ -907,16 +895,19 @@ impl HelperState {
             );
         }
 
-        let cmd = unsafe {
-            let _ = SetForegroundWindow(self.hwnd);
-            TrackPopupMenuEx(
-                menu,
-                (TPM_LEFTALIGN | TPM_TOPALIGN | TPM_RETURNCMD).0,
-                x,
-                y,
-                self.hwnd,
-                None,
-            )
+        let cmd = {
+            let _popup_guard = MenuPopupActiveGuard::enter(&self.shared);
+            unsafe {
+                let _ = SetForegroundWindow(self.hwnd);
+                TrackPopupMenuEx(
+                    menu,
+                    (TPM_LEFTALIGN | TPM_TOPALIGN | TPM_RETURNCMD).0,
+                    x,
+                    y,
+                    self.hwnd,
+                    None,
+                )
+            }
         };
         unsafe {
             let _ = DestroyMenu(menu);
@@ -940,7 +931,6 @@ impl HelperState {
             FENCE_CMD_SELECT_ALL => Some(CollapsedMenuCommand::SelectAll),
             FENCE_CMD_REFRESH_PORTAL => Some(CollapsedMenuCommand::RefreshPortal),
             FENCE_CMD_NEW_BLANK => Some(CollapsedMenuCommand::CreateBlank),
-            FENCE_CMD_NEW_UNFILED => Some(CollapsedMenuCommand::CreateUnfiledDesktop),
             FENCE_CMD_NEW_PORTAL => Some(CollapsedMenuCommand::CreatePortal),
             FENCE_CMD_DELETE => Some(CollapsedMenuCommand::DeleteFence),
             FENCE_CMD_EXIT => Some(CollapsedMenuCommand::ExitApp),
@@ -962,12 +952,6 @@ impl HelperState {
         };
         unsafe {
             let _ = AppendMenuW(menu, MF_STRING, FREE_CMD_NEW_BLANK as usize, w!("新建空白格子"));
-            let _ = AppendMenuW(
-                menu,
-                MF_STRING,
-                FREE_CMD_NEW_UNFILED as usize,
-                w!("新建未归档桌面视图"),
-            );
             let _ = AppendMenuW(
                 menu,
                 MF_STRING,
@@ -1048,16 +1032,19 @@ impl HelperState {
             );
         }
 
-        let cmd = unsafe {
-            let _ = SetForegroundWindow(self.hwnd);
-            TrackPopupMenuEx(
-                menu,
-                (TPM_LEFTALIGN | TPM_TOPALIGN | TPM_RETURNCMD).0,
-                x,
-                y,
-                self.hwnd,
-                None,
-            )
+        let cmd = {
+            let _popup_guard = MenuPopupActiveGuard::enter(&self.shared);
+            unsafe {
+                let _ = SetForegroundWindow(self.hwnd);
+                TrackPopupMenuEx(
+                    menu,
+                    (TPM_LEFTALIGN | TPM_TOPALIGN | TPM_RETURNCMD).0,
+                    x,
+                    y,
+                    self.hwnd,
+                    None,
+                )
+            }
         };
         unsafe {
             let _ = DestroyMenu(menu);
@@ -1068,12 +1055,6 @@ impl HelperState {
                 let _ = self
                     .tx
                     .send(BgEvent::FreeDesktopMenuCmd(FreeDesktopMenuCommand::CreateBlank));
-                self.egui_ctx.request_repaint_of(ViewportId::ROOT);
-            }
-            FREE_CMD_NEW_UNFILED => {
-                let _ = self.tx.send(BgEvent::FreeDesktopMenuCmd(
-                    FreeDesktopMenuCommand::CreateUnfiledDesktop,
-                ));
                 self.egui_ctx.request_repaint_of(ViewportId::ROOT);
             }
             FREE_CMD_NEW_PORTAL => {
@@ -1234,16 +1215,19 @@ impl HelperState {
             }
         }
 
-        let cmd = unsafe {
-            let _ = SetForegroundWindow(self.hwnd);
-            TrackPopupMenuEx(
-                menu,
-                (TPM_LEFTALIGN | TPM_TOPALIGN | TPM_RETURNCMD).0,
-                x,
-                y,
-                self.hwnd,
-                None,
-            )
+        let cmd = {
+            let _popup_guard = MenuPopupActiveGuard::enter(&self.shared);
+            unsafe {
+                let _ = SetForegroundWindow(self.hwnd);
+                TrackPopupMenuEx(
+                    menu,
+                    (TPM_LEFTALIGN | TPM_TOPALIGN | TPM_RETURNCMD).0,
+                    x,
+                    y,
+                    self.hwnd,
+                    None,
+                )
+            }
         };
         unsafe {
             let _ = DestroyMenu(menu);
@@ -1310,26 +1294,34 @@ unsafe extern "system" fn helper_wnd_proc(
             st.schedule_shell_reverify();
             LRESULT(0)
         }
+        WM_APP_FREE_DESKTOP_EVENT => {
+            st.egui_ctx.request_repaint_of(ViewportId::ROOT);
+            LRESULT(0)
+        }
+        WM_APP_REFRESH_FREE_DESKTOP => {
+            st.push_free_desktop_snapshot_if_dirty();
+            LRESULT(0)
+        }
         WM_APP_DRAG_DONE => {
-            let (changed, fids, repaint_free) = {
+            let (changed, fids, free_snap) = {
                 let mut guard = lock_unpoisoned(&st.shared);
                 let changed = guard.poll_async_drag();
                 let fids: Vec<i32> = guard.pending_repaint_fences.drain().collect();
                 let repaint_free = std::mem::take(&mut guard.pending_repaint_free_desktop);
-                (changed, fids, repaint_free)
+                let free_snap = repaint_free.then(|| build_free_desktop_snapshot(&guard));
+                for &fid in &fids {
+                    guard.request_repaint_fence(&st.egui_ctx, fid);
+                }
+                (changed, fids, free_snap)
             };
-            if changed {
+            if let Some(snap) = free_snap
+                && let Some(ctrl) = lock_unpoisoned(&st.free_desktop_ctrl).as_ref().cloned()
+            {
+                ctrl.update_snapshot(snap);
+            }
+            if changed || !fids.is_empty() {
                 st.egui_ctx.request_repaint_of(ViewportId::ROOT);
             }
-            for fid in fids {
-                st.egui_ctx
-                    .request_repaint_of(ViewportId::from_hash_of(("desklite_fence", fid)));
-            }
-            if repaint_free {
-                st.egui_ctx
-                    .request_repaint_of(ViewportId::from_hash_of("desklite_free_desktop"));
-            }
-            st.egui_ctx.request_repaint();
             LRESULT(0)
         }
         WM_APP_SHUTDOWN => {
@@ -1447,6 +1439,9 @@ unsafe extern "system" fn helper_wnd_proc(
         WM_ENDSESSION => {
             if wparam.0 != 0 {
                 st.shutting_down = true;
+                if let Some(ctrl) = lock_unpoisoned(&st.free_desktop_ctrl).as_ref().cloned() {
+                    ctrl.shutdown();
+                }
                 persist_and_restore_on_exit(&st.layout_path, &st.shared, "WM_ENDSESSION");
             } else if !st.shutting_down {
                 let _ = set_shell_desktop_icons_visible(false);
@@ -1477,6 +1472,7 @@ unsafe extern "system" fn helper_wnd_proc(
 fn spawn_win32_helper(
     layout_path: PathBuf,
     shared: Arc<Mutex<SharedFenceState>>,
+    free_desktop_ctrl: Arc<Mutex<Option<FreeDesktopController>>>,
     free_icon_menu_paths: Arc<Mutex<Vec<String>>>,
     tx: Sender<BgEvent>,
     egui_ctx: egui::Context,
@@ -1523,6 +1519,7 @@ fn spawn_win32_helper(
             hwnd,
             layout_path,
             shared,
+            free_desktop_ctrl,
             free_icon_menu_paths,
             tx,
             egui_ctx,
@@ -1565,13 +1562,14 @@ fn spawn_win32_helper(
 struct DeskLiteEguiApp {
     layout_path: PathBuf,
     shared: Arc<Mutex<SharedFenceState>>,
+    free_desktop_ctrl: FreeDesktopController,
+    free_desktop_rx: Receiver<FreeDesktopEvent>,
     free_icon_menu_paths: Arc<Mutex<Vec<String>>>,
     rx: Receiver<BgEvent>,
     tx: Sender<BgEvent>,
     helper_hwnd: isize,
     host_attach_passes: u8,
     prev_hide_all_fences: bool,
-    free_desktop_synced_key: Option<desklite_core::TopologyKey>,
     shutting_down: bool,
 }
 
@@ -1601,9 +1599,19 @@ impl DeskLiteEguiApp {
         self.post_helper(WM_APP_SCHEDULE_SHELL_VERIFY, WPARAM(0), LPARAM(0));
     }
 
+    fn push_free_desktop_snapshot(&self) {
+        let snapshot = {
+            let mut guard = lock_unpoisoned(&self.shared);
+            guard.pending_repaint_free_desktop = false;
+            build_free_desktop_snapshot(&guard)
+        };
+        self.free_desktop_ctrl.update_snapshot(snapshot);
+    }
+
     fn begin_shutdown(&mut self, ctx: &egui::Context) {
         if !self.shutting_down {
             self.shutting_down = true;
+            self.free_desktop_ctrl.shutdown();
             persist_and_restore_on_exit(&self.layout_path, &self.shared, "shutdown");
             self.post_helper(WM_APP_SHUTDOWN, WPARAM(0), LPARAM(0));
         }
@@ -1616,12 +1624,16 @@ impl DeskLiteEguiApp {
         thread::spawn(move || {
             let _ = unsafe { CoInitializeEx(None, COINIT_APARTMENTTHREADED) };
             if let Ok(Some(dir)) = pick_folder_dialog(HWND::default()) {
-                let ev = match fence_id {
-                    Some(fid) => BgEvent::BindPortalResult(fid, dir),
-                    None => BgEvent::TrayNewPortal(dir),
-                };
-                let _ = tx.send(ev);
-                ctx_clone.request_repaint_of(ViewportId::ROOT);
+                if is_desktop_dir_path(Path::new(&dir)) {
+                    show_desktop_portal_forbidden_dialog();
+                } else {
+                    let ev = match fence_id {
+                        Some(fid) => BgEvent::BindPortalResult(fid, dir),
+                        None => BgEvent::TrayNewPortal(dir),
+                    };
+                    let _ = tx.send(ev);
+                    ctx_clone.request_repaint_of(ViewportId::ROOT);
+                }
             }
             unsafe {
                 CoUninitialize();
@@ -1666,44 +1678,9 @@ impl DeskLiteEguiApp {
         guard.dirty_layout = true;
     }
 
-    fn create_unfiled_desktop_fence(&self) {
-        let desktop_dirs = { lock_unpoisoned(&self.shared).desktop_dirs.clone() };
-        let scanned_desktop = scan_all_desktop_items(&desktop_dirs);
-        let mut guard = lock_unpoisoned(&self.shared);
-        let id = guard.config.next_fence_id();
-        let work = guard.topology.primary().work_area;
-        let offset = ((guard.config.fences.len() as i32) % 6) * 28;
-        let raw_rect = Rect::new(
-            (work.left + 100 + offset).min(work.right - 340),
-            (work.top + 100 + offset).min(work.bottom - 300),
-            (work.left + 440 + offset).min(work.right),
-            (work.top + 400 + offset).min(work.bottom),
-        );
-        let rect = clamp_rect_to_monitors(raw_rect, guard.topology.monitors())
-            .map(|(r, _)| r)
-            .unwrap_or(raw_rect);
-        guard.config.upsert_fence(FenceSpec {
-            id,
-            name: "未归档桌面".to_string(),
-            kind: FenceKind::IconGrid,
-            rect,
-            collapsed: false,
-            locked: false,
-            role: Some(FenceRole::UnfiledDesktop),
-            portal_dir: None,
-            backdrop_alpha: DEFAULT_BACKDROP_ALPHA,
-            layout_override: None,
-            items: Vec::new(),
-        });
-        guard.refresh_unfiled_desktop_views(&scanned_desktop);
-        guard.config.update_active_snapshot_rect(id, rect);
-        guard.sync_builder_rects_from_config();
-        guard.dirty_layout = true;
-    }
-
     fn create_portal_fence(&self, dir: String) {
         if is_desktop_dir_path(Path::new(&dir)) {
-            self.create_unfiled_desktop_fence();
+            show_desktop_portal_forbidden_dialog();
             return;
         }
         let folder_name = Path::new(&dir)
@@ -1752,16 +1729,14 @@ impl DeskLiteEguiApp {
         let desktop_dirs = { lock_unpoisoned(&self.shared).desktop_dirs.clone() };
         let scanned_desktop = scan_all_desktop_items(&desktop_dirs);
 
-        let (fences_snap, hwnd_to_fence_snap, free_hwnd, fence_ids) = {
+        let (fences_snap, hwnd_to_fence_snap, fence_ids) = {
             let mut guard = lock_unpoisoned(&self.shared);
             guard.topology = topo.clone();
             if let Err(err) = guard.config.apply_topology(&topo, (72, 72)) {
                 eprintln!("[desklite] apply_topology failed: {err}");
             }
             if refresh_portals {
-                refresh_all_portals(&mut guard.config, &desktop_dirs, &scanned_desktop);
-            } else {
-                guard.refresh_unfiled_desktop_views(&scanned_desktop);
+                refresh_all_portals(&mut guard.config, &desktop_dirs);
             }
             let _ = reconcile_free_icons_in_config(
                 &mut guard.config,
@@ -1774,54 +1749,41 @@ impl DeskLiteEguiApp {
             (
                 guard.config.fences.clone(),
                 guard.hwnd_to_fence.clone(),
-                guard.free_desktop_hwnd,
                 ids,
             )
         };
 
-        move_live_windows_to_topology(&topo, &fences_snap, &hwnd_to_fence_snap, free_hwnd);
+        move_live_windows_to_topology(&topo, &fences_snap, &hwnd_to_fence_snap);
+        self.free_desktop_ctrl.set_bounds(topo.virtual_bounds());
+        self.push_free_desktop_snapshot();
         lock_unpoisoned(&self.shared).finish_topology_settling(Duration::from_millis(250));
-        if free_hwnd != 0 {
-            self.free_desktop_synced_key = Some(topo.key().clone());
-        }
+
         if !self.shutting_down {
             let _ = set_shell_desktop_icons_visible(false);
             post_reassert_all_fences_z();
             self.schedule_shell_reverify();
         }
 
+        let guard = lock_unpoisoned(&self.shared);
         for fid in fence_ids {
-            ctx.request_repaint_of(ViewportId::from_hash_of(("desklite_fence", fid)));
+            guard.request_repaint_fence(ctx, fid);
         }
-        ctx.request_repaint_of(ViewportId::from_hash_of("desklite_free_desktop"));
     }
 
-    fn refresh_desktop_views(&self, ctx: &egui::Context) -> bool {
+    fn refresh_desktop_views(&self) -> bool {
         let desktop_dirs = { lock_unpoisoned(&self.shared).desktop_dirs.clone() };
         let scanned_desktop = scan_all_desktop_items(&desktop_dirs);
-        let (reconciled, unfiled_ids) = {
+        let reconciled = {
             let mut guard = lock_unpoisoned(&self.shared);
             let topo = guard.topology.clone();
-            guard.refresh_unfiled_desktop_views(&scanned_desktop);
-            let reconciled = reconcile_free_icons_in_config(
+            reconcile_free_icons_in_config(
                 &mut guard.config,
                 &topo,
                 &desktop_dirs,
                 &scanned_desktop,
-            );
-            let ids: Vec<i32> = guard
-                .config
-                .fences
-                .iter()
-                .filter(|f| f.is_unfiled_desktop(&desktop_dirs))
-                .map(|f| f.id)
-                .collect();
-            (reconciled, ids)
+            )
         };
-        for fid in unfiled_ids {
-            ctx.request_repaint_of(ViewportId::from_hash_of(("desklite_fence", fid)));
-        }
-        ctx.request_repaint_of(ViewportId::from_hash_of("desklite_free_desktop"));
+        self.push_free_desktop_snapshot();
         reconciled > 0
     }
 
@@ -1833,19 +1795,22 @@ impl DeskLiteEguiApp {
             let ids: Vec<i32> = guard.config.fences.iter().map(|f| f.id).collect();
             (guard.config.hide_all_fences, ids)
         };
-        for fid in fence_ids {
-            ctx.request_repaint_of(ViewportId::from_hash_of(("desklite_fence", fid)));
-        }
+        self.push_free_desktop_snapshot();
         if !now_hidden {
+            let guard = lock_unpoisoned(&self.shared);
+            for fid in fence_ids {
+                guard.request_repaint_fence(ctx, fid);
+            }
+            drop(guard);
             post_reassert_all_fences_z();
         }
-        ctx.request_repaint_of(ViewportId::from_hash_of("desklite_free_desktop"));
         ctx.request_repaint_of(ViewportId::ROOT);
     }
 
     fn drain_events_and_commands(&mut self, ctx: &egui::Context) -> bool {
         let mut needs_save = false;
         let mut needs_watcher_sync = false;
+        let mut needs_free_snapshot = false;
 
         while let Ok(ev) = self.rx.try_recv() {
             match ev {
@@ -1869,20 +1834,16 @@ impl DeskLiteEguiApp {
                         if let Some(f) = guard.config.fence_mut(fid) {
                             f.items = items;
                         }
-                        ctx.request_repaint_of(ViewportId::from_hash_of(("desklite_fence", fid)));
+                        guard.request_repaint_fence(ctx, fid);
                     }
                 }
                 BgEvent::DesktopDirty => {
-                    if self.refresh_desktop_views(ctx) {
+                    if self.refresh_desktop_views() {
                         needs_save = true;
                     }
                 }
                 BgEvent::TrayNewBlank => {
                     self.create_blank_fence();
-                    needs_save = true;
-                }
-                BgEvent::TrayNewUnfiled => {
-                    self.create_unfiled_desktop_fence();
                     needs_save = true;
                 }
                 BgEvent::TrayNewPortal(dir) => {
@@ -1901,39 +1862,23 @@ impl DeskLiteEguiApp {
                     needs_save = true;
                 }
                 BgEvent::BindPortalResult(fid, dir) => {
-                    let desktop_dirs = { lock_unpoisoned(&self.shared).desktop_dirs.clone() };
-                    let scanned_desktop = scan_all_desktop_items(&desktop_dirs);
-                    let is_desktop = is_desktop_dir_path(Path::new(&dir));
-                    let ext_items = if is_desktop {
-                        Vec::new()
-                    } else {
-                        scan_portal_directory(Path::new(&dir))
-                    };
+                    if is_desktop_dir_path(Path::new(&dir)) {
+                        show_desktop_portal_forbidden_dialog();
+                        continue;
+                    }
+                    let ext_items = scan_portal_directory(Path::new(&dir));
                     {
                         let mut guard = lock_unpoisoned(&self.shared);
-                        let topo = guard.topology.clone();
                         if let Some(f) = guard.config.fence_mut(fid) {
-                            if is_desktop {
-                                f.role = Some(FenceRole::UnfiledDesktop);
-                                f.portal_dir = None;
-                            } else {
-                                f.role = Some(FenceRole::ExternalPortal { dir: dir.clone() });
-                                f.portal_dir = Some(dir);
-                                f.items = ext_items;
-                            }
+                            f.role = Some(FenceRole::ExternalPortal { dir: dir.clone() });
+                            f.portal_dir = Some(dir);
+                            f.items = ext_items;
                             needs_save = true;
                             needs_watcher_sync = true;
                         }
-                        guard.refresh_unfiled_desktop_views(&scanned_desktop);
-                        let _ = reconcile_free_icons_in_config(
-                            &mut guard.config,
-                            &topo,
-                            &desktop_dirs,
-                            &scanned_desktop,
-                        );
+                        guard.request_repaint_fence(ctx, fid);
                     }
-                    ctx.request_repaint_of(ViewportId::from_hash_of(("desklite_fence", fid)));
-                    ctx.request_repaint_of(ViewportId::from_hash_of("desklite_free_desktop"));
+                    needs_free_snapshot = true;
                 }
                 BgEvent::FenceMenuCommand(fid, action) => {
                     if apply_collapsed_menu_command(fid, action, &self.shared, ctx) {
@@ -1944,11 +1889,21 @@ impl DeskLiteEguiApp {
                     if apply_free_desktop_menu_command(action, &self.shared, ctx) {
                         needs_save = true;
                     }
+                    needs_free_snapshot = true;
                 }
                 BgEvent::FreeIconMenuCmd(paths, action) => {
+                    let is_rename = matches!(action, FreeIconMenuCommand::Rename);
                     if apply_free_icon_menu_command(&paths, action, &self.shared, ctx) {
                         needs_save = true;
                     }
+                    if is_rename
+                        && let Some((path, cur_name, rect)) =
+                            pending_free_rename(&lock_unpoisoned(&self.shared))
+                    {
+                        self.free_desktop_ctrl
+                            .begin_inline_rename(path, cur_name, rect);
+                    }
+                    needs_free_snapshot = true;
                 }
                 BgEvent::FlushAndExit => {
                     self.begin_shutdown(ctx);
@@ -1957,16 +1912,50 @@ impl DeskLiteEguiApp {
             }
         }
 
-        let (cmds, async_save) = {
+        let mut cmds: Vec<FenceCommand> = Vec::new();
+        while let Ok(free_ev) = self.free_desktop_rx.try_recv() {
+            let res = handle_free_desktop_event(free_ev, &self.shared);
+            if res.needs_save {
+                needs_save = true;
+            }
+            if res.needs_snapshot_refresh {
+                needs_free_snapshot = true;
+            }
+            if let Some(path) = res.launch_path
+                && let Err(err) = launch_item(&path)
+            {
+                lock_unpoisoned(&self.shared).free_toast =
+                    Some((format!("打开失败: {err}"), Instant::now()));
+                needs_free_snapshot = true;
+            }
+            if let Some((path, cur_name, rect)) = res.begin_rename {
+                self.free_desktop_ctrl
+                    .begin_inline_rename(path, cur_name, rect);
+            }
+            if !res.repaint_fences.is_empty() {
+                let guard = lock_unpoisoned(&self.shared);
+                for fid in res.repaint_fences {
+                    guard.request_repaint_fence(ctx, fid);
+                }
+            }
+            cmds.extend(res.commands);
+        }
+
+        let (shared_cmds, async_save, pending_free) = {
             let mut guard = lock_unpoisoned(&self.shared);
             (
                 std::mem::take(&mut guard.pending_commands),
                 std::mem::take(&mut guard.pending_immediate_save_from_async),
+                std::mem::take(&mut guard.pending_repaint_free_desktop),
             )
         };
         if async_save {
             needs_save = true;
         }
+        if pending_free {
+            needs_free_snapshot = true;
+        }
+        cmds.extend(shared_cmds);
 
         for cmd in cmds {
             match cmd {
@@ -1974,10 +1963,7 @@ impl DeskLiteEguiApp {
                     self.create_blank_fence();
                     needs_save = true;
                 }
-                FenceCommand::RequestCreateUnfiledDesktop => {
-                    self.create_unfiled_desktop_fence();
-                    needs_save = true;
-                }
+                FenceCommand::RequestCreateUnfiledDesktop => {}
                 FenceCommand::RequestCreatePortal => {
                     self.spawn_folder_picker_cmd(ctx, None);
                 }
@@ -1987,12 +1973,11 @@ impl DeskLiteEguiApp {
                 FenceCommand::RequestDelete(fid) => {
                     let desktop_dirs = { lock_unpoisoned(&self.shared).desktop_dirs.clone() };
                     let scanned_desktop = scan_all_desktop_items(&desktop_dirs);
-                    let unfiled_ids = {
+                    {
                         let mut guard = lock_unpoisoned(&self.shared);
                         let topo = guard.topology.clone();
                         if guard.config.remove_fence(fid) {
                             guard.prune_removed_fences();
-                            guard.refresh_unfiled_desktop_views(&scanned_desktop);
                             let _ = reconcile_free_icons_in_config(
                                 &mut guard.config,
                                 &topo,
@@ -2001,31 +1986,23 @@ impl DeskLiteEguiApp {
                             );
                             needs_save = true;
                             needs_watcher_sync = true;
+                            needs_free_snapshot = true;
                         }
-                        guard
-                            .config
-                            .fences
-                            .iter()
-                            .filter(|f| f.is_unfiled_desktop(&desktop_dirs))
-                            .map(|f| f.id)
-                            .collect::<Vec<_>>()
-                    };
-                    for ufid in unfiled_ids {
-                        ctx.request_repaint_of(ViewportId::from_hash_of(("desklite_fence", ufid)));
                     }
-                    ctx.request_repaint_of(ViewportId::from_hash_of("desklite_free_desktop"));
                 }
                 FenceCommand::SyncPortals => {
                     needs_watcher_sync = true;
                 }
                 FenceCommand::RefreshDesktop => {
-                    if self.refresh_desktop_views(ctx) {
+                    if self.refresh_desktop_views() {
                         needs_save = true;
                     }
+                    needs_free_snapshot = false;
                 }
                 FenceCommand::ToggleHideAllFences => {
                     self.toggle_hide_all_fences(ctx);
                     needs_save = true;
+                    needs_free_snapshot = false;
                 }
                 FenceCommand::ShowFenceMenu {
                     fence_id,
@@ -2086,6 +2063,9 @@ impl DeskLiteEguiApp {
                 ctx.request_repaint_after(deadline - now);
             }
         }
+        if needs_free_snapshot {
+            self.push_free_desktop_snapshot();
+        }
         true
     }
 }
@@ -2112,15 +2092,7 @@ impl eframe::App for DeskLiteEguiApp {
             return;
         }
 
-        let (
-            fences,
-            builder_rects,
-            topology,
-            hide_all_fences,
-            free_desktop_hwnd,
-            show_free_desktop,
-            inspector_meta,
-        ) = {
+        let (fences, builder_rects, topology, hide_all_fences, inspector_meta) = {
             let guard = lock_unpoisoned(&self.shared);
             let insp = if guard.inspector_spawned {
                 guard.inspector.as_ref().map(|ins| {
@@ -2149,78 +2121,16 @@ impl eframe::App for DeskLiteEguiApp {
             } else {
                 None
             };
-            let has_unfiled_fence = guard
-                .config
-                .unfiled_desktop_fence_id(&guard.desktop_dirs)
-                .is_some();
-            // Do not spawn the full-screen WGL FreeDesktop overlay when an UnfiledDesktop
-            // fence already hosts unfiled desktop items (avoids duplicate icons, saves a
-            // full-screen GL framebuffer, and keeps the native Windows wallpaper unobstructed).
-            let show_free_desktop = !has_unfiled_fence
-                && !guard.config.active_free_icons().is_empty()
-                && !guard.config.hide_all_fences;
             (
                 guard.config.fences.clone(),
                 guard.builder_rects.clone(),
                 guard.topology.clone(),
                 guard.config.hide_all_fences,
-                guard.free_desktop_hwnd,
-                show_free_desktop,
                 insp,
             )
         };
 
         let monitors = topology.monitors();
-        let vbounds = topology.virtual_bounds();
-        if show_free_desktop {
-            if free_desktop_hwnd != 0
-                && self.free_desktop_synced_key.as_ref() != Some(topology.key())
-            {
-                set_window_rect_no_z(
-                    free_desktop_hwnd,
-                    vbounds.left,
-                    vbounds.top,
-                    vbounds.width().max(1),
-                    vbounds.height().max(1),
-                );
-                self.free_desktop_synced_key = Some(topology.key().clone());
-            }
-
-            let free_scale = if monitors.is_empty() {
-                1.0
-            } else {
-                (nearest_monitor(vbounds.center(), monitors).dpi_x as f32 / 96.0).max(0.5)
-            };
-            let free_vb = ViewportBuilder::default()
-                .with_title(FREE_DESKTOP_TITLE)
-                .with_decorations(false)
-                .with_transparent(true)
-                .with_taskbar(false)
-                .with_resizable(false)
-                .with_visible(true)
-                .with_window_level(WindowLevel::AlwaysOnBottom)
-                .with_position(Pos2::new(
-                    vbounds.left as f32 / free_scale,
-                    vbounds.top as f32 / free_scale,
-                ))
-                .with_inner_size(Vec2::new(
-                    (vbounds.width().max(1) as f32) / free_scale,
-                    (vbounds.height().max(1) as f32) / free_scale,
-                ));
-            let free_shared = Arc::clone(&self.shared);
-            let free_layout_path = self.layout_path.clone();
-            ctx.show_viewport_deferred(
-                ViewportId::from_hash_of("desklite_free_desktop"),
-                free_vb,
-                move |sub_ui, _class| {
-                    let res = render_free_desktop_viewport(sub_ui, &free_shared);
-                    if res.needs_immediate_save {
-                        save_shared_now(&free_layout_path, &free_shared, "free_desktop_viewport");
-                    }
-                },
-            );
-        }
-
         for spec in fences {
             let fid = spec.id;
             let vid = ViewportId::from_hash_of(("desklite_fence", fid));
@@ -2265,10 +2175,13 @@ impl eframe::App for DeskLiteEguiApp {
             });
         }
 
-        if self.prev_hide_all_fences && !hide_all_fences {
-            post_reassert_all_fences_z();
+        if self.prev_hide_all_fences != hide_all_fences {
+            if self.prev_hide_all_fences && !hide_all_fences {
+                post_reassert_all_fences_z();
+            }
+            self.push_free_desktop_snapshot();
+            self.prev_hide_all_fences = hide_all_fences;
         }
-        self.prev_hide_all_fences = hide_all_fences;
 
         if let Some((insp_open, init_pos)) = inspector_meta {
             let ivb = ViewportBuilder::default()
@@ -2300,6 +2213,7 @@ impl eframe::App for DeskLiteEguiApp {
     fn on_exit(&mut self, _gl: Option<&eframe::glow::Context>) {
         if !self.shutting_down {
             self.shutting_down = true;
+            self.free_desktop_ctrl.shutdown();
             persist_and_restore_on_exit(&self.layout_path, &self.shared, "on_exit");
             self.post_helper(WM_APP_SHUTDOWN, WPARAM(0), LPARAM(0));
         }
@@ -2336,6 +2250,7 @@ fn main() {
 
     let _ = set_shell_desktop_icons_visible(false);
 
+    let free_desktop_ctrl_slot = Arc::new(Mutex::new(None));
     let free_icon_menu_paths = Arc::new(Mutex::new(Vec::new()));
     let (tx, rx) = mpsc::channel();
 
@@ -2350,7 +2265,7 @@ fn main() {
         clipboard_shortcuts: false,
         ..Default::default()
     };
-    native_options.glow_options.vsync = false;
+    native_options.glow_options.vsync = true;
 
     let _ = eframe::run_native(
         "DeskLite",
@@ -2361,13 +2276,42 @@ fn main() {
             let helper_hwnd = spawn_win32_helper(
                 layout_path.clone(),
                 Arc::clone(&shared),
+                Arc::clone(&free_desktop_ctrl_slot),
                 Arc::clone(&free_icon_menu_paths),
                 tx.clone(),
                 cc.egui_ctx.clone(),
             );
+            let (free_desktop_ctrl, free_desktop_rx) =
+                match FreeDesktopController::spawn(helper_hwnd, WM_APP_FREE_DESKTOP_EVENT) {
+                    Ok(pair) => pair,
+                    Err(err) => {
+                        restore_all_desktop_icons();
+                        if helper_hwnd != 0 {
+                            unsafe {
+                                let _ = PostMessageW(
+                                    Some(HWND(helper_hwnd as *mut _)),
+                                    WM_APP_SHUTDOWN,
+                                    WPARAM(0),
+                                    LPARAM(0),
+                                );
+                            }
+                        }
+                        return Err(Box::new(err));
+                    }
+                };
             {
-                lock_unpoisoned(&shared).set_drag_notify_target(helper_hwnd, WM_APP_DRAG_DONE);
+                *lock_unpoisoned(&free_desktop_ctrl_slot) = Some(free_desktop_ctrl.clone());
             }
+            let initial_snapshot = {
+                let mut guard = lock_unpoisoned(&shared);
+                guard.free_desktop_hwnd = free_desktop_ctrl.hwnd();
+                guard.set_helper_hwnd(helper_hwnd);
+                guard.set_drag_notify_target(helper_hwnd, WM_APP_DRAG_DONE);
+                guard.set_free_desktop_notify_target(helper_hwnd, WM_APP_REFRESH_FREE_DESKTOP);
+                build_free_desktop_snapshot(&guard)
+            };
+            free_desktop_ctrl.update_snapshot(initial_snapshot);
+
             if helper_hwnd != 0 {
                 unsafe {
                     let _ = PostMessageW(
@@ -2381,15 +2325,17 @@ fn main() {
             Ok(Box::new(DeskLiteEguiApp {
                 layout_path,
                 shared,
+                free_desktop_ctrl,
+                free_desktop_rx,
                 free_icon_menu_paths,
                 rx,
                 tx,
                 helper_hwnd,
                 host_attach_passes: 0,
                 prev_hide_all_fences: initial_hide_all,
-                free_desktop_synced_key: None,
                 shutting_down: false,
             }))
         }),
     );
+    restore_all_desktop_icons();
 }

@@ -1,10 +1,12 @@
 pub mod desktop_listview;
 pub mod display;
 pub mod dpi;
+pub mod drag_ghost;
 pub mod drag_out;
 pub mod events;
 pub mod fence_poc;
 pub mod folder_watch;
+pub mod free_desktop_wnd;
 pub mod icons;
 pub mod shell_ops;
 pub mod tray;
@@ -45,6 +47,7 @@ pub use desktop_listview::{
 };
 pub use display::probe_display_topology;
 pub use dpi::enable_per_monitor_dpi_v2;
+pub use drag_ghost::DragGhost;
 pub use drag_out::{
     AsyncDragRequest, DragOutOutcome, DragTargetOutcome, clipboard_has_files,
     copy_files_to_clipboard, copy_text_to_clipboard, read_clipboard_files, read_clipboard_text,
@@ -58,7 +61,10 @@ pub use events::{
 };
 pub use fence_poc::{FencePocConfig, run_bottom_fence_poc};
 pub use folder_watch::{FolderWatcher, WM_APP_PORTAL_DIRTY};
-pub use icons::{DecodedIcon, IconCache};
+pub use free_desktop_wnd::{
+    FreeDesktopController, FreeDesktopEvent, FreeDesktopRenderItem, FreeDesktopSnapshot,
+};
+pub use icons::{DecodedIcon, IconCache, extract_file_icon_pbgra};
 pub use shell_ops::{
     all_desktop_dirs, is_desktop_dir_path, is_directly_on_desktop, is_vault_path, launch_as_admin,
     launch_item, migrate_vault_item_to_desktop, move_path_in_place, paste_files_to_directory,
@@ -71,10 +77,11 @@ pub use window_attach::{
     DesktopZHookGuard, Win32Hotkey, all_bucket_fence_hwnds, all_fence_hwnds,
     allow_foreground_self, attach_desktop_owner_and_rounded_corners, attach_free_desktop_canvas,
     cursor_screen_pos, enable_dark_popup_menus, find_window_by_exact_title, focus_window_now,
-    foreground_window_handle, free_desktop_hwnd, install_desktop_z_win_event_hooks,
-    is_ctrl_key_down, is_free_desktop_hwnd, is_in_size_move, is_primary_mouse_down,
+    foreground_window_handle, free_desktop_hwnd, inspector_hwnd,
+    install_desktop_z_win_event_hooks, is_ctrl_key_down, is_file_drag_active,
+    is_free_desktop_hwnd, is_in_size_move, is_popup_menu_hwnd, is_primary_mouse_down,
     live_sizemove_rect_for_hwnd, move_window_no_z, post_reassert_all_fences_z,
-    set_active_text_edit_hwnd, set_hwnd_locked, set_inspector_hwnd, set_window_rect_no_z,
-    strip_alt_tab_from_host, style_floating_inspector_window, take_win32_hotkeys,
-    window_outer_rect,
+    set_active_text_edit_hwnd, set_file_drag_active, set_hwnd_locked, set_inspector_hwnd,
+    set_window_rect_no_z, strip_alt_tab_from_host, style_floating_inspector_window,
+    take_win32_hotkeys, window_outer_rect,
 };

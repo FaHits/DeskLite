@@ -154,7 +154,8 @@ fn is_desktop_dir_str(dir: &str, desktop_dirs: &[String]) -> bool {
 pub enum FenceRole {
     /// Hosts categorized desktop files in-place on the Desktop (or legacy vault paths).
     DesktopBucket,
-    /// Optional catch-all fence for unfiled desktop files (supersedes `portal_dir == Desktop`).
+    /// Legacy alias from earlier builds; always resolves/normalizes to `DesktopBucket`
+    /// so `FreeDesktop` (`BoxId=1`) owns unfiled desktop files directly without conflict.
     UnfiledDesktop,
     /// Browses an external non-desktop folder portal.
     ExternalPortal { dir: String },
@@ -183,11 +184,16 @@ pub struct FenceSpec {
 
 impl FenceSpec {
     /// Resolves the effective role using `role` first, falling back to `portal_dir`.
+    /// Any legacy `UnfiledDesktop` or `portal_dir` pointing to a desktop directory resolves to
+    /// `FenceRole::DesktopBucket` so desktop fences remain mutually exclusive with `FreeDesktop`.
     pub fn effective_role(&self, desktop_dirs: &[String]) -> FenceRole {
         if let Some(role) = &self.role {
             return match role {
-                FenceRole::ExternalPortal { dir } if is_desktop_dir_str(dir, desktop_dirs) => {
-                    FenceRole::UnfiledDesktop
+                FenceRole::UnfiledDesktop => FenceRole::DesktopBucket,
+                FenceRole::ExternalPortal { dir }
+                    if dir.trim().is_empty() || is_desktop_dir_str(dir, desktop_dirs) =>
+                {
+                    FenceRole::DesktopBucket
                 }
                 other => other.clone(),
             };
@@ -198,7 +204,7 @@ impl FenceSpec {
             .map(str::trim)
             .filter(|s| !s.is_empty())
         {
-            Some(dir) if is_desktop_dir_str(dir, desktop_dirs) => FenceRole::UnfiledDesktop,
+            Some(dir) if is_desktop_dir_str(dir, desktop_dirs) => FenceRole::DesktopBucket,
             Some(dir) => FenceRole::ExternalPortal {
                 dir: dir.to_string(),
             },
@@ -206,8 +212,8 @@ impl FenceSpec {
         }
     }
 
-    /// Normalizes legacy `portal_dir` into `role` and keeps `portal_dir` populated only for
-    /// external folder portals.
+    /// Normalizes legacy `portal_dir` and `UnfiledDesktop` into `DesktopBucket` (preserving
+    /// `items` and `rect`), keeping `portal_dir` populated only for external folder portals.
     pub fn normalize_role(&mut self, desktop_dirs: &[String]) {
         let resolved = self.effective_role(desktop_dirs);
         self.role = Some(resolved.clone());
@@ -1031,12 +1037,42 @@ mod tests {
     fn role_resolution_and_portal_dir_backward_compatibility() {
         let desktops = vec![r"C:\Users\Alice\Desktop".to_string()];
 
-        let mut unfiled_legacy = make_fence(101, "Desktop", None, Some(r"c:/Users/Alice/Desktop\"));
-        assert_eq!(unfiled_legacy.effective_role(&desktops), FenceRole::UnfiledDesktop);
-        assert!(unfiled_legacy.is_unfiled_desktop(&desktops));
-        unfiled_legacy.normalize_role(&desktops);
-        assert_eq!(unfiled_legacy.role, Some(FenceRole::UnfiledDesktop));
-        assert_eq!(unfiled_legacy.portal_dir, None);
+        let mut desktop_portal_legacy =
+            make_fence(101, "Desktop", None, Some(r"c:/Users/Alice/Desktop\"));
+        desktop_portal_legacy
+            .items
+            .push(make_item("keep.txt", r"C:\Users\Alice\Desktop\keep.txt", 0));
+        let orig_rect = desktop_portal_legacy.rect;
+        assert_eq!(
+            desktop_portal_legacy.effective_role(&desktops),
+            FenceRole::DesktopBucket
+        );
+        assert!(desktop_portal_legacy.is_desktop_bucket(&desktops));
+        assert!(!desktop_portal_legacy.is_unfiled_desktop(&desktops));
+        desktop_portal_legacy.normalize_role(&desktops);
+        assert_eq!(desktop_portal_legacy.role, Some(FenceRole::DesktopBucket));
+        assert_eq!(desktop_portal_legacy.portal_dir, None);
+        assert_eq!(desktop_portal_legacy.rect, orig_rect);
+        assert_eq!(desktop_portal_legacy.items.len(), 1);
+
+        let mut persisted_unfiled = make_fence(
+            104,
+            "Desktop",
+            Some(FenceRole::UnfiledDesktop),
+            Some(r"C:\Users\Alice\Desktop"),
+        );
+        persisted_unfiled
+            .items
+            .push(make_item("in_box.lnk", r"C:\Users\Alice\Desktop\in_box.lnk", 0));
+        assert_eq!(
+            persisted_unfiled.effective_role(&desktops),
+            FenceRole::DesktopBucket
+        );
+        assert!(!persisted_unfiled.is_unfiled_desktop(&desktops));
+        persisted_unfiled.normalize_role(&desktops);
+        assert_eq!(persisted_unfiled.role, Some(FenceRole::DesktopBucket));
+        assert_eq!(persisted_unfiled.portal_dir, None);
+        assert_eq!(persisted_unfiled.items.len(), 1);
 
         let mut ext_legacy = make_fence(102, "Docs", None, Some(r"D:\Work\Docs"));
         assert_eq!(
@@ -1068,16 +1104,20 @@ mod tests {
         let mut b1 = make_fence(101, "Work", Some(FenceRole::DesktopBucket), None);
         b1.items.push(make_item("a.txt", r"C:\Users\Alice\Desktop\a.txt", 0));
         let b2 = make_fence(102, "Play", Some(FenceRole::DesktopBucket), None);
-        let mut portal = make_fence(103, "Unfiled", Some(FenceRole::UnfiledDesktop), None);
-        portal
+        // Legacy UnfiledDesktop fence now behaves identically to a normal DesktopBucket:
+        // deduplicated under single ownership and never swallows FreeDesktop.
+        let mut legacy_desktop_fence =
+            make_fence(104, "Desktop", Some(FenceRole::UnfiledDesktop), None);
+        legacy_desktop_fence
             .items
             .push(make_item("a.txt", r"C:\Users\Alice\Desktop\a.txt", 0));
 
         let mut cfg = NativeLayoutConfig {
-            fences: vec![b1, b2, portal],
+            fences: vec![b1, b2, legacy_desktop_fence],
             ..Default::default()
         };
         cfg.apply_topology(&topo, (84, 92)).unwrap();
+        assert_eq!(cfg.unfiled_desktop_fence_id(&desktops), None);
 
         assert!(cfg.upsert_free_icon(
             DesktopIconPos {
@@ -1087,6 +1127,12 @@ mod tests {
             },
             &desktops
         ));
+        // Duplicate between b1 (101) and legacy_desktop_fence (104) is purged, while
+        // unowned free.lnk remains untouched in free_icons.
+        assert_eq!(cfg.enforce_desktop_single_ownership(&desktops), 1);
+        assert!(cfg.fences[2].items.is_empty());
+        assert_eq!(cfg.active_free_icons().len(), 1);
+
         // Bucket-owned item cannot be added to free_icons.
         assert!(!cfg.upsert_free_icon(
             DesktopIconPos {
@@ -1123,7 +1169,8 @@ mod tests {
         assert_eq!(cfg.active_free_icons().len(), 1);
         assert_eq!(cfg.active_free_icons()[0].display_name, "new.pdf");
 
-        // Release free.lnk back from b2 and delete a.txt everywhere.
+        // Release free.lnk back from b2 (and from normalized legacy_desktop_fence if assigned)
+        // and verify it returns to free_icons instead of being absorbed.
         assert_eq!(
             cfg.release_desktop_items(102, &[r"C:\Users\Alice\Desktop\free.lnk".into()], &desktops),
             1

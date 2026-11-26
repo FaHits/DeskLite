@@ -104,11 +104,14 @@ pub fn open_param_editor_for_fence(
         desklite_win32::move_window_no_z(insp_hwnd, initial_pos.0, initial_pos.1);
         focus_window_now(insp_hwnd);
     }
-    if needs_uncollapse {
-        ctx.request_repaint_of(ViewportId::from_hash_of(("desklite_fence", fence_id)));
+    {
+        let guard = lock_unpoisoned(shared);
+        if needs_uncollapse {
+            guard.request_repaint_fence(ctx, fence_id);
+        }
+        guard.request_repaint_inspector(ctx);
     }
     ctx.request_repaint_of(ViewportId::ROOT);
-    ctx.request_repaint_of(insp_vid);
 }
 
 fn inspector_card<R>(ui: &mut Ui, title: &str, add_contents: impl FnOnce(&mut Ui) -> R) -> R {
@@ -197,7 +200,7 @@ pub fn close_inspector_safely(
     out.needs_immediate_save = true;
     ctx.send_viewport_cmd(ViewportCommand::Visible(false));
     if let Some(fid) = repainted_fid {
-        ctx.request_repaint_of(ViewportId::from_hash_of(("desklite_fence", fid)));
+        lock_unpoisoned(shared).request_repaint_fence(ctx, fid);
     }
     ctx.request_repaint_of(ViewportId::ROOT);
 }
@@ -393,10 +396,7 @@ pub fn render_inspector_viewport(
                             .is_some_and(|f| f.collapsed)
                         {
                             guard.pending_toggle_collapse.insert(picked);
-                            ctx.request_repaint_of(ViewportId::from_hash_of((
-                                "desklite_fence",
-                                picked,
-                            )));
+                            guard.request_repaint_fence(&ctx, picked);
                         }
                     }
                 }
@@ -799,10 +799,7 @@ pub fn render_inspector_viewport(
                                 || lock_changed
                                 || single_changed
                             {
-                                ctx.request_repaint_of(ViewportId::from_hash_of((
-                                    "desklite_fence",
-                                    target_id,
-                                )));
+                                lock_unpoisoned(shared).request_repaint_fence(&ctx, target_id);
                             }
                             if rect_changed && !locked {
                                 let _ = apply_param_editor_rect(
@@ -841,10 +838,7 @@ pub fn render_inspector_viewport(
                             ("已复制样式格子".to_string(), Instant::now()),
                         );
                         out.needs_immediate_save = true;
-                        ctx.request_repaint_of(ViewportId::from_hash_of((
-                            "desklite_fence",
-                            target_id,
-                        )));
+                        lock_unpoisoned(shared).request_repaint_fence(&ctx, target_id);
                         ctx.request_repaint_of(ViewportId::ROOT);
                     }
                     ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
