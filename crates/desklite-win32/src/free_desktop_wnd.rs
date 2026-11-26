@@ -24,13 +24,15 @@ use windows::Win32::Graphics::Direct2D::{
     D2D1_BITMAP_INTERPOLATION_MODE_LINEAR, D2D1_BITMAP_PROPERTIES, D2D1_DRAW_TEXT_OPTIONS_CLIP,
     D2D1_FACTORY_TYPE_SINGLE_THREADED, D2D1_FEATURE_LEVEL_DEFAULT, D2D1_RENDER_TARGET_PROPERTIES,
     D2D1_RENDER_TARGET_TYPE_DEFAULT, D2D1_RENDER_TARGET_USAGE_NONE, D2D1_ROUNDED_RECT,
-    D2D1CreateFactory, ID2D1Bitmap, ID2D1DCRenderTarget, ID2D1Factory, ID2D1SolidColorBrush,
+    D2D1_TEXT_ANTIALIAS_MODE_GRAYSCALE, D2D1CreateFactory, ID2D1Bitmap, ID2D1DCRenderTarget,
+    ID2D1Factory, ID2D1SolidColorBrush,
 };
 use windows::Win32::Graphics::DirectWrite::{
     DWRITE_FACTORY_TYPE_SHARED, DWRITE_FONT_STRETCH_NORMAL, DWRITE_FONT_STYLE_NORMAL,
     DWRITE_FONT_WEIGHT_NORMAL, DWRITE_MEASURING_MODE_NATURAL, DWRITE_PARAGRAPH_ALIGNMENT_NEAR,
-    DWRITE_TEXT_ALIGNMENT_CENTER, DWRITE_TRIMMING, DWRITE_TRIMMING_GRANULARITY_CHARACTER,
-    DWRITE_WORD_WRAPPING_WRAP, DWriteCreateFactory, IDWriteFactory, IDWriteTextFormat,
+    DWRITE_TEXT_ALIGNMENT_CENTER, DWRITE_TEXT_METRICS, DWRITE_TRIMMING,
+    DWRITE_TRIMMING_GRANULARITY_CHARACTER, DWRITE_WORD_WRAPPING_WRAP, DWriteCreateFactory,
+    IDWriteFactory, IDWriteTextFormat,
 };
 use windows::Win32::Graphics::Dxgi::Common::DXGI_FORMAT_B8G8R8A8_UNORM;
 use windows::Win32::Graphics::Gdi::{
@@ -45,8 +47,9 @@ use windows::Win32::System::SystemServices::{MK_CONTROL, MK_SHIFT};
 use windows::Win32::UI::Controls::{EM_SETSEL, WM_MOUSELEAVE};
 use windows::Win32::UI::HiDpi::GetDpiForWindow;
 use windows::Win32::UI::Input::KeyboardAndMouse::{
-    GetCapture, ReleaseCapture, SetCapture, SetFocus, TME_LEAVE, TRACKMOUSEEVENT, TrackMouseEvent,
-    VK_ESCAPE, VK_RETURN,
+    GetCapture, GetKeyState, MAPVK_VSC_TO_VK_EX, MapVirtualKeyW, ReleaseCapture, SetCapture,
+    SetFocus, TME_LEAVE, TRACKMOUSEEVENT, TrackMouseEvent, VK_CONTROL, VK_DELETE, VK_ESCAPE,
+    VK_F2, VK_F5, VK_MENU, VK_PROCESSKEY, VK_RETURN, VK_SHIFT,
 };
 use windows::Win32::UI::Shell::{
     DefSubclassProc, DragAcceptFiles, DragFinish, DragQueryFileW, DragQueryPoint, HDROP,
@@ -54,14 +57,15 @@ use windows::Win32::UI::Shell::{
 };
 use windows::Win32::UI::WindowsAndMessaging::{
     CREATESTRUCTW, CS_DBLCLKS, CreateWindowExW, DLGC_WANTALLKEYS, DefWindowProcW, DestroyWindow,
-    DispatchMessageW, ES_AUTOHSCROLL, ES_CENTER, GWLP_USERDATA, GetMessageW, GetWindowLongPtrW,
-    GetWindowTextLengthW, GetWindowTextW, HMENU, PostMessageW, PostQuitMessage, RegisterClassExW,
-    SW_SHOWNOACTIVATE, SWP_NOACTIVATE, SWP_NOZORDER, SendMessageW, SetForegroundWindow,
-    SetWindowLongPtrW, SetWindowPos, ShowWindow, TranslateMessage, ULW_ALPHA, UpdateLayeredWindow,
+    DispatchMessageW, ES_AUTOHSCROLL, ES_CENTER, GWLP_USERDATA, GetForegroundWindow, GetMessageW,
+    GetWindowLongPtrW, GetWindowTextLengthW, GetWindowTextW, HMENU, HTCLIENT, IDC_ARROW,
+    LoadCursorW, PostMessageW, PostQuitMessage, RegisterClassExW, SW_HIDE, SW_SHOWNOACTIVATE,
+    SWP_NOACTIVATE, SWP_NOZORDER, SendMessageW, SetCursor, SetForegroundWindow, SetWindowLongPtrW,
+    SetWindowPos, ShowWindow, ShowWindowAsync, TranslateMessage, ULW_ALPHA, UpdateLayeredWindow,
     WM_ACTIVATE, WM_APP, WM_CAPTURECHANGED, WM_CHAR, WM_CONTEXTMENU, WM_CREATE, WM_DESTROY,
     WM_DPICHANGED, WM_DROPFILES, WM_ERASEBKGND, WM_GETDLGCODE, WM_KEYDOWN, WM_KILLFOCUS,
     WM_LBUTTONDBLCLK, WM_LBUTTONDOWN, WM_LBUTTONUP, WM_MOUSEMOVE, WM_NCDESTROY, WM_PAINT,
-    WM_RBUTTONUP, WM_SETFONT, WNDCLASSEXW, WS_BORDER, WS_CHILD, WS_EX_LAYERED, WS_EX_NOACTIVATE,
+    WM_RBUTTONUP, WM_SETCURSOR, WM_SETFONT, WNDCLASSEXW, WS_BORDER, WS_CHILD, WS_EX_LAYERED,
     WS_EX_TOOLWINDOW, WS_POPUP, WS_VISIBLE,
 };
 use windows::core::{HSTRING, w};
@@ -126,6 +130,21 @@ impl Default for FreeDesktopSnapshot {
     }
 }
 
+/// Keyboard shortcut actions dispatched directly from the native `FreeDesktop` window.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum FreeDesktopHotkey {
+    SelectAll,
+    Copy,
+    CopyPaths,
+    Cut,
+    Paste,
+    Undo,
+    Rename,
+    Delete { permanent: bool },
+    Refresh,
+    ClearSelection,
+}
+
 /// Events emitted by the `FreeDesktop` native Win32 canvas toward the app event loop.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum FreeDesktopEvent {
@@ -161,6 +180,7 @@ pub enum FreeDesktopEvent {
         screen_y: i32,
     },
     FocusLost,
+    Hotkey(FreeDesktopHotkey),
     RenameCommitted {
         old_path: String,
         new_name: String,
@@ -197,7 +217,10 @@ impl ControllerInner {
             let raw = self.hwnd.load(Ordering::Acquire);
             if raw != 0 {
                 let hwnd = HWND(raw as *mut c_void);
-                let _ = unsafe { PostMessageW(Some(hwnd), WM_APP_SHUTDOWN, WPARAM(0), LPARAM(0)) };
+                unsafe {
+                    let _ = ShowWindowAsync(hwnd, SW_HIDE);
+                    let _ = PostMessageW(Some(hwnd), WM_APP_SHUTDOWN, WPARAM(0), LPARAM(0));
+                }
             }
         }
 
@@ -498,6 +521,9 @@ impl DesktopRenderer {
         };
         let rt = unsafe { self.d2d_factory.CreateDCRenderTarget(&props) }
             .map_err(|e| win_err("CreateDCRenderTarget", e))?;
+        unsafe {
+            rt.SetTextAntialiasMode(D2D1_TEXT_ANTIALIAS_MODE_GRAYSCALE);
+        }
         self.dc_rt = Some(rt.clone());
         Ok(rt)
     }
@@ -622,7 +648,7 @@ impl DesktopRenderer {
 
         let (cw, ch) = effective_cell_size(snapshot.cell_size);
         let dpi = unsafe { GetDpiForWindow(hwnd) }.max(96) as f32;
-        let font_size = compute_label_font_size(ch, dpi);
+        let font_size = compute_label_font_size(cw, ch, dpi);
         let text_format = match self.ensure_text_format(font_size) {
             Ok(fmt) => fmt,
             Err(_) => return,
@@ -659,16 +685,19 @@ impl DesktopRenderer {
 
         if !snapshot.hide_all_fences {
             let brushes = RenderBrushes::new(&rt);
+            let dwrite = self.dwrite_factory.clone();
             for item in &snapshot.icons {
                 let is_hovered = hovered_path == Some(item.path.as_str());
                 let hide_label = active_rename_path == Some(item.path.as_str());
                 let bmp = self.get_or_create_bitmap(&rt, &item.path);
                 draw_icon_cell(
                     &rt,
+                    &dwrite,
                     &text_format,
                     &brushes,
                     bounds,
                     (cw, ch),
+                    font_size,
                     item,
                     bmp.as_ref(),
                     is_hovered,
@@ -734,15 +763,15 @@ struct RenderBrushes {
 impl RenderBrushes {
     fn new(rt: &ID2D1DCRenderTarget) -> Self {
         Self {
-            sel_fill: make_brush(rt, 0.24, 0.56, 0.94, 0.36),
-            sel_border: make_brush(rt, 0.45, 0.75, 1.0, 0.80),
-            hover_fill: make_brush(rt, 1.0, 1.0, 1.0, 0.14),
-            hover_border: make_brush(rt, 1.0, 1.0, 1.0, 0.26),
+            sel_fill: make_brush(rt, 88.0 / 255.0, 156.0 / 255.0, 250.0 / 255.0, 0.28),
+            sel_border: make_brush(rt, 135.0 / 255.0, 196.0 / 255.0, 1.0, 0.62),
+            hover_fill: make_brush(rt, 1.0, 1.0, 1.0, 0.13),
+            hover_border: make_brush(rt, 1.0, 1.0, 1.0, 0.22),
             fallback_fill: make_brush(rt, 0.72, 0.78, 0.86, 0.75),
-            shadow: make_brush(rt, 0.0, 0.0, 0.0, 0.85),
-            text: make_brush(rt, 1.0, 1.0, 1.0, 0.98),
-            marquee_fill: make_brush(rt, 0.20, 0.56, 0.98, 0.22),
-            marquee_border: make_brush(rt, 0.35, 0.72, 1.0, 0.88),
+            shadow: make_brush(rt, 0.0, 0.0, 0.0, 0.78),
+            text: make_brush(rt, 244.0 / 255.0, 247.0 / 255.0, 1.0, 0.98),
+            marquee_fill: make_brush(rt, 64.0 / 255.0, 152.0 / 255.0, 1.0, 0.22),
+            marquee_border: make_brush(rt, 110.0 / 255.0, 185.0 / 255.0, 1.0, 0.86),
         }
     }
 }
@@ -757,13 +786,75 @@ fn make_brush(
     unsafe { rt.CreateSolidColorBrush(&D2D1_COLOR_F { r, g, b, a }, None) }.ok()
 }
 
+fn free_cell_metrics(cw: f32, ch: f32, font_size: f32) -> (f32, f32) {
+    let est_two_line_h = font_size * 2.55;
+    let max_by_w = (cw * 0.60).max(28.0);
+    let max_by_h = (ch - 14.0 - est_two_line_h).max(28.0);
+    let icon_dim = max_by_w.min(max_by_h).clamp(28.0, 96.0).round();
+    let gap = (icon_dim * 0.14).clamp(4.0, 9.0).round();
+    (icon_dim, gap)
+}
+
+fn measure_dwrite_text(
+    dwrite: &IDWriteFactory,
+    text_format: &IDWriteTextFormat,
+    text: &str,
+    max_width: f32,
+    max_height: f32,
+) -> Option<DWRITE_TEXT_METRICS> {
+    let utf16: Vec<u16> = text.encode_utf16().collect();
+    let layout = unsafe { dwrite.CreateTextLayout(&utf16, text_format, max_width, max_height) }.ok()?;
+    let mut metrics = DWRITE_TEXT_METRICS::default();
+    unsafe { layout.GetMetrics(&mut metrics) }.ok()?;
+    Some(metrics)
+}
+
+fn fit_two_lines_dwrite(
+    dwrite: &IDWriteFactory,
+    text_format: &IDWriteTextFormat,
+    text: &str,
+    max_width: f32,
+    font_size: f32,
+) -> (String, f32) {
+    let max_h = (font_size * 4.5).max(48.0);
+    if let Some(full_metrics) = measure_dwrite_text(dwrite, text_format, text, max_width, max_h) {
+        if full_metrics.lineCount <= 2 {
+            return (text.to_string(), full_metrics.height.max(font_size * 1.2));
+        }
+
+        let chars: Vec<char> = text.chars().collect();
+        let mut lo = 0usize;
+        let mut hi = chars.len();
+        let mut best: Option<(String, f32)> = None;
+        while lo < hi {
+            let mid = lo.midpoint(hi).max(lo + 1);
+            let cand: String = chars[..mid].iter().chain(std::iter::once(&'…')).collect();
+            if let Some(metrics) =
+                measure_dwrite_text(dwrite, text_format, &cand, max_width, max_h)
+                && metrics.lineCount <= 2
+            {
+                best = Some((cand, metrics.height.max(font_size * 1.2)));
+                lo = mid;
+            } else {
+                hi = mid - 1;
+            }
+        }
+        if let Some(hit) = best {
+            return hit;
+        }
+    }
+    (text.to_string(), (font_size * 2.55).round())
+}
+
 #[allow(clippy::too_many_arguments)]
 fn draw_icon_cell(
     rt: &ID2D1DCRenderTarget,
+    dwrite: &IDWriteFactory,
     text_format: &IDWriteTextFormat,
     brushes: &RenderBrushes,
     bounds: Rect,
     cell_size: (i32, i32),
+    font_size: f32,
     item: &FreeDesktopRenderItem,
     bitmap: Option<&ID2D1Bitmap>,
     is_hovered: bool,
@@ -780,36 +871,69 @@ fn draw_icon_cell(
         right: lx + cw - 2.0,
         bottom: ly + ch - 2.0,
     };
+    let stroke_rect = D2D_RECT_F {
+        left: cell_rect.left + 0.5,
+        top: cell_rect.top + 0.5,
+        right: cell_rect.right - 0.5,
+        bottom: cell_rect.bottom - 0.5,
+    };
 
     if item.selected {
-        let rr = D2D1_ROUNDED_RECT {
+        let fill_rr = D2D1_ROUNDED_RECT {
             rect: cell_rect,
-            radiusX: 4.0,
-            radiusY: 4.0,
+            radiusX: 6.0,
+            radiusY: 6.0,
+        };
+        let stroke_rr = D2D1_ROUNDED_RECT {
+            rect: stroke_rect,
+            radiusX: 5.5,
+            radiusY: 5.5,
         };
         if let Some(fill) = &brushes.sel_fill {
-            unsafe { rt.FillRoundedRectangle(&rr, fill) };
+            unsafe { rt.FillRoundedRectangle(&fill_rr, fill) };
         }
         if let Some(border) = &brushes.sel_border {
-            unsafe { rt.DrawRoundedRectangle(&rr, border, 1.0, None) };
+            unsafe { rt.DrawRoundedRectangle(&stroke_rr, border, 1.0, None) };
         }
     } else if is_hovered {
-        let rr = D2D1_ROUNDED_RECT {
+        let fill_rr = D2D1_ROUNDED_RECT {
             rect: cell_rect,
-            radiusX: 4.0,
-            radiusY: 4.0,
+            radiusX: 6.0,
+            radiusY: 6.0,
+        };
+        let stroke_rr = D2D1_ROUNDED_RECT {
+            rect: stroke_rect,
+            radiusX: 5.5,
+            radiusY: 5.5,
         };
         if let Some(fill) = &brushes.hover_fill {
-            unsafe { rt.FillRoundedRectangle(&rr, fill) };
+            unsafe { rt.FillRoundedRectangle(&fill_rr, fill) };
         }
         if let Some(border) = &brushes.hover_border {
-            unsafe { rt.DrawRoundedRectangle(&rr, border, 1.0, None) };
+            unsafe { rt.DrawRoundedRectangle(&stroke_rr, border, 1.0, None) };
         }
     }
 
-    let icon_dim = (cw * 0.50).clamp(28.0, 56.0).min((ch - 32.0).max(24.0));
-    let icon_left = lx + (cw - icon_dim) * 0.5;
-    let icon_top = ly + 6.0;
+    let (icon_dim, gap) = free_cell_metrics(cw, ch, font_size);
+    let label_max_w = (cw - 8.0).max(16.0);
+    let fitted = (!hide_label && !item.display_name.is_empty()).then(|| {
+        fit_two_lines_dwrite(
+            dwrite,
+            text_format,
+            &item.display_name,
+            label_max_w,
+            font_size,
+        )
+    });
+    let text_h = fitted
+        .as_ref()
+        .map(|(_, h)| *h)
+        .unwrap_or_else(|| (font_size * 1.35).round());
+
+    let content_h = icon_dim + gap + text_h;
+    let top_y = (ly + (ch - content_h) * 0.5).round().max(ly + 4.0);
+    let icon_left = (lx + (cw - icon_dim) * 0.5).round();
+    let icon_top = top_y;
     let icon_rect = D2D_RECT_F {
         left: icon_left,
         top: icon_top,
@@ -837,19 +961,19 @@ fn draw_icon_cell(
         unsafe { rt.FillRoundedRectangle(&rr, fallback) };
     }
 
-    if hide_label || item.display_name.is_empty() {
+    let Some((label_text, _)) = fitted else {
         return;
-    }
+    };
 
-    let label_top = (icon_top + icon_dim + 4.0).min(ly + ch - 18.0);
+    let label_left = (lx + 4.0).round();
+    let label_top = (icon_top + icon_dim + gap).round().min(ly + ch - 16.0);
     let label_rect = D2D_RECT_F {
-        left: lx + 3.0,
+        left: label_left,
         top: label_top,
-        right: (lx + cw - 3.0).max(lx + 8.0),
+        right: (label_left + label_max_w).max(label_left + 8.0),
         bottom: (ly + ch - 3.0).max(label_top + 14.0),
     };
-    let label_utf16: Vec<u16> = item.display_name.encode_utf16().collect();
-
+    let label_utf16: Vec<u16> = label_text.encode_utf16().collect();
     if let Some(shadow) = &brushes.shadow {
         let shadow_rect = D2D_RECT_F {
             left: label_rect.left + 1.0,
@@ -896,11 +1020,17 @@ fn draw_marquee_box(
         right: (screen_rc.right - bounds.left) as f32,
         bottom: (screen_rc.bottom - bounds.top) as f32,
     };
+    let stroke_rc = D2D_RECT_F {
+        left: rc.left + 0.5,
+        top: rc.top + 0.5,
+        right: (rc.right - 0.5).max(rc.left + 0.5),
+        bottom: (rc.bottom - 0.5).max(rc.top + 0.5),
+    };
     if let Some(fill) = &brushes.marquee_fill {
         unsafe { rt.FillRectangle(&rc, fill) };
     }
     if let Some(border) = &brushes.marquee_border {
-        unsafe { rt.DrawRectangle(&rc, border, 1.0, None) };
+        unsafe { rt.DrawRectangle(&stroke_rc, border, 1.0, None) };
     }
 }
 
@@ -1054,9 +1184,9 @@ impl WindowState {
             return;
         };
 
-        let (_, ch) = effective_cell_size(self.snapshot.cell_size);
+        let (cw, ch) = effective_cell_size(self.snapshot.cell_size);
         let dpi = unsafe { GetDpiForWindow(self.hwnd) }.max(96) as f32;
-        let font_px = -(compute_label_font_size(ch, dpi).round() as i32);
+        let font_px = -(compute_label_font_size(cw, ch, dpi).round() as i32);
         let font = unsafe {
             CreateFontW(
                 font_px,
@@ -1210,11 +1340,13 @@ fn run_window_thread(
     };
 
     let hinstance = unsafe { GetModuleHandleW(None) }.ok();
+    let default_cursor = unsafe { LoadCursorW(None, IDC_ARROW) }.unwrap_or_default();
     let wc = WNDCLASSEXW {
         cbSize: size_of::<WNDCLASSEXW>() as u32,
         style: CS_DBLCLKS,
         lpfnWndProc: Some(free_desktop_wnd_proc),
         hInstance: hinstance.map(Into::into).unwrap_or_default(),
+        hCursor: default_cursor,
         lpszClassName: FREE_DESKTOP_CLASS_NAME,
         ..Default::default()
     };
@@ -1242,7 +1374,7 @@ fn run_window_thread(
 
     let hwnd_res = unsafe {
         CreateWindowExW(
-            WS_EX_LAYERED | WS_EX_TOOLWINDOW | WS_EX_NOACTIVATE,
+            WS_EX_LAYERED | WS_EX_TOOLWINDOW,
             FREE_DESKTOP_CLASS_NAME,
             FREE_DESKTOP_WINDOW_TITLE,
             WS_POPUP,
@@ -1435,6 +1567,26 @@ unsafe extern "system" fn free_desktop_wnd_proc(
             }
             LRESULT(0)
         }
+        WM_SETCURSOR => {
+            if (lparam.0 & 0xFFFF) as u16 == HTCLIENT as u16 {
+                if let Ok(arrow) = unsafe { LoadCursorW(None, IDC_ARROW) } {
+                    unsafe {
+                        let _ = SetCursor(Some(arrow));
+                    }
+                }
+                return LRESULT(1);
+            }
+            unsafe { DefWindowProcW(hwnd, msg, wparam, lparam) }
+        }
+        WM_KEYDOWN => {
+            if state.inline_rename.is_none()
+                && let Some(hk) = decode_free_desktop_hotkey(wparam, lparam)
+            {
+                state.emit(FreeDesktopEvent::Hotkey(hk));
+                return LRESULT(0);
+            }
+            unsafe { DefWindowProcW(hwnd, msg, wparam, lparam) }
+        }
         WM_LBUTTONDOWN => {
             handle_lbutton_down(state, wparam, lparam);
             LRESULT(0)
@@ -1514,9 +1666,59 @@ unsafe extern "system" fn free_desktop_wnd_proc(
     }
 }
 
+fn decode_free_desktop_hotkey(wparam: WPARAM, lparam: LPARAM) -> Option<FreeDesktopHotkey> {
+    if (lparam.0 & (1 << 30)) != 0 {
+        return None;
+    }
+    let mut vk = (wparam.0 & 0xFFFF) as u32;
+    if vk == u32::from(VK_PROCESSKEY.0) {
+        let scancode = ((lparam.0 >> 16) & 0xFF) as u32;
+        if scancode != 0 {
+            vk = unsafe { MapVirtualKeyW(scancode, MAPVK_VSC_TO_VK_EX) };
+        }
+    }
+    let ctrl_down = (unsafe { GetKeyState(VK_CONTROL.0 as i32) } as u16 & 0x8000) != 0;
+    let alt_down = (unsafe { GetKeyState(VK_MENU.0 as i32) } as u16 & 0x8000) != 0;
+    let shift_down = (unsafe { GetKeyState(VK_SHIFT.0 as i32) } as u16 & 0x8000) != 0;
+
+    if ctrl_down && !alt_down {
+        return match (vk, shift_down) {
+            (0x41, false) => Some(FreeDesktopHotkey::SelectAll),
+            (0x43, false) => Some(FreeDesktopHotkey::Copy),
+            (0x43, true) => Some(FreeDesktopHotkey::CopyPaths),
+            (0x58, false) => Some(FreeDesktopHotkey::Cut),
+            (0x56, false) => Some(FreeDesktopHotkey::Paste),
+            (0x5A, false) => Some(FreeDesktopHotkey::Undo),
+            _ => None,
+        };
+    }
+    if !ctrl_down && !alt_down {
+        if vk == u32::from(VK_F2.0) && !shift_down {
+            return Some(FreeDesktopHotkey::Rename);
+        }
+        if vk == u32::from(VK_F5.0) && !shift_down {
+            return Some(FreeDesktopHotkey::Refresh);
+        }
+        if vk == u32::from(VK_DELETE.0) {
+            return Some(FreeDesktopHotkey::Delete {
+                permanent: shift_down,
+            });
+        }
+        if vk == u32::from(VK_ESCAPE.0) && !shift_down {
+            return Some(FreeDesktopHotkey::ClearSelection);
+        }
+    }
+    None
+}
+
 fn handle_lbutton_down(state: &mut WindowState, wparam: WPARAM, lparam: LPARAM) {
     state.finish_inline_rename(false);
     state.suppress_next_lbutton_up = false;
+    unsafe {
+        if GetForegroundWindow() != state.hwnd {
+            let _ = SetForegroundWindow(state.hwnd);
+        }
+    }
 
     let screen_pt = screen_point_from_lparam(lparam, state.snapshot.virtual_bounds);
     let ctrl = (wparam.0 & MK_CONTROL.0 as usize) != 0;
@@ -1602,12 +1804,14 @@ fn handle_mouse_move(state: &mut WindowState, lparam: LPARAM) {
 }
 
 fn handle_lbutton_up(state: &mut WindowState, lparam: LPARAM) {
+    // Take drag_state before ReleaseCapture() because ReleaseCapture synchronously
+    // dispatches WM_CAPTURECHANGED and resets state.drag_state to None.
+    let taken = std::mem::replace(&mut state.drag_state, MouseDragState::None);
     unsafe {
         if GetCapture() == state.hwnd {
             let _ = ReleaseCapture();
         }
     }
-    let taken = std::mem::replace(&mut state.drag_state, MouseDragState::None);
     if state.suppress_next_lbutton_up {
         state.suppress_next_lbutton_up = false;
         if matches!(taken, MouseDragState::Marquee { .. }) {
@@ -1746,10 +1950,12 @@ fn effective_cell_size(cell_size: (i32, i32)) -> (i32, i32) {
     (cell_size.0.max(48), cell_size.1.max(56))
 }
 
-fn compute_label_font_size(cell_h: i32, dpi: f32) -> f32 {
-    let dpi_base = 12.0 * (dpi / 96.0);
-    let cell_cap = (cell_h as f32 * 0.16).clamp(11.0, 22.0);
-    dpi_base.min(cell_cap).max(11.0)
+fn compute_label_font_size(cell_w: i32, cell_h: i32, dpi: f32) -> f32 {
+    let min_side = cell_w.min(cell_h) as f32;
+    let logical_base = (11.2 + (min_side - 80.0).max(0.0) * 0.035).clamp(11.5, 14.5);
+    let dpi_scaled = logical_base * (dpi / 96.0);
+    let cell_cap = (cell_h as f32 * 0.17).clamp(11.5, 22.0);
+    dpi_scaled.min(cell_cap).max(11.5)
 }
 
 fn rect_from_points(a: Point, b: Point) -> Rect {

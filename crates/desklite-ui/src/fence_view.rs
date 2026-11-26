@@ -72,7 +72,9 @@ fn ensure_fence_attached(fence_id: i32, shared: &Arc<Mutex<SharedFenceState>>) {
     }
     attach_desktop_owner_and_rounded_corners(raw_hwnd);
     if all_bucket_fence_hwnds().contains(&raw_hwnd) {
-        lock_unpoisoned(shared).register_fence_hwnd(fence_id, raw_hwnd);
+        let mut guard = lock_unpoisoned(shared);
+        guard.register_fence_hwnd(fence_id, raw_hwnd);
+        guard.pending_reveal_fences.insert(fence_id, 1);
     }
 }
 
@@ -698,7 +700,14 @@ pub fn render_fence_viewport(
             guard.request_repaint_inspector(&ctx);
         }
     }
+    let reveal_step = {
+        lock_unpoisoned(shared)
+            .pending_reveal_fences
+            .get(&fence_id)
+            .copied()
+    };
     if let Some(cur_phys) = live_phys_rect
+        && reveal_step.is_none()
         && !topology_settling
         && !any_pointer_down
         && !desklite_win32::is_in_size_move()
@@ -1771,6 +1780,33 @@ pub fn render_fence_viewport(
         });
     });
 
+    if let Some(step) = reveal_step
+        && my_hwnd != 0
+    {
+        if step > 0 {
+            lock_unpoisoned(shared)
+                .pending_reveal_fences
+                .insert(fence_id, step - 1);
+            ctx.request_repaint();
+        } else {
+            lock_unpoisoned(shared).pending_reveal_fences.remove(&fence_id);
+            let target_h = if spec.collapsed {
+                (COLLAPSED_HEIGHT * ppp).round() as i32
+            } else {
+                spec.rect.height().max(MIN_FENCE_HEIGHT)
+            };
+            desklite_win32::set_window_rect_no_z(
+                my_hwnd,
+                spec.rect.left,
+                spec.rect.top,
+                spec.rect.width().max(MIN_FENCE_WIDTH),
+                target_h,
+            );
+            desklite_win32::post_reassert_all_fences_z();
+            ctx.request_repaint_of(ViewportId::ROOT);
+        }
+    }
+
     out
 }
 
@@ -2787,5 +2823,47 @@ mod tests {
         let g = lock_unpoisoned(&shared);
         assert!(g.selected_items.is_empty());
         assert!(g.free_selected_paths.is_empty());
+    }
+
+    #[test]
+    fn free_desktop_hotkeys_handle_select_all_clear_and_refresh() {
+        let shared = test_shared(Vec::new());
+        {
+            let mut g = lock_unpoisoned(&shared);
+            let snap_key = g.config.active_topology.clone().unwrap();
+            g.config.snapshots.get_mut(&snap_key).unwrap().free_icons = vec![
+                DesktopIconPos {
+                    id: r"C:\Users\Demo\Desktop\one.txt".into(),
+                    display_name: "one.txt".into(),
+                    pos: Point { x: 20, y: 20 },
+                },
+                DesktopIconPos {
+                    id: r"C:\Users\Demo\Desktop\two.txt".into(),
+                    display_name: "two.txt".into(),
+                    pos: Point { x: 140, y: 20 },
+                },
+            ];
+        }
+        let r1 = handle_free_desktop_event(
+            desklite_win32::FreeDesktopEvent::Hotkey(desklite_win32::FreeDesktopHotkey::SelectAll),
+            &shared,
+        );
+        assert!(r1.needs_snapshot_refresh);
+        assert_eq!(lock_unpoisoned(&shared).free_selected_paths.len(), 2);
+
+        let r2 = handle_free_desktop_event(
+            desklite_win32::FreeDesktopEvent::Hotkey(
+                desklite_win32::FreeDesktopHotkey::ClearSelection,
+            ),
+            &shared,
+        );
+        assert!(r2.needs_snapshot_refresh);
+        assert!(lock_unpoisoned(&shared).free_selected_paths.is_empty());
+
+        let r3 = handle_free_desktop_event(
+            desklite_win32::FreeDesktopEvent::Hotkey(desklite_win32::FreeDesktopHotkey::Refresh),
+            &shared,
+        );
+        assert!(r3.commands.contains(&FenceCommand::RefreshDesktop));
     }
 }

@@ -13,8 +13,8 @@ use desklite_win32::{
     DragTargetOutcome, FreeDesktopRenderItem, FreeDesktopSnapshot, IconCache, all_desktop_dirs,
     foreground_window_handle, inspector_hwnd, is_ctrl_key_down, is_directly_on_desktop,
     is_file_drag_active, is_popup_menu_hwnd, paste_files_to_directory_detailed,
-    resolve_dropped_item, scan_portal_directory, set_window_rect_no_z, trash_files,
-    user_desktop_dir,
+    post_window_message, resolve_dropped_item, scan_portal_directory, set_window_rect_no_z,
+    trash_files, user_desktop_dir,
 };
 use egui::{
     Color32, ColorImage, CornerRadius, Pos2, Stroke, TextureHandle, TextureOptions, Vec2,
@@ -59,6 +59,7 @@ pub enum FenceCommand {
         screen_x: i32,
         screen_y: i32,
     },
+    FreeDesktopMenuAction(FreeDesktopMenuCommand),
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -312,6 +313,7 @@ pub struct SharedFenceState {
     pub drag_notify_msg: u32,
     pub pending_immediate_save_from_async: bool,
     pub pending_repaint_fences: HashSet<i32>,
+    pub pending_reveal_fences: HashMap<i32, u8>,
     pub pending_repaint_free_desktop: bool,
     pub popup_owners: HashMap<i32, PopupOwnerState>,
     pub pending_commands: Vec<FenceCommand>,
@@ -377,6 +379,7 @@ impl SharedFenceState {
             drag_notify_msg: 0,
             pending_immediate_save_from_async: false,
             pending_repaint_fences: HashSet::new(),
+            pending_reveal_fences: HashMap::new(),
             pending_repaint_free_desktop: false,
             popup_owners: HashMap::new(),
             pending_commands: Vec::new(),
@@ -435,6 +438,7 @@ impl SharedFenceState {
 
     /// Clears all item selections globally except for the optional active `keep` scope.
     pub fn clear_all_selections_except(&mut self, keep: Option<SelectionScope>) {
+        let had_free = !self.free_selected_paths.is_empty();
         match keep {
             Some(SelectionScope::Fence(keep_fid)) => {
                 self.selected_items.retain(|fid, _| *fid == keep_fid);
@@ -452,6 +456,10 @@ impl SharedFenceState {
                 self.free_selected_paths.clear();
                 self.free_selection_anchor = None;
             }
+        }
+        if had_free && self.free_selected_paths.is_empty() {
+            self.mark_free_desktop_dirty(None);
+            post_window_message(self.free_desktop_notify_hwnd, self.free_desktop_notify_msg);
         }
     }
 
@@ -672,6 +680,7 @@ impl SharedFenceState {
         self.last_title_click.retain(|id, _| active_ids.contains(id));
         self.last_focused_fences.retain(|id, _| active_ids.contains(id));
         self.pending_repaint_fences.retain(|id| active_ids.contains(id));
+        self.pending_reveal_fences.retain(|id, _| active_ids.contains(id));
         self.popup_owners.retain(|id, _| active_ids.contains(id));
         self.pending_toggle_collapse.retain(|id| active_ids.contains(id));
         self.pending_collapse_until.retain(|id, _| active_ids.contains(id));

@@ -27,17 +27,18 @@ use windows::Win32::UI::WindowsAndMessaging::{
     EVENT_SYSTEM_MINIMIZEEND, EVENT_SYSTEM_MINIMIZESTART, FindWindowW, GW_HWNDNEXT, GWL_EXSTYLE,
     GWL_STYLE, GWLP_HWNDPARENT, GWLP_WNDPROC, GetClassNameW, GetCursorPos, GetDesktopWindow,
     GetForegroundWindow, GetTopWindow, GetWindow, GetWindowLongPtrW, GetWindowRect, HTBOTTOM,
-    HTBOTTOMLEFT, HTBOTTOMRIGHT, HTLEFT, HTRIGHT, HTTOP, HTTOPLEFT, HTTOPRIGHT, HWND_BOTTOM,
-    HWND_TOP, IDC_ARROW, IsIconic, IsWindow, IsWindowVisible, LoadCursorW, PostMessageW,
-    SC_MAXIMIZE, SC_MINIMIZE, SC_RESTORE, STYLESTRUCT, SWP_FRAMECHANGED, SWP_NOACTIVATE,
-    SWP_NOMOVE, SWP_NOSIZE, SWP_NOZORDER, SetCursor, SetForegroundWindow, SetWindowLongPtrW,
-    SetWindowPos, WINDOWPOS, WINEVENT_OUTOFCONTEXT, WINEVENT_SKIPOWNPROCESS, WM_APP, WM_CANCELMODE,
-    WM_CAPTURECHANGED, WM_ENTERSIZEMOVE, WM_ERASEBKGND, WM_EXITSIZEMOVE, WM_KEYDOWN,
-    WM_LBUTTONDOWN, WM_MOVING, WM_NCACTIVATE, WM_NCCALCSIZE, WM_NCDESTROY, WM_NCHITTEST,
-    WM_NCPAINT, WM_RBUTTONDOWN, WM_SETCURSOR, WM_SIZING, WM_STYLECHANGING, WM_SYSCOMMAND,
-    WM_WINDOWPOSCHANGING, WNDPROC, WS_BORDER, WS_CAPTION, WS_DLGFRAME, WS_EX_APPWINDOW,
-    WS_EX_CLIENTEDGE, WS_EX_DLGMODALFRAME, WS_EX_TOOLWINDOW, WS_EX_TOPMOST, WS_EX_WINDOWEDGE,
-    WS_MAXIMIZE, WS_MAXIMIZEBOX, WS_MINIMIZE, WS_MINIMIZEBOX, WS_POPUP, WS_SYSMENU,
+    HTBOTTOMLEFT, HTBOTTOMRIGHT, HTCLIENT, HTLEFT, HTRIGHT, HTTOP, HTTOPLEFT, HTTOPRIGHT,
+    HWND_BOTTOM, HWND_TOP, IDC_ARROW, IsIconic, IsWindow, IsWindowVisible, LoadCursorW,
+    PostMessageW, SC_MAXIMIZE, SC_MINIMIZE, SC_RESTORE, STYLESTRUCT, SW_HIDE, SWP_FRAMECHANGED,
+    SWP_NOACTIVATE, SWP_NOMOVE, SWP_NOSIZE, SWP_NOZORDER, SetCursor, SetForegroundWindow,
+    SetWindowLongPtrW, SetWindowPos, ShowWindow, WINDOWPOS, WINEVENT_OUTOFCONTEXT,
+    WINEVENT_SKIPOWNPROCESS, WM_APP, WM_CANCELMODE, WM_CAPTURECHANGED, WM_ENTERSIZEMOVE,
+    WM_ERASEBKGND, WM_EXITSIZEMOVE, WM_KEYDOWN, WM_LBUTTONDOWN, WM_MOVING, WM_NCACTIVATE,
+    WM_NCCALCSIZE, WM_NCDESTROY, WM_NCHITTEST, WM_NCPAINT, WM_RBUTTONDOWN, WM_SETCURSOR,
+    WM_SIZING, WM_STYLECHANGING, WM_SYSCOMMAND, WM_WINDOWPOSCHANGING, WNDPROC, WS_BORDER,
+    WS_CAPTION, WS_DLGFRAME, WS_EX_APPWINDOW, WS_EX_CLIENTEDGE, WS_EX_DLGMODALFRAME,
+    WS_EX_TOOLWINDOW, WS_EX_TOPMOST, WS_EX_WINDOWEDGE, WS_MAXIMIZE, WS_MAXIMIZEBOX, WS_MINIMIZE,
+    WS_MINIMIZEBOX, WS_POPUP, WS_SYSMENU,
 };
 use windows::core::{BOOL, HSTRING, PCSTR, w};
 
@@ -61,7 +62,15 @@ static FILE_DRAG_ACTIVE: std::sync::atomic::AtomicBool = std::sync::atomic::Atom
 static DEFERRED_Z_AFTER_SIZEMOVE: std::sync::atomic::AtomicBool =
     std::sync::atomic::AtomicBool::new(false);
 static LAST_SELF_Z_MS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+static EXTERNAL_FG_NOTIFY_HWND: std::sync::atomic::AtomicIsize =
+    std::sync::atomic::AtomicIsize::new(0);
+static EXTERNAL_FG_NOTIFY_MSG: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
 static START_MONO: OnceLock<std::time::Instant> = OnceLock::new();
+
+pub fn set_external_foreground_notify_target(hwnd: isize, msg: u32) {
+    EXTERNAL_FG_NOTIFY_MSG.store(msg, std::sync::atomic::Ordering::Release);
+    EXTERNAL_FG_NOTIFY_HWND.store(hwnd, std::sync::atomic::Ordering::Release);
+}
 
 pub fn set_file_drag_active(active: bool) {
     FILE_DRAG_ACTIVE.store(active, std::sync::atomic::Ordering::Release);
@@ -208,6 +217,20 @@ pub fn set_window_rect_no_z(raw_hwnd: isize, x: i32, y: i32, w: i32, h: i32) {
             SWP_NOZORDER | SWP_NOACTIVATE,
         )
     };
+}
+
+/// Posts an application message without blocking (used to request an async FreeDesktop refresh).
+pub fn post_window_message(raw_hwnd: isize, msg: u32) {
+    if raw_hwnd != 0 && msg != 0 {
+        unsafe {
+            let _ = PostMessageW(
+                Some(HWND(raw_hwnd as *mut _)),
+                msg,
+                WPARAM(0),
+                LPARAM(0),
+            );
+        }
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -370,6 +393,28 @@ pub fn all_bucket_fence_hwnds() -> Vec<isize> {
         .copied()
         .filter(|&h| h != 0 && h != free)
         .collect()
+}
+
+/// Immediately hides all visible DeskLite bucket fences and inspector windows before
+/// tearing down OpenGL/DWM resources so exit never flashes opaque white rectangles.
+pub fn hide_all_fences_immediately() {
+    for raw in all_bucket_fence_hwnds() {
+        let hwnd = HWND(raw as *mut _);
+        if unsafe { IsWindow(Some(hwnd)).as_bool() } {
+            unsafe {
+                let _ = ShowWindow(hwnd, SW_HIDE);
+            }
+        }
+    }
+    let insp = inspector_hwnd();
+    if insp != 0 {
+        let hwnd = HWND(insp as *mut _);
+        if unsafe { IsWindow(Some(hwnd)).as_bool() } {
+            unsafe {
+                let _ = ShowWindow(hwnd, SW_HIDE);
+            }
+        }
+    }
 }
 
 unsafe fn is_desktop_shell_class(hwnd: HWND) -> bool {
@@ -580,6 +625,26 @@ unsafe extern "system" fn desktop_z_win_event_proc(
     } else if is_in_size_move() {
         DEFERRED_Z_AFTER_SIZEMOVE.store(true, std::sync::atomic::Ordering::Release);
         return;
+    }
+    if event == EVENT_SYSTEM_FOREGROUND && !hwnd.is_invalid() {
+        let raw = hwnd.0 as isize;
+        let is_ours = is_free_desktop_hwnd(raw)
+            || raw == inspector_hwnd()
+            || lock_unpoisoned(orig_procs()).contains_key(&raw);
+        if !is_ours && !is_popup_menu_hwnd(raw) {
+            let notify_hwnd = EXTERNAL_FG_NOTIFY_HWND.load(std::sync::atomic::Ordering::Acquire);
+            let notify_msg = EXTERNAL_FG_NOTIFY_MSG.load(std::sync::atomic::Ordering::Acquire);
+            if notify_hwnd != 0 && notify_msg != 0 {
+                unsafe {
+                    let _ = PostMessageW(
+                        Some(HWND(notify_hwnd as *mut _)),
+                        notify_msg,
+                        WPARAM(0),
+                        LPARAM(0),
+                    );
+                }
+            }
+        }
     }
     post_reassert_all_fences_z();
 }
@@ -825,7 +890,9 @@ unsafe extern "system" fn bottom_subclass_proc(
     {
         return hit;
     }
-    if msg == WM_SETCURSOR && is_file_drag_active() {
+    if msg == WM_SETCURSOR
+        && (is_file_drag_active() || (is_free && (lparam.0 & 0xFFFF) as u16 == HTCLIENT as u16))
+    {
         if let Ok(arrow) = unsafe { LoadCursorW(None, IDC_ARROW) } {
             unsafe {
                 let _ = SetCursor(Some(arrow));

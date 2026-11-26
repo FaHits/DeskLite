@@ -62,7 +62,8 @@ pub use events::{
 pub use fence_poc::{FencePocConfig, run_bottom_fence_poc};
 pub use folder_watch::{FolderWatcher, WM_APP_PORTAL_DIRTY};
 pub use free_desktop_wnd::{
-    FreeDesktopController, FreeDesktopEvent, FreeDesktopRenderItem, FreeDesktopSnapshot,
+    FreeDesktopController, FreeDesktopEvent, FreeDesktopHotkey, FreeDesktopRenderItem,
+    FreeDesktopSnapshot,
 };
 pub use icons::{DecodedIcon, IconCache, extract_file_icon_pbgra};
 pub use shell_ops::{
@@ -77,11 +78,12 @@ pub use window_attach::{
     DesktopZHookGuard, Win32Hotkey, all_bucket_fence_hwnds, all_fence_hwnds,
     allow_foreground_self, attach_desktop_owner_and_rounded_corners, attach_free_desktop_canvas,
     cursor_screen_pos, enable_dark_popup_menus, find_window_by_exact_title, focus_window_now,
-    foreground_window_handle, free_desktop_hwnd, inspector_hwnd,
+    foreground_window_handle, free_desktop_hwnd, hide_all_fences_immediately, inspector_hwnd,
     install_desktop_z_win_event_hooks, is_ctrl_key_down, is_file_drag_active,
     is_free_desktop_hwnd, is_in_size_move, is_popup_menu_hwnd, is_primary_mouse_down,
     live_sizemove_rect_for_hwnd, move_window_no_z, post_reassert_all_fences_z,
-    set_active_text_edit_hwnd, set_file_drag_active, set_hwnd_locked, set_inspector_hwnd,
-    set_window_rect_no_z, strip_alt_tab_from_host, style_floating_inspector_window,
-    take_win32_hotkeys, window_outer_rect,
+    post_window_message, set_active_text_edit_hwnd, set_external_foreground_notify_target,
+    set_file_drag_active, set_hwnd_locked, set_inspector_hwnd, set_window_rect_no_z,
+    strip_alt_tab_from_host, style_floating_inspector_window, take_win32_hotkeys,
+    window_outer_rect,
 };

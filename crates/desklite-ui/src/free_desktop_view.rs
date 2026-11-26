@@ -8,9 +8,9 @@ use desklite_core::{
     normalize_path_key,
 };
 use desklite_win32::{
-    FreeDesktopEvent, FreeDesktopSnapshot, clipboard_has_files, copy_text_to_clipboard,
-    cursor_screen_pos, is_directly_on_desktop, launch_as_admin, launch_item,
-    paste_files_to_directory_detailed, read_clipboard_files, rename_file_in_place,
+    FreeDesktopEvent, FreeDesktopHotkey, FreeDesktopSnapshot, clipboard_has_files,
+    copy_text_to_clipboard, cursor_screen_pos, is_directly_on_desktop, launch_as_admin,
+    launch_item, paste_files_to_directory_detailed, read_clipboard_files, rename_file_in_place,
     resolve_dropped_item, reveal_in_explorer, set_clipboard_files_for_window, show_file_properties,
     trash_files, user_desktop_dir,
 };
@@ -584,6 +584,9 @@ pub fn handle_free_desktop_event(
                 res.needs_snapshot_refresh = true;
             }
         }
+        FreeDesktopEvent::Hotkey(hk) => {
+            handle_free_desktop_hotkey(hk, shared, &mut res);
+        }
         FreeDesktopEvent::RenameCommitted { old_path, new_name } => {
             let changed = commit_free_item_rename_core(&old_path, &new_name, shared);
             res.needs_save = changed;
@@ -594,6 +597,139 @@ pub fn handle_free_desktop_event(
         }
     }
     res
+}
+
+fn collect_ordered_free_selected_paths(guard: &SharedFenceState) -> Vec<String> {
+    guard
+        .config
+        .active_free_icons()
+        .iter()
+        .filter(|ic| {
+            guard
+                .free_selected_paths
+                .contains(&normalize_path_key(&ic.id))
+        })
+        .map(|ic| ic.id.clone())
+        .collect()
+}
+
+fn handle_free_desktop_hotkey(
+    hk: FreeDesktopHotkey,
+    shared: &Arc<Mutex<SharedFenceState>>,
+    res: &mut FreeDesktopDispatchResult,
+) {
+    match hk {
+        FreeDesktopHotkey::SelectAll => {
+            let mut guard = lock_unpoisoned(shared);
+            if !guard.config.active_free_icons().is_empty() {
+                res.repaint_fences = collect_non_empty_selected_fences(&guard);
+                guard.clear_all_selections_except(Some(SelectionScope::FreeDesktop));
+                let keys: Vec<String> = guard
+                    .config
+                    .active_free_icons()
+                    .iter()
+                    .map(|ic| normalize_path_key(&ic.id))
+                    .collect();
+                guard.free_selection_anchor = keys.first().cloned();
+                guard.free_selected_paths = keys.into_iter().collect();
+                res.needs_snapshot_refresh = true;
+            }
+        }
+        FreeDesktopHotkey::Copy | FreeDesktopHotkey::Cut => {
+            let cut = matches!(hk, FreeDesktopHotkey::Cut);
+            let (hwnd, paths) = {
+                let guard = lock_unpoisoned(shared);
+                (guard.free_desktop_hwnd, collect_ordered_free_selected_paths(&guard))
+            };
+            if paths.is_empty() {
+                return;
+            }
+            if set_clipboard_files_for_window(hwnd, &paths, cut).is_ok() {
+                let mut guard = lock_unpoisoned(shared);
+                guard.cut_paths.clear();
+                if cut {
+                    for p in &paths {
+                        guard.cut_paths.insert(p.to_ascii_lowercase());
+                    }
+                }
+                let verb = if cut { "已剪切" } else { "已复制" };
+                guard.free_toast = Some((format!("{verb} {} 项", paths.len()), Instant::now()));
+                res.needs_snapshot_refresh = true;
+            } else {
+                lock_unpoisoned(shared).free_toast =
+                    Some(("剪贴板被占用，请重试".to_string(), Instant::now()));
+            }
+        }
+        FreeDesktopHotkey::CopyPaths => {
+            let paths = {
+                let guard = lock_unpoisoned(shared);
+                collect_ordered_free_selected_paths(&guard)
+            };
+            if !paths.is_empty() && copy_text_to_clipboard(&paths.join("\r\n")).is_ok() {
+                lock_unpoisoned(shared).free_toast =
+                    Some(("已复制路径".to_string(), Instant::now()));
+            }
+        }
+        FreeDesktopHotkey::Paste => {
+            res.commands
+                .push(FenceCommand::FreeDesktopMenuAction(FreeDesktopMenuCommand::PasteToDesktop));
+        }
+        FreeDesktopHotkey::Undo => {
+            res.commands
+                .push(FenceCommand::FreeDesktopMenuAction(FreeDesktopMenuCommand::UndoLast));
+        }
+        FreeDesktopHotkey::Rename => {
+            let mut guard = lock_unpoisoned(shared);
+            let paths = collect_ordered_free_selected_paths(&guard);
+            if let Some(first) = paths.first().cloned()
+                && let Some(rect) = free_icon_screen_rect(&guard, &first)
+            {
+                let file_name = Path::new(&first)
+                    .file_name()
+                    .map(|s| s.to_string_lossy().into_owned())
+                    .unwrap_or_else(|| first.clone());
+                guard.free_rename_prompt = Some(FreeItemRenamePrompt {
+                    original_path: first.clone(),
+                    draft: file_name.clone(),
+                    needs_focus: true,
+                });
+                res.begin_rename = Some((first, file_name, rect));
+                res.needs_snapshot_refresh = true;
+            }
+        }
+        FreeDesktopHotkey::Delete { .. } => {
+            let paths = {
+                let guard = lock_unpoisoned(shared);
+                collect_ordered_free_selected_paths(&guard)
+            };
+            if paths.is_empty() {
+                return;
+            }
+            if let Ok(true) = trash_files(&paths) {
+                let mut guard = lock_unpoisoned(shared);
+                let desktop_dirs = guard.desktop_dirs.clone();
+                for p in &paths {
+                    guard.invalidate_icon_texture(p);
+                    let _ = guard.config.remove_desktop_path_everywhere(p, &desktop_dirs);
+                    guard.free_selected_paths.remove(&normalize_path_key(p));
+                }
+                guard.dirty_layout = true;
+                res.needs_save = true;
+                res.needs_snapshot_refresh = true;
+            }
+        }
+        FreeDesktopHotkey::Refresh => {
+            res.commands.push(FenceCommand::RefreshDesktop);
+        }
+        FreeDesktopHotkey::ClearSelection => {
+            let mut guard = lock_unpoisoned(shared);
+            if !guard.free_selected_paths.is_empty() {
+                guard.free_selected_paths.clear();
+                guard.free_selection_anchor = None;
+                res.needs_snapshot_refresh = true;
+            }
+        }
+    }
 }
 
 fn arrange_free_icons(

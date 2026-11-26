@@ -30,12 +30,13 @@ use desklite_ui::{
 use desklite_win32::{
     FolderWatcher, FreeDesktopController, FreeDesktopEvent, IconCache, TrayIcon,
     WM_APP_PORTAL_DIRTY, WM_APP_TRAY, all_desktop_dirs, clipboard_has_files,
-    enable_dark_popup_menus, enable_per_monitor_dpi_v2, install_desktop_z_win_event_hooks,
-    is_desktop_dir_path, is_display_wake_power_broadcast, is_vault_path, launch_item,
-    migrate_vault_item_to_desktop, pick_folder_dialog, post_reassert_all_fences_z,
-    probe_display_topology, register_power_and_session_notifications, restore_all_desktop_icons,
-    scan_portal_directory, set_shell_desktop_icons_visible, set_window_rect_no_z,
-    strip_alt_tab_from_host, unregister_power_and_session_notifications,
+    enable_dark_popup_menus, enable_per_monitor_dpi_v2, hide_all_fences_immediately,
+    install_desktop_z_win_event_hooks, is_desktop_dir_path, is_display_wake_power_broadcast,
+    is_vault_path, launch_item, migrate_vault_item_to_desktop, pick_folder_dialog,
+    post_reassert_all_fences_z, probe_display_topology, register_power_and_session_notifications,
+    restore_all_desktop_icons, scan_portal_directory, set_external_foreground_notify_target,
+    set_shell_desktop_icons_visible, set_window_rect_no_z, strip_alt_tab_from_host,
+    unregister_power_and_session_notifications,
 };
 use egui::{Pos2, Vec2, ViewportBuilder, ViewportCommand, ViewportId, WindowLevel};
 use raw_window_handle::{HasWindowHandle, RawWindowHandle};
@@ -81,6 +82,7 @@ const WM_APP_SHOW_FREE_ICON_MENU: u32 = WM_APP + 26;
 const WM_APP_SCHEDULE_SHELL_VERIFY: u32 = WM_APP + 27;
 const WM_APP_FREE_DESKTOP_EVENT: u32 = WM_APP + 28;
 const WM_APP_REFRESH_FREE_DESKTOP: u32 = WM_APP + 29;
+const WM_APP_EXTERNAL_FOREGROUND: u32 = WM_APP + 30;
 
 const TRAY_CMD_NEW_BLANK: u32 = 1001;
 const TRAY_CMD_NEW_PORTAL: u32 = 1003;
@@ -487,6 +489,7 @@ enum BgEvent {
     FenceMenuCommand(i32, CollapsedMenuCommand),
     FreeDesktopMenuCmd(FreeDesktopMenuCommand),
     FreeIconMenuCmd(Vec<String>, FreeIconMenuCommand),
+    ExternalForeground,
     FlushAndExit,
 }
 
@@ -1302,6 +1305,11 @@ unsafe extern "system" fn helper_wnd_proc(
             st.push_free_desktop_snapshot_if_dirty();
             LRESULT(0)
         }
+        WM_APP_EXTERNAL_FOREGROUND => {
+            let _ = st.tx.send(BgEvent::ExternalForeground);
+            st.egui_ctx.request_repaint_of(ViewportId::ROOT);
+            LRESULT(0)
+        }
         WM_APP_DRAG_DONE => {
             let (changed, fids, free_snap) = {
                 let mut guard = lock_unpoisoned(&st.shared);
@@ -1439,6 +1447,7 @@ unsafe extern "system" fn helper_wnd_proc(
         WM_ENDSESSION => {
             if wparam.0 != 0 {
                 st.shutting_down = true;
+                hide_all_fences_immediately();
                 if let Some(ctrl) = lock_unpoisoned(&st.free_desktop_ctrl).as_ref().cloned() {
                     ctrl.shutdown();
                 }
@@ -1537,6 +1546,7 @@ fn spawn_win32_helper(
         unsafe {
             SetWindowLongPtrW(hwnd, GWLP_USERDATA, (&raw mut *helper) as isize);
         }
+        set_external_foreground_notify_target(hwnd.0 as isize, WM_APP_EXTERNAL_FOREGROUND);
         let _z_hooks = install_desktop_z_win_event_hooks();
         let _ = hwnd_tx.send(hwnd.0 as isize);
 
@@ -1611,6 +1621,7 @@ impl DeskLiteEguiApp {
     fn begin_shutdown(&mut self, ctx: &egui::Context) {
         if !self.shutting_down {
             self.shutting_down = true;
+            hide_all_fences_immediately();
             self.free_desktop_ctrl.shutdown();
             persist_and_restore_on_exit(&self.layout_path, &self.shared, "shutdown");
             self.post_helper(WM_APP_SHUTDOWN, WPARAM(0), LPARAM(0));
@@ -1905,6 +1916,23 @@ impl DeskLiteEguiApp {
                     }
                     needs_free_snapshot = true;
                 }
+                BgEvent::ExternalForeground => {
+                    let cleared = {
+                        let mut guard = lock_unpoisoned(&self.shared);
+                        if !guard.is_focus_clear_exempt(desklite_ui::SelectionScope::FreeDesktop, Some(ctx))
+                            && !guard.free_selected_paths.is_empty()
+                        {
+                            guard.free_selected_paths.clear();
+                            guard.free_selection_anchor = None;
+                            true
+                        } else {
+                            false
+                        }
+                    };
+                    if cleared {
+                        needs_free_snapshot = true;
+                    }
+                }
                 BgEvent::FlushAndExit => {
                     self.begin_shutdown(ctx);
                     return false;
@@ -2042,6 +2070,12 @@ impl DeskLiteEguiApp {
                         LPARAM(packed as isize),
                     );
                 }
+                FenceCommand::FreeDesktopMenuAction(action) => {
+                    if apply_free_desktop_menu_command(action, &self.shared, ctx) {
+                        needs_save = true;
+                    }
+                    needs_free_snapshot = true;
+                }
                 FenceCommand::RequestExitApp => {
                     self.begin_shutdown(ctx);
                     return false;
@@ -2092,7 +2126,15 @@ impl eframe::App for DeskLiteEguiApp {
             return;
         }
 
-        let (fences, builder_rects, topology, hide_all_fences, inspector_meta) = {
+        let (
+            fences,
+            builder_rects,
+            topology,
+            hide_all_fences,
+            attached_fences,
+            pending_reveal,
+            inspector_meta,
+        ) = {
             let guard = lock_unpoisoned(&self.shared);
             let insp = if guard.inspector_spawned {
                 guard.inspector.as_ref().map(|ins| {
@@ -2126,6 +2168,8 @@ impl eframe::App for DeskLiteEguiApp {
                 guard.builder_rects.clone(),
                 guard.topology.clone(),
                 guard.config.hide_all_fences,
+                guard.attached_hwnds.keys().copied().collect::<HashSet<i32>>(),
+                guard.pending_reveal_fences.keys().copied().collect::<HashSet<i32>>(),
                 insp,
             )
         };
@@ -2148,6 +2192,12 @@ impl eframe::App for DeskLiteEguiApp {
             } else {
                 (brect.height().max(MIN_FENCE_HEIGHT) as f32) / mon_scale
             };
+            let wait_reveal = !attached_fences.contains(&fid) || pending_reveal.contains(&fid);
+            let init_pos = if wait_reveal {
+                Pos2::new(-32000.0, -32000.0)
+            } else {
+                Pos2::new(brect.left as f32 / mon_scale, brect.top as f32 / mon_scale)
+            };
             let vb = ViewportBuilder::default()
                 .with_title(format!("DeskLite#{fid}"))
                 .with_decorations(false)
@@ -2155,10 +2205,7 @@ impl eframe::App for DeskLiteEguiApp {
                 .with_taskbar(false)
                 .with_visible(!hide_all_fences)
                 .with_window_level(WindowLevel::AlwaysOnBottom)
-                .with_position(Pos2::new(
-                    brect.left as f32 / mon_scale,
-                    brect.top as f32 / mon_scale,
-                ))
+                .with_position(init_pos)
                 .with_inner_size(Vec2::new(
                     (brect.width().max(MIN_FENCE_WIDTH) as f32) / mon_scale,
                     init_h,
@@ -2213,6 +2260,7 @@ impl eframe::App for DeskLiteEguiApp {
     fn on_exit(&mut self, _gl: Option<&eframe::glow::Context>) {
         if !self.shutting_down {
             self.shutting_down = true;
+            hide_all_fences_immediately();
             self.free_desktop_ctrl.shutdown();
             persist_and_restore_on_exit(&self.layout_path, &self.shared, "on_exit");
             self.post_helper(WM_APP_SHUTDOWN, WPARAM(0), LPARAM(0));
