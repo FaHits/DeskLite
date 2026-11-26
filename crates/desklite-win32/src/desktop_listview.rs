@@ -1,8 +1,11 @@
 use std::ffi::c_void;
 use std::mem::size_of;
+use std::path::Path;
+use std::sync::{Mutex, OnceLock};
 
 use desklite_core::Point;
 use windows::Win32::Foundation::{CloseHandle, HANDLE, HWND, LPARAM, POINT, TRUE, WPARAM};
+use windows::Win32::Graphics::Gdi::ScreenToClient;
 use windows::Win32::System::Diagnostics::Debug::{ReadProcessMemory, WriteProcessMemory};
 use windows::Win32::System::Memory::{
     MEM_COMMIT, MEM_RELEASE, MEM_RESERVE, PAGE_READWRITE, VirtualAllocEx, VirtualFreeEx,
@@ -12,15 +15,21 @@ use windows::Win32::System::Threading::{
     PROCESS_VM_WRITE,
 };
 use windows::Win32::UI::Controls::{
-    LVIF_TEXT, LVITEMW, LVM_GETITEMCOUNT, LVM_GETITEMPOSITION, LVM_GETITEMTEXTW,
-    LVM_SETITEMPOSITION32,
+    LVIF_TEXT, LVITEMW, LVM_DELETEITEM, LVM_GETITEMCOUNT, LVM_GETITEMPOSITION, LVM_GETITEMTEXTW,
+    LVM_GETORIGIN, LVM_SETITEMPOSITION32,
+};
+use windows::Win32::UI::HiDpi::GetDpiForWindow;
+use windows::Win32::UI::Shell::{
+    SHCNE_CREATE, SHCNE_DELETE, SHCNE_MKDIR, SHCNE_RMDIR, SHCNE_UPDATEDIR, SHCNF_FLUSH,
+    SHCNF_FLUSHNOWAIT, SHCNF_PATHW, SHChangeNotify,
 };
 use windows::Win32::UI::WindowsAndMessaging::{
-    EnumChildWindows, EnumWindows, FindWindowExW, FindWindowW, GetAncestor, GetClassNameW,
-    GetDesktopWindow, GetWindowThreadProcessId, GA_ROOT, SendMessageW,
+    EnumChildWindows, EnumWindows, FindWindowExW, FindWindowW, GA_ROOT, GetAncestor, GetClassNameW,
+    GetDesktopWindow, GetWindowThreadProcessId, SendMessageW, WM_COMMAND,
 };
-use windows::core::{BOOL, w};
+use windows::core::{BOOL, HSTRING, w};
 
+use crate::shell_ops::{all_desktop_dirs, is_directly_on_desktop, shell_display_name};
 use crate::{Win32Error, win_err};
 
 #[derive(Debug, Clone)]
@@ -375,5 +384,244 @@ impl DesktopListView {
             );
         }
         Ok(())
+    }
+
+    pub fn delete_icon(&self, index: usize) -> Result<(), Win32Error> {
+        let count = self.icon_count();
+        if index >= count {
+            return Err(Win32Error::IconIndexOutOfRange(index, count));
+        }
+        unsafe {
+            SendMessageW(self.tree.list_view, LVM_DELETEITEM, Some(WPARAM(index)), Some(LPARAM(0)));
+        }
+        Ok(())
+    }
+
+    pub fn screen_to_listview_point(&self, screen_x: i32, screen_y: i32) -> Point {
+        let mut pt = POINT {
+            x: screen_x,
+            y: screen_y,
+        };
+        unsafe {
+            let _ = ScreenToClient(self.tree.list_view, &mut pt);
+        }
+        let mut origin = POINT::default();
+        if let Ok(process) = self.open_explorer()
+            && let Ok(org_buf) = RemoteBuffer::alloc(process.0, size_of::<POINT>())
+        {
+            let ok = unsafe {
+                SendMessageW(
+                    self.tree.list_view,
+                    LVM_GETORIGIN,
+                    None,
+                    Some(LPARAM(org_buf.ptr as isize)),
+                )
+                .0
+            } != 0;
+            if ok {
+                let _ = unsafe {
+                    ReadProcessMemory(
+                        process.0,
+                        org_buf.ptr,
+                        (&raw mut origin).cast(),
+                        size_of::<POINT>(),
+                        None,
+                    )
+                };
+            }
+        }
+        let dpi = unsafe { GetDpiForWindow(self.tree.list_view) };
+        let scale = if dpi >= 96 { dpi as f32 / 96.0 } else { 1.0 };
+        let half_cell = (36.0 * scale).round() as i32;
+        Point {
+            x: (pt.x + origin.x - half_cell).max(0),
+            y: (pt.y + origin.y - half_cell).max(0),
+        }
+    }
+}
+
+fn candidate_icon_names(path: &Path) -> Vec<String> {
+    let mut out = Vec::new();
+    if let Some(disp) = shell_display_name(path) {
+        let s = disp.trim().to_ascii_lowercase();
+        if !s.is_empty() {
+            out.push(s);
+        }
+    }
+    if let Some(fname) = path.file_name().and_then(|s| s.to_str()) {
+        let s = fname.trim().to_ascii_lowercase();
+        if !s.is_empty() && !out.contains(&s) {
+            out.push(s);
+        }
+    }
+    // Only fall back to stem when Shell display name was unavailable (avoids matching `foo.txt` with folder `foo`).
+    if out.len() <= 1
+        && let Some(stem) = path.file_stem().and_then(|s| s.to_str())
+    {
+        let s = stem.trim().to_ascii_lowercase();
+        if !s.is_empty() && !out.contains(&s) {
+            out.push(s);
+        }
+    }
+    out
+}
+
+fn find_icon_index_for_path(icons: &[DesktopIconInfo], path: &Path) -> Option<usize> {
+    let candidates = candidate_icon_names(path);
+    for cand in &candidates {
+        if let Some(icon) = icons
+            .iter()
+            .find(|ic| ic.name.trim().to_ascii_lowercase() == *cand)
+        {
+            return Some(icon.index);
+        }
+    }
+    None
+}
+
+static DESKTOP_LV_SYNC: OnceLock<Mutex<()>> = OnceLock::new();
+
+fn lv_sync_lock() -> &'static Mutex<()> {
+    DESKTOP_LV_SYNC.get_or_init(|| Mutex::new(()))
+}
+
+fn notify_shell_item(path: &Path, show: bool, flush: bool) {
+    let event = if path.is_dir() {
+        if show { SHCNE_MKDIR } else { SHCNE_RMDIR }
+    } else if show {
+        SHCNE_CREATE
+    } else {
+        SHCNE_DELETE
+    };
+    let flags = if flush {
+        SHCNF_PATHW | SHCNF_FLUSH
+    } else {
+        SHCNF_PATHW | SHCNF_FLUSHNOWAIT
+    };
+    let wpath = HSTRING::from(path.to_string_lossy().as_ref());
+    unsafe {
+        SHChangeNotify(event, flags, Some(wpath.as_ptr().cast()), None);
+    }
+}
+
+fn hide_icons_unlocked(lv: &DesktopListView, managed_paths: &[String]) {
+    let desktop_paths: Vec<&Path> = managed_paths
+        .iter()
+        .map(Path::new)
+        .filter(|p| is_directly_on_desktop(p) && p.exists())
+        .collect();
+    if desktop_paths.is_empty() {
+        return;
+    }
+    let Ok(icons) = lv.enumerate_icons() else {
+        return;
+    };
+    // Win11 Explorer's Desktop SysListView32 uses LVS_OWNERDATA, where LVM_DELETEITEM ignores item
+    // index and trims from the end; SHCNE_DELETE/SHCNE_RMDIR evicts exact items from CDefView
+    // without touching disk files or shifting unrelated icons.
+    let to_hide: Vec<&Path> = desktop_paths
+        .into_iter()
+        .filter(|p| find_icon_index_for_path(&icons, p).is_some())
+        .collect();
+    for p in to_hide {
+        // SHCNF_FLUSH on each notification prevents Shell from coalescing >10 events into UPDATEDIR.
+        notify_shell_item(p, false, true);
+    }
+}
+
+/// Hides icons matching `managed_paths` (direct children of User/Public Desktop)
+/// from Explorer's `SysListView32` in-place, leaving all disk files intact on Desktop.
+pub fn hide_desktop_icons_for_paths(managed_paths: &[String]) {
+    let _guard = lv_sync_lock().lock().unwrap_or_else(|e| e.into_inner());
+    let Ok(lv) = find_desktop_listview() else {
+        return;
+    };
+    hide_icons_unlocked(&lv, managed_paths);
+}
+
+/// Restores a Desktop-resident icon back onto `SysListView32` (off the UI thread so egui never stalls),
+/// optionally placing it at `(screen_x, screen_y)` while keeping other managed items hidden.
+pub fn restore_desktop_icon_async(
+    path_str: String,
+    screen_drop_pt: Option<(i32, i32)>,
+    still_hidden_paths: Vec<String>,
+) {
+    let p = Path::new(&path_str);
+    if !is_directly_on_desktop(p) || !p.exists() {
+        return;
+    }
+    std::thread::spawn(move || {
+        restore_desktop_icon(Path::new(&path_str), screen_drop_pt, &still_hidden_paths);
+    });
+}
+
+pub fn restore_desktop_icon(
+    path: &Path,
+    screen_drop_pt: Option<(i32, i32)>,
+    still_hidden_paths: &[String],
+) {
+    if !is_directly_on_desktop(path) || !path.exists() {
+        return;
+    }
+    let _guard = lv_sync_lock().lock().unwrap_or_else(|e| e.into_inner());
+    let Ok(lv) = find_desktop_listview() else {
+        return;
+    };
+
+    let mut found_idx = lv
+        .enumerate_icons()
+        .ok()
+        .and_then(|icons| find_icon_index_for_path(&icons, path));
+
+    if found_idx.is_none() {
+        notify_shell_item(path, true, true);
+        for _ in 0..20 {
+            std::thread::sleep(std::time::Duration::from_millis(20));
+            if let Ok(icons) = lv.enumerate_icons()
+                && let Some(idx) = find_icon_index_for_path(&icons, path)
+            {
+                found_idx = Some(idx);
+                break;
+            }
+        }
+    }
+
+    if let Some((sx, sy)) = screen_drop_pt
+        && let Some(idx) = found_idx
+    {
+        let lv_pt = lv.screen_to_listview_point(sx, sy);
+        let _ = lv.set_icon_position(idx, lv_pt);
+        std::thread::sleep(std::time::Duration::from_millis(45));
+        if let Ok(icons2) = lv.enumerate_icons()
+            && let Some(idx2) = find_icon_index_for_path(&icons2, path)
+        {
+            let _ = lv.set_icon_position(idx2, lv_pt);
+        }
+    }
+    let _ = still_hidden_paths;
+}
+
+/// Restores all icons on Windows Desktop when DeskLite exits cleanly.
+pub fn restore_all_desktop_icons() {
+    if let Ok(lv) = find_desktop_listview() {
+        unsafe {
+            SendMessageW(
+                lv.tree.shell_def_view,
+                WM_COMMAND,
+                Some(WPARAM(0x7103)),
+                Some(LPARAM(0)),
+            );
+        }
+    }
+    for dir in all_desktop_dirs() {
+        let wdir = HSTRING::from(dir.to_string_lossy().as_ref());
+        unsafe {
+            SHChangeNotify(
+                SHCNE_UPDATEDIR,
+                SHCNF_PATHW | SHCNF_FLUSH,
+                Some(wdir.as_ptr().cast()),
+                None,
+            );
+        }
     }
 }

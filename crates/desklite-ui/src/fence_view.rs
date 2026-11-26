@@ -8,20 +8,21 @@ use desklite_core::{
     Rect, clamp_rect_to_monitors,
 };
 use desklite_win32::{
-    IconCache, attach_desktop_owner_and_rounded_corners, find_window_by_exact_title, launch_item,
-    resolve_dropped_item, reveal_in_explorer, start_file_drag_out,
+    DragOutOutcome, IconCache, attach_desktop_owner_and_rounded_corners,
+    find_window_by_exact_title, foreground_window_handle, hide_desktop_icons_for_paths,
+    is_directly_on_desktop, launch_item, resolve_dropped_item, restore_desktop_icon_async,
+    reveal_in_explorer, start_file_drag_out,
 };
 use egui::{
-    Align, Color32, ColorImage, CornerRadius, CursorIcon, Frame, Layout, Margin, PointerButton,
-    Pos2, ResizeDirection, RichText, ScrollArea, Sense, Stroke, TextureHandle, TextureOptions, Ui,
-    Vec2, ViewportCommand, ViewportId,
+    Align, Color32, ColorImage, CornerRadius, CursorIcon, Frame, Key, Layout, Margin,
+    PointerButton, Pos2, ResizeDirection, ScrollArea, Sense, Stroke, TextureHandle,
+    TextureOptions, Ui, Vec2, ViewportCommand, ViewportId, text::LayoutJob,
 };
 
 use crate::snap::snap_move_rect;
 
 pub const COLLAPSED_HEIGHT: f32 = 38.0;
 const RESIZE_EDGE: f32 = 6.0;
-const HEADER_BTN_RESERVE_W: f32 = 92.0;
 
 #[derive(Debug, Clone)]
 pub enum FenceCommand {
@@ -47,6 +48,12 @@ pub struct DragSourceState {
     pub finished_at: Option<Instant>,
 }
 
+#[derive(Debug, Clone, Copy)]
+pub struct PopupOwnerState {
+    pub popup_id: egui::Id,
+    pub saw_focused: bool,
+}
+
 pub struct SharedFenceState {
     pub config: NativeLayoutConfig,
     pub topology: DisplayTopology,
@@ -58,6 +65,7 @@ pub struct SharedFenceState {
     pub selected_item: HashMap<i32, usize>,
     pub last_title_click: HashMap<i32, Instant>,
     pub dragging_from_fence: Option<DragSourceState>,
+    pub popup_owners: HashMap<i32, PopupOwnerState>,
     pub pending_commands: Vec<FenceCommand>,
     pub dirty_layout: bool,
     pub pending_save_at: Option<Instant>,
@@ -81,6 +89,7 @@ impl SharedFenceState {
             selected_item: HashMap::new(),
             last_title_click: HashMap::new(),
             dragging_from_fence: None,
+            popup_owners: HashMap::new(),
             pending_commands: Vec::new(),
             dirty_layout: false,
             pending_save_at: None,
@@ -134,7 +143,19 @@ impl SharedFenceState {
         self.attached_hwnds.retain(|id, _| active_ids.contains(id));
         self.builder_rects.retain(|id, _| active_ids.contains(id));
         self.selected_item.retain(|id, _| active_ids.contains(id));
+        self.popup_owners.retain(|id, _| active_ids.contains(id));
     }
+}
+
+pub fn collect_managed_desktop_paths(config: &NativeLayoutConfig) -> Vec<String> {
+    config
+        .fences
+        .iter()
+        .filter(|f| f.portal_dir.is_none())
+        .flat_map(|f| f.items.iter())
+        .filter(|it| is_directly_on_desktop(Path::new(&it.path)))
+        .map(|it| it.path.clone())
+        .collect()
 }
 
 #[derive(Debug, Default)]
@@ -178,6 +199,44 @@ pub fn render_fence_viewport(
     let ctx = ui.ctx().clone();
     let mut out = FenceUiOutput::default();
     ensure_fence_attached(fence_id, shared);
+
+    // Close this fence's open popup menu cleanly on focus loss (e.g. clicking Desktop or another window),
+    // tracking popup_id per fence so multiple fences never clobber one another.
+    let focused_now = ctx.input(|i| i.focused);
+    let lost_focus_ev = ctx.input(|i| {
+        i.events
+            .iter()
+            .any(|e| matches!(e, egui::Event::WindowFocused(false)))
+    });
+    let tracked_popup = {
+        let guard = shared.lock().unwrap();
+        guard.popup_owners.get(&fence_id).copied()
+    };
+    if let Some(mut owner) = tracked_popup {
+        if !egui::Popup::is_id_open(&ctx, owner.popup_id) {
+            shared.lock().unwrap().popup_owners.remove(&fence_id);
+        } else {
+            let fg_hwnd = foreground_window_handle();
+            let my_hwnd = {
+                let guard = shared.lock().unwrap();
+                guard.attached_hwnds.get(&fence_id).copied().unwrap_or(0)
+            };
+            let is_fg = my_hwnd != 0 && fg_hwnd == my_hwnd;
+            if focused_now || is_fg {
+                owner.saw_focused = true;
+            }
+            if lost_focus_ev
+                || (owner.saw_focused && !focused_now)
+                || (owner.saw_focused && my_hwnd != 0 && fg_hwnd != 0 && fg_hwnd != my_hwnd)
+            {
+                egui::Popup::close_id(&ctx, owner.popup_id);
+                shared.lock().unwrap().popup_owners.remove(&fence_id);
+                ctx.request_repaint();
+            } else {
+                shared.lock().unwrap().popup_owners.insert(fence_id, owner);
+            }
+        }
+    }
 
     // 1. Read fence snapshot & preferences once per frame
     let (spec_opt, cell_w, cell_h, snap_px, monitors, sibling_rects, is_renaming_this, selected_idx) = {
@@ -300,11 +359,12 @@ pub fn render_fence_viewport(
         }
     }
 
-    // 3. Handle 8-edge resize borders cleanly (excluding top-right header control buttons)
+    // 3. Handle all 8 resize borders cleanly (outer RESIZE_EDGE always takes priority, even at top-right).
     let win_rect = ui.max_rect();
-    if let Some(pos) = ctx.input(|i| i.pointer.hover_pos())
-        && let Some(dir) = detect_resize_edge(win_rect, pos, spec.collapsed)
-    {
+    let resize_dir = ctx
+        .input(|i| i.pointer.hover_pos())
+        .and_then(|pos| detect_resize_edge(win_rect, pos, spec.collapsed));
+    if let Some(dir) = resize_dir {
         ctx.set_cursor_icon(resize_cursor(dir));
         if ctx.input(|i| i.pointer.button_pressed(PointerButton::Primary)) {
             ctx.send_viewport_cmd(ViewportCommand::BeginResize(dir));
@@ -322,30 +382,42 @@ pub fn render_fence_viewport(
             .collect()
     });
     if !dropped_paths.is_empty() && spec.portal_dir.is_none() {
-        let mut guard = shared.lock().unwrap();
-        let source_transfer = guard.dragging_from_fence.take();
-        if let Some(src_info) = source_transfer
-            && src_info.fence_id != fence_id
-            && let Some(src) = guard.config.fence_mut(src_info.fence_id)
-            && src.portal_dir.is_none()
-        {
-            src.items
-                .retain(|it| !it.path.eq_ignore_ascii_case(&src_info.path));
-            for (idx, it) in src.items.iter_mut().enumerate() {
-                it.order = idx as i32;
-            }
-            ctx.request_repaint_of(ViewportId::from_hash_of(("desklite_fence", src_info.fence_id)));
-        }
-        if let Some(f) = guard.config.fence_mut(fence_id) {
-            for raw in dropped_paths {
-                if !f.items.iter().any(|it| it.path.eq_ignore_ascii_case(&raw)) {
-                    let order = f.items.len() as i32;
-                    f.items.push(resolve_dropped_item(Path::new(&raw), order));
+        let managed = {
+            let mut guard = shared.lock().unwrap();
+            let matching_transfer = guard
+                .dragging_from_fence
+                .as_ref()
+                .is_some_and(|ds| dropped_paths.iter().any(|p| p.eq_ignore_ascii_case(&ds.path)));
+            let source_transfer = if matching_transfer {
+                guard.dragging_from_fence.take()
+            } else {
+                None
+            };
+            if let Some(src_info) = source_transfer
+                && src_info.fence_id != fence_id
+                && let Some(src) = guard.config.fence_mut(src_info.fence_id)
+                && src.portal_dir.is_none()
+            {
+                src.items
+                    .retain(|it| !it.path.eq_ignore_ascii_case(&src_info.path));
+                for (idx, it) in src.items.iter_mut().enumerate() {
+                    it.order = idx as i32;
                 }
+                ctx.request_repaint_of(ViewportId::from_hash_of(("desklite_fence", src_info.fence_id)));
             }
-            guard.dirty_layout = true;
-            out.needs_immediate_save = true;
-        }
+            if let Some(f) = guard.config.fence_mut(fence_id) {
+                for raw in dropped_paths {
+                    if !f.items.iter().any(|it| it.path.eq_ignore_ascii_case(&raw)) {
+                        let order = f.items.len() as i32;
+                        f.items.push(resolve_dropped_item(Path::new(&raw), order));
+                    }
+                }
+                guard.dirty_layout = true;
+                out.needs_immediate_save = true;
+            }
+            collect_managed_desktop_paths(&guard.config)
+        };
+        hide_desktop_icons_for_paths(&managed);
         ctx.request_repaint();
     }
 
@@ -377,7 +449,12 @@ pub fn render_fence_viewport(
                 sw: if spec.collapsed { 10 } else { 0 },
                 se: if spec.collapsed { 10 } else { 0 },
             })
-            .inner_margin(Margin::symmetric(10, 6));
+            .inner_margin(Margin {
+                left: 10,
+                right: 9,
+                top: 8,
+                bottom: 4,
+            });
 
         title_bar_frame.show(ui, |ui| {
             ui.set_height(COLLAPSED_HEIGHT - 12.0);
@@ -390,9 +467,21 @@ pub fn render_fence_viewport(
                         painter.circle_filled(Pos2::new(cx, cy + dy), 1.4, fg);
                     }
                 });
-                egui::Popup::menu(&menu_resp).show(|ui| {
-                    render_fence_menu_items(ui, fence_id, &spec, shared, &ctx, &mut out);
-                });
+                if egui::Popup::menu(&menu_resp)
+                    .show(|ui| {
+                        render_fence_menu_items(ui, fence_id, &spec, shared, &ctx, &mut out);
+                    })
+                    .is_some()
+                {
+                    let mut guard = shared.lock().unwrap();
+                    guard.popup_owners.insert(
+                        fence_id,
+                        PopupOwnerState {
+                            popup_id: egui::Popup::default_response_id(&menu_resp),
+                            saw_focused: focused_now,
+                        },
+                    );
+                }
 
                 let is_list = matches!(spec.kind, FenceKind::FileList);
                 if draw_header_icon_btn(ui, "切换网格 / 列表视图", |painter, r, fg| {
@@ -526,7 +615,7 @@ pub fn render_fence_viewport(
                     let (title_rect, _) =
                         ui.allocate_exact_size(Vec2::new(rem_w, 24.0), Sense::hover());
                     let title_resp = ui.interact(
-                        title_rect.expand2(Vec2::new(0.0, 4.0)),
+                        title_rect.expand2(Vec2::new(0.0, 1.0)),
                         ui.make_persistent_id(("title_bar", fence_id)),
                         Sense::click_and_drag(),
                     );
@@ -546,42 +635,56 @@ pub fn render_fence_viewport(
                         Color32::from_rgb(242, 245, 252),
                     );
 
-                    let pointer_dbl = ctx.input(|i| {
-                        i.pointer.button_double_clicked(PointerButton::Primary)
-                            && i.pointer
-                                .interact_pos()
-                                .is_some_and(|p| title_rect.expand(4.0).contains(p))
-                    });
-                    let mut quick_second_click = false;
-                    if title_resp.clicked() {
-                        let now = Instant::now();
-                        let mut guard = shared.lock().unwrap();
-                        if let Some(prev) = guard.last_title_click.get(&fence_id)
-                            && now.duration_since(*prev) <= Duration::from_millis(550)
-                        {
-                            quick_second_click = true;
-                            guard.last_title_click.remove(&fence_id);
-                        } else {
-                            guard.last_title_click.insert(fence_id, now);
-                        }
-                    }
-
-                    if title_resp.double_clicked() || pointer_dbl || quick_second_click {
-                        toggle_collapse(fence_id, &spec, shared, &ctx, &mut out);
-                    } else if title_resp.dragged_by(PointerButton::Primary) {
-                        let moved_enough = ctx.input(|i| {
-                            i.pointer
-                                .press_origin()
-                                .zip(i.pointer.interact_pos())
-                                .is_some_and(|(a, b)| (b - a).length() > 4.0)
+                    if resize_dir.is_none() {
+                        let pointer_dbl = ctx.input(|i| {
+                            i.pointer.button_double_clicked(PointerButton::Primary)
+                                && i.pointer
+                                    .interact_pos()
+                                    .is_some_and(|p| title_rect.expand(3.0).contains(p))
                         });
-                        if moved_enough {
-                            ctx.send_viewport_cmd(ViewportCommand::StartDrag);
+                        let mut quick_second_click = false;
+                        if title_resp.clicked() {
+                            let now = Instant::now();
+                            let mut guard = shared.lock().unwrap();
+                            if let Some(prev) = guard.last_title_click.get(&fence_id)
+                                && now.duration_since(*prev) <= Duration::from_millis(550)
+                            {
+                                quick_second_click = true;
+                                guard.last_title_click.remove(&fence_id);
+                            } else {
+                                guard.last_title_click.insert(fence_id, now);
+                            }
+                        }
+
+                        if title_resp.double_clicked() || pointer_dbl || quick_second_click {
+                            toggle_collapse(fence_id, &spec, shared, &ctx, &mut out);
+                        } else if title_resp.dragged_by(PointerButton::Primary) {
+                            let moved_enough = ctx.input(|i| {
+                                i.pointer
+                                    .press_origin()
+                                    .zip(i.pointer.interact_pos())
+                                    .is_some_and(|(a, b)| (b - a).length() > 4.0)
+                            });
+                            if moved_enough {
+                                ctx.send_viewport_cmd(ViewportCommand::StartDrag);
+                            }
                         }
                     }
-                    title_resp.context_menu(|ui| {
-                        render_fence_menu_items(ui, fence_id, &spec, shared, &ctx, &mut out);
-                    });
+                    if title_resp
+                        .context_menu(|ui| {
+                            render_fence_menu_items(ui, fence_id, &spec, shared, &ctx, &mut out);
+                        })
+                        .is_some()
+                    {
+                        let mut guard = shared.lock().unwrap();
+                        guard.popup_owners.insert(
+                            fence_id,
+                            PopupOwnerState {
+                                popup_id: egui::Popup::default_response_id(&title_resp),
+                                saw_focused: focused_now,
+                            },
+                        );
+                    }
                 }
             });
         });
@@ -606,21 +709,69 @@ pub fn render_fence_viewport(
                     );
                 }
             } else if spec.items.is_empty() {
-                ui.centered_and_justified(|ui| {
-                    ui.label(
-                        RichText::new("可从桌面或资源管理器拖入文件\n也可以拖动条目放到桌面或其它格子")
-                            .size(12.0)
-                            .color(Color32::from_rgba_unmultiplied(200, 210, 228, 175)),
+                let empty_resp = ui.interact(
+                    ui.available_rect_before_wrap(),
+                    ui.make_persistent_id(("empty_body", fence_id)),
+                    Sense::click(),
+                );
+                if empty_resp
+                    .context_menu(|ui| {
+                        render_fence_menu_items(ui, fence_id, &spec, shared, &ctx, &mut out);
+                    })
+                    .is_some()
+                {
+                    let mut guard = shared.lock().unwrap();
+                    guard.popup_owners.insert(
+                        fence_id,
+                        PopupOwnerState {
+                            popup_id: egui::Popup::default_response_id(&empty_resp),
+                            saw_focused: focused_now,
+                        },
                     );
-                });
+                }
+                ui.painter().text(
+                    empty_resp.rect.center(),
+                    egui::Align2::CENTER_CENTER,
+                    "可从桌面或资源管理器拖入文件\n也可以拖动条目放到桌面或其它格子",
+                    egui::FontId::proportional(12.0),
+                    Color32::from_rgba_unmultiplied(200, 210, 228, 175),
+                );
                 return;
             }
 
             let mut item_action: Option<ItemUiAction> = None;
+            let mut opened_item_popup: Option<egui::Id> = None;
 
             ScrollArea::vertical()
                 .auto_shrink([false, false])
                 .show(ui, |ui| {
+                    // Register blank-body background click/right-click BEFORE items so item widgets sit
+                    // above it in hit-test order, while trailing row slots, margins, and footer work cleanly.
+                    let full_body_rect = ui.available_rect_before_wrap();
+                    let blank_resp = ui.interact(
+                        full_body_rect,
+                        ui.make_persistent_id(("blank_body", fence_id)),
+                        Sense::click(),
+                    );
+                    if blank_resp.clicked() {
+                        shared.lock().unwrap().selected_item.remove(&fence_id);
+                    }
+                    if blank_resp
+                        .context_menu(|ui| {
+                            render_fence_menu_items(ui, fence_id, &spec, shared, &ctx, &mut out);
+                        })
+                        .is_some()
+                    {
+                        let mut guard = shared.lock().unwrap();
+                        guard.popup_owners.insert(
+                            fence_id,
+                            PopupOwnerState {
+                                popup_id: egui::Popup::default_response_id(&blank_resp),
+                                saw_focused: focused_now,
+                            },
+                        );
+                    }
+
                     let avail_w = ui.available_width().max(cell_w);
                     match spec.kind {
                         FenceKind::FileList => {
@@ -631,49 +782,92 @@ pub fn render_fence_viewport(
                                 };
                                 let selected = selected_idx == Some(idx);
                                 let row_resp = render_list_item(ui, item, tex.as_ref(), selected);
-                                handle_item_interactions(
+                                if let Some(pid) = handle_item_interactions(
                                     &row_resp,
                                     idx,
                                     item,
                                     is_portal,
                                     &mut item_action,
-                                );
+                                ) {
+                                    opened_item_popup = Some(pid);
+                                }
                             }
                         }
                         FenceKind::IconGrid | FenceKind::Unknown(_) => {
-                            let cols = ((avail_w / cell_w).floor() as usize).max(1);
-                            egui::Grid::new(("fence_grid", fence_id))
-                                .num_columns(cols)
-                                .spacing([4.0, 6.0])
-                                .show(ui, |ui| {
-                                    for (idx, item) in spec.items.iter().enumerate() {
-                                        let tex = {
-                                            let mut guard = shared.lock().unwrap();
-                                            guard.get_or_load_texture(&ctx, &item.path)
-                                        };
-                                        let selected = selected_idx == Some(idx);
-                                        let tile_resp = render_grid_item(
-                                            ui,
-                                            item,
-                                            tex.as_ref(),
-                                            selected,
-                                            Vec2::new(cell_w - 4.0, cell_h),
-                                        );
-                                        handle_item_interactions(
-                                            &tile_resp,
-                                            idx,
-                                            item,
-                                            is_portal,
-                                            &mut item_action,
-                                        );
-                                        if (idx + 1) % cols == 0 {
-                                            ui.end_row();
+                            let gap_x = 6.0_f32;
+                            let gap_y = 6.0_f32;
+                            let tile_w = (cell_w - 4.0).max(64.0);
+                            let cols = (((avail_w + gap_x) / (tile_w + gap_x)).floor() as usize).max(1);
+                            let used_cols = cols.min(spec.items.len().max(1));
+                            let grid_w = used_cols as f32 * tile_w
+                                + (used_cols.saturating_sub(1) as f32) * gap_x;
+                            let left_pad = ((avail_w - grid_w) * 0.5).floor().max(0.0);
+
+                            ui.horizontal(|ui| {
+                                ui.spacing_mut().item_spacing.x = 0.0;
+                                if left_pad > 0.0 {
+                                    ui.add_space(left_pad);
+                                }
+                                egui::Grid::new(("fence_grid", fence_id))
+                                    .num_columns(cols)
+                                    .spacing([gap_x, gap_y])
+                                    .show(ui, |ui| {
+                                        for (idx, item) in spec.items.iter().enumerate() {
+                                            let tex = {
+                                                let mut guard = shared.lock().unwrap();
+                                                guard.get_or_load_texture(&ctx, &item.path)
+                                            };
+                                            let selected = selected_idx == Some(idx);
+                                            let tile_resp = render_grid_item(
+                                                ui,
+                                                item,
+                                                tex.as_ref(),
+                                                selected,
+                                                Vec2::new(tile_w, cell_h),
+                                            );
+                                            if let Some(pid) = handle_item_interactions(
+                                                &tile_resp,
+                                                idx,
+                                                item,
+                                                is_portal,
+                                                &mut item_action,
+                                            ) {
+                                                opened_item_popup = Some(pid);
+                                            }
+                                            if (idx + 1) % cols == 0 {
+                                                ui.end_row();
+                                            }
                                         }
-                                    }
-                                });
+                                    });
+                            });
                         }
                     }
                 });
+
+            if let Some(pid) = opened_item_popup {
+                let mut guard = shared.lock().unwrap();
+                guard.popup_owners.insert(
+                    fence_id,
+                    PopupOwnerState {
+                        popup_id: pid,
+                        saw_focused: focused_now,
+                    },
+                );
+            }
+
+            if item_action.is_none()
+                && focused_now
+                && !is_renaming_this
+                && !egui::Popup::is_any_open(&ctx)
+                && let Some(sel) = selected_idx
+                && let Some(sel_item) = spec.items.get(sel)
+            {
+                if ctx.input(|i| i.key_pressed(Key::Enter)) {
+                    item_action = Some(ItemUiAction::Launch(sel_item.path.clone()));
+                } else if !is_portal && ctx.input(|i| i.key_pressed(Key::Delete)) {
+                    item_action = Some(ItemUiAction::Remove(sel));
+                }
+            }
 
             if let Some(act) = item_action {
                 match act {
@@ -687,36 +881,101 @@ pub fn render_fence_viewport(
                         let _ = reveal_in_explorer(&path);
                     }
                     ItemUiAction::Remove(idx) => {
-                        let mut guard = shared.lock().unwrap();
-                        if let Some(f) = guard.config.fence_mut(fence_id)
-                            && f.portal_dir.is_none()
-                            && idx < f.items.len()
-                        {
-                            f.items.remove(idx);
-                            for (i, it) in f.items.iter_mut().enumerate() {
-                                it.order = i as i32;
+                        let (removed_path, remaining) = {
+                            let mut guard = shared.lock().unwrap();
+                            let removed_path = if let Some(f) = guard.config.fence_mut(fence_id)
+                                && f.portal_dir.is_none()
+                                && idx < f.items.len()
+                            {
+                                let removed = f.items.remove(idx);
+                                for (i, it) in f.items.iter_mut().enumerate() {
+                                    it.order = i as i32;
+                                }
+                                guard.selected_item.remove(&fence_id);
+                                guard.dirty_layout = true;
+                                out.needs_immediate_save = true;
+                                Some(removed.path)
+                            } else {
+                                None
+                            };
+                            (removed_path, collect_managed_desktop_paths(&guard.config))
+                        };
+                        if let Some(rp) = removed_path {
+                            let p = Path::new(&rp);
+                            if is_directly_on_desktop(p) {
+                                restore_desktop_icon_async(rp, None, remaining);
                             }
-                            guard.dirty_layout = true;
-                            out.needs_immediate_save = true;
+                            ctx.request_repaint_of(ViewportId::from_hash_of(("desklite_fence", fence_id)));
+                            ctx.request_repaint_of(ViewportId::ROOT);
                         }
                     }
                     ItemUiAction::StartDragOut(path) => {
-                        {
+                        let is_desktop_res = is_directly_on_desktop(Path::new(&path));
+                        let fence_hwnds: Vec<isize> = {
                             let mut guard = shared.lock().unwrap();
                             guard.dragging_from_fence = Some(DragSourceState {
                                 fence_id,
                                 path: path.clone(),
                                 finished_at: None,
                             });
-                        }
-                        let _ = start_file_drag_out(&[path]);
-                        {
+                            guard.attached_hwnds.values().copied().collect()
+                        };
+                        let outcome = start_file_drag_out(
+                            std::slice::from_ref(&path),
+                            is_desktop_res,
+                            &fence_hwnds,
+                        );
+                        let restore_desktop_at: Option<(i32, i32, Vec<String>)> = {
                             let mut guard = shared.lock().unwrap();
-                            if let Some(ref mut ds) = guard.dragging_from_fence {
-                                ds.finished_at = Some(Instant::now());
+                            let unconsumed = guard.dragging_from_fence.is_some();
+                            let gone_from_disk = !Path::new(&path).exists();
+                            match outcome {
+                                Ok(DragOutOutcome::DroppedOnDesktop { x, y }) => {
+                                    guard.dragging_from_fence = None;
+                                    if let Some(f) = guard.config.fence_mut(fence_id)
+                                        && f.portal_dir.is_none()
+                                    {
+                                        f.items.retain(|it| !it.path.eq_ignore_ascii_case(&path));
+                                        for (i, it) in f.items.iter_mut().enumerate() {
+                                            it.order = i as i32;
+                                        }
+                                        guard.selected_item.remove(&fence_id);
+                                        guard.dirty_layout = true;
+                                        out.needs_immediate_save = true;
+                                    }
+                                    Some((x, y, collect_managed_desktop_paths(&guard.config)))
+                                }
+                                Ok(DragOutOutcome::DroppedExternal { moved }) => {
+                                    let should_remove = unconsumed && (moved || gone_from_disk);
+                                    if should_remove {
+                                        guard.dragging_from_fence = None;
+                                        if let Some(f) = guard.config.fence_mut(fence_id)
+                                            && f.portal_dir.is_none()
+                                        {
+                                            f.items.retain(|it| !it.path.eq_ignore_ascii_case(&path));
+                                            for (i, it) in f.items.iter_mut().enumerate() {
+                                                it.order = i as i32;
+                                            }
+                                            guard.selected_item.remove(&fence_id);
+                                            guard.dirty_layout = true;
+                                            out.needs_immediate_save = true;
+                                        }
+                                    } else if let Some(ref mut ds) = guard.dragging_from_fence {
+                                        ds.finished_at = Some(Instant::now());
+                                    }
+                                    None
+                                }
+                                Ok(DragOutOutcome::Cancelled) | Err(_) => {
+                                    guard.dragging_from_fence = None;
+                                    None
+                                }
                             }
+                        };
+                        if let Some((dx, dy, remaining)) = restore_desktop_at {
+                            restore_desktop_icon_async(path, Some((dx, dy)), remaining);
                         }
-                        ctx.request_repaint();
+                        ctx.request_repaint_of(ViewportId::from_hash_of(("desklite_fence", fence_id)));
+                        ctx.request_repaint_of(ViewportId::ROOT);
                     }
                 }
             }
@@ -740,7 +999,7 @@ fn handle_item_interactions(
     item: &desklite_core::FenceItem,
     is_portal: bool,
     out_action: &mut Option<ItemUiAction>,
-) {
+) -> Option<egui::Id> {
     if resp.clicked() {
         *out_action = Some(ItemUiAction::Select(idx));
     }
@@ -750,6 +1009,11 @@ fn handle_item_interactions(
     if resp.drag_started_by(PointerButton::Primary) {
         *out_action = Some(ItemUiAction::StartDragOut(item.path.clone()));
     }
+    let remove_lbl = if is_directly_on_desktop(Path::new(&item.path)) {
+        "移出格子（放回桌面）"
+    } else {
+        "从格子移除"
+    };
     resp.context_menu(|ui| {
         if ui.button("打开").clicked() {
             *out_action = Some(ItemUiAction::Launch(item.path.clone()));
@@ -759,11 +1023,12 @@ fn handle_item_interactions(
             *out_action = Some(ItemUiAction::Reveal(item.path.clone()));
             ui.close();
         }
-        if !is_portal && ui.button("从格子移除").clicked() {
+        if !is_portal && ui.button(remove_lbl).clicked() {
             *out_action = Some(ItemUiAction::Remove(idx));
             ui.close();
         }
-    });
+    })
+    .map(|_| egui::Popup::default_response_id(resp))
 }
 
 fn render_grid_item(
@@ -790,7 +1055,7 @@ fn render_grid_item(
         if let Some(t) = tex {
             let icon_sz = 40.0;
             let icon_rect = egui::Rect::from_min_size(
-                Pos2::new(rect.center().x - icon_sz / 2.0, rect.min.y + 6.0),
+                Pos2::new((rect.center().x - icon_sz * 0.5).round(), rect.min.y + 6.0),
                 Vec2::splat(icon_sz),
             );
             ui.painter().image(
@@ -803,18 +1068,27 @@ fn render_grid_item(
 
         let clipped = ui.painter().with_clip_rect(rect.shrink(2.0));
         let font = egui::FontId::proportional(11.5);
-        let fitted = fit_two_lines(ui.painter(), &item.display_name, font.clone(), (size.x - 8.0).max(20.0));
-        let label_galley = ui.painter().layout(
-            fitted,
-            font,
-            Color32::from_rgb(240, 244, 252),
-            (size.x - 8.0).max(20.0),
+        let max_text_w = (size.x - 8.0).max(20.0);
+        let fitted = fit_two_lines(ui.painter(), &item.display_name, font.clone(), max_text_w);
+
+        let mut shadow_job = LayoutJob::simple(
+            fitted.clone(),
+            font.clone(),
+            Color32::from_rgba_unmultiplied(0, 0, 0, 175),
+            max_text_w,
         );
-        let text_pos = Pos2::new(
-            (rect.center().x - label_galley.size().x / 2.0).max(rect.min.x + 4.0),
-            rect.min.y + 50.0,
-        );
-        clipped.galley(text_pos, label_galley, Color32::WHITE);
+        shadow_job.halign = Align::Center;
+        let shadow_galley = ui.painter().layout_job(shadow_job);
+
+        let mut label_job =
+            LayoutJob::simple(fitted, font, Color32::from_rgb(244, 247, 255), max_text_w);
+        label_job.halign = Align::Center;
+        let label_galley = ui.painter().layout_job(label_job);
+
+        let center_x = rect.center().x.round();
+        let text_y = rect.min.y + 50.0;
+        clipped.galley(Pos2::new(center_x, text_y + 1.0), shadow_galley, Color32::WHITE);
+        clipped.galley(Pos2::new(center_x, text_y), label_galley, Color32::WHITE);
     }
     resp.on_hover_text(&item.path)
 }
@@ -1020,11 +1294,17 @@ fn render_fence_menu_items(
         }
         ui.close();
     }
-    if spec.portal_dir.is_some() {
+    if let Some(ref portal_dir) = spec.portal_dir {
+        if ui.button("在资源管理器中打开文件夹").clicked() {
+            let _ = launch_item(portal_dir);
+            ui.close();
+        }
         if ui.button("取消文件夹映射").clicked() {
             let mut guard = shared.lock().unwrap();
             if let Some(f) = guard.config.fence_mut(fence_id) {
                 f.portal_dir = None;
+                f.items.clear();
+                guard.selected_item.remove(&fence_id);
                 guard.dirty_layout = true;
                 out.needs_immediate_save = true;
             }
@@ -1071,11 +1351,6 @@ fn render_fence_menu_items(
 }
 
 fn detect_resize_edge(rect: egui::Rect, pos: Pos2, collapsed: bool) -> Option<ResizeDirection> {
-    // Keep top-right header control buttons free of accidental resize-edge grabs.
-    if pos.y - rect.min.y < COLLAPSED_HEIGHT && rect.max.x - pos.x < HEADER_BTN_RESERVE_W {
-        return None;
-    }
-
     let left = pos.x - rect.min.x < RESIZE_EDGE;
     let right = rect.max.x - pos.x < RESIZE_EDGE;
     let top = pos.y - rect.min.y < RESIZE_EDGE;

@@ -37,7 +37,9 @@ pub(crate) fn win_err(op: &'static str, source: windows::core::Error) -> Win32Er
 }
 
 pub use desktop_listview::{
-    DesktopIconInfo, DesktopListView, find_desktop_listview, probe_desktop_window_tree,
+    DesktopIconInfo, DesktopListView, find_desktop_listview, hide_desktop_icons_for_paths,
+    probe_desktop_window_tree, restore_all_desktop_icons, restore_desktop_icon,
+    restore_desktop_icon_async,
 };
 pub use display::probe_display_topology;
 pub use dpi::enable_per_monitor_dpi_v2;
@@ -47,10 +49,13 @@ pub use fence_poc::{FencePocConfig, run_bottom_fence_poc};
 pub use folder_watch::{FolderWatcher, WM_APP_PORTAL_DIRTY};
 pub use icons::{DecodedIcon, IconCache};
 pub use shell_ops::{
-    launch_item, pick_folder_dialog, resolve_dropped_item, reveal_in_explorer,
-    scan_portal_directory,
+    all_desktop_dirs, is_directly_on_desktop, is_vault_path, launch_item,
+    migrate_vault_item_to_desktop, pick_folder_dialog, resolve_dropped_item,
+    reveal_in_explorer, scan_portal_directory,
 };
 pub use tray::{TrayIcon, WM_APP_TRAY};
 pub use window_attach::{
-    attach_desktop_owner_and_rounded_corners, find_window_by_exact_title, strip_alt_tab_from_host,
+    DesktopZHookGuard, attach_desktop_owner_and_rounded_corners, find_window_by_exact_title,
+    foreground_window_handle, install_desktop_z_win_event_hooks, post_reassert_all_fences_z,
+    strip_alt_tab_from_host,
 };

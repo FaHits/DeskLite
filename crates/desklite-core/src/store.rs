@@ -78,7 +78,7 @@ pub fn load_native_layout(path: &Path) -> Result<NativeLayoutConfig, StoreError>
         path: path.to_path_buf(),
         source,
     })?;
-    let cfg: NativeLayoutConfig = serde_json::from_str(&raw)?;
+    let cfg: NativeLayoutConfig = serde_json::from_str(raw.trim_start_matches('\u{feff}'))?;
     if cfg.schema_version != CURRENT_SCHEMA_VERSION {
         return Err(StoreError::UnsupportedSchema(cfg.schema_version));
     }

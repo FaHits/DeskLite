@@ -14,14 +14,16 @@ use desklite_core::{
     save_native_layout,
 };
 use desklite_legacy::{LegacyOptions, legacy_to_native, load_legacy_dir};
-use desklite_ui::fence_view::{FenceCommand, RenamePrompt};
+use desklite_ui::fence_view::{FenceCommand, RenamePrompt, collect_managed_desktop_paths};
 use desklite_ui::{
     COLLAPSED_HEIGHT, SharedFenceState, configure_egui_theme, install_chinese_fonts,
     render_fence_viewport,
 };
 use desklite_win32::{
-    FolderWatcher, IconCache, TrayIcon, WM_APP_PORTAL_DIRTY, WM_APP_TRAY,
-    enable_per_monitor_dpi_v2, pick_folder_dialog, probe_display_topology,
+    FolderWatcher, IconCache, TrayIcon, WM_APP_PORTAL_DIRTY, WM_APP_TRAY, all_desktop_dirs,
+    enable_per_monitor_dpi_v2, hide_desktop_icons_for_paths, install_desktop_z_win_event_hooks,
+    is_directly_on_desktop, is_vault_path, migrate_vault_item_to_desktop, pick_folder_dialog,
+    probe_display_topology, restore_all_desktop_icons, restore_desktop_icon_async,
     scan_portal_directory, strip_alt_tab_from_host,
 };
 use egui::{Pos2, Vec2, ViewportBuilder, ViewportCommand, ViewportId, WindowLevel};
@@ -47,6 +49,8 @@ use windows::core::{HSTRING, w};
 
 const DISPLAY_DEBOUNCE_TIMER: usize = 101;
 const DISPLAY_DEBOUNCE_MS: u32 = 150;
+const DESKTOP_DEBOUNCE_TIMER: usize = 102;
+const DESKTOP_DEBOUNCE_MS: u32 = 160;
 const WM_APP_SYNC_WATCHERS: u32 = WM_APP + 20;
 const WM_APP_SHUTDOWN: u32 = WM_APP + 21;
 
@@ -113,17 +117,37 @@ fn create_starter_fence(topo: &DisplayTopology) -> FenceSpec {
     }
 }
 
+fn migrate_legacy_vault_items(cfg: &mut NativeLayoutConfig) -> bool {
+    let mut changed = false;
+    for f in &mut cfg.fences {
+        if f.portal_dir.is_some() {
+            continue;
+        }
+        for it in &mut f.items {
+            let p = Path::new(&it.path);
+            if is_vault_path(p)
+                && let Some(restored) = migrate_vault_item_to_desktop(p)
+            {
+                it.path = restored.to_string_lossy().into_owned();
+                changed = true;
+            }
+        }
+    }
+    changed
+}
+
 fn load_or_bootstrap_layout(layout_path: &Path, topo: &DisplayTopology) -> NativeLayoutConfig {
     if layout_path.exists()
         && let Ok(mut cfg) = load_native_layout(layout_path)
     {
         let sanitized = cfg.sanitize_legacy_containers();
+        let migrated = migrate_legacy_vault_items(&mut cfg);
         if cfg.fences.is_empty() {
             cfg.fences.push(create_starter_fence(topo));
         }
         let _ = cfg.apply_topology(topo, (72, 72));
         refresh_all_portals(&mut cfg);
-        if sanitized {
+        if sanitized || migrated {
             let _ = save_native_layout(layout_path, &cfg);
         }
         return cfg;
@@ -155,6 +179,7 @@ fn load_or_bootstrap_layout(layout_path: &Path, topo: &DisplayTopology) -> Nativ
 enum BgEvent {
     TopologyChanged(DisplayTopology),
     PortalDirty(i32),
+    DesktopDirty,
     TrayNewBlank,
     TrayNewPortal(String),
     TrayRealign,
@@ -187,6 +212,12 @@ impl HelperState {
         for (id, dir) in portals {
             if let Some(w) = FolderWatcher::start(id, Path::new(&dir), self.hwnd) {
                 self.watchers.insert(id, w);
+            }
+        }
+        for (idx, dir) in all_desktop_dirs().into_iter().enumerate() {
+            let sentinel_id = -100 - (idx as i32);
+            if let Some(w) = FolderWatcher::start(sentinel_id, &dir, self.hwnd) {
+                self.watchers.insert(sentinel_id, w);
             }
         }
     }
@@ -307,8 +338,13 @@ unsafe extern "system" fn helper_wnd_proc(
             LRESULT(0)
         }
         WM_APP_PORTAL_DIRTY => {
-            let _ = st.tx.send(BgEvent::PortalDirty(wparam.0 as i32));
-            st.egui_ctx.request_repaint_of(ViewportId::ROOT);
+            let fid = wparam.0 as i32;
+            if fid < 0 {
+                unsafe { SetTimer(Some(hwnd), DESKTOP_DEBOUNCE_TIMER, DESKTOP_DEBOUNCE_MS, None) };
+            } else {
+                let _ = st.tx.send(BgEvent::PortalDirty(fid));
+                st.egui_ctx.request_repaint_of(ViewportId::ROOT);
+            }
             LRESULT(0)
         }
         WM_APP_TRAY => {
@@ -344,6 +380,12 @@ unsafe extern "system" fn helper_wnd_proc(
                     Err(_) => {}
                 }
             }
+            LRESULT(0)
+        }
+        WM_TIMER if wparam.0 == DESKTOP_DEBOUNCE_TIMER => {
+            let _ = unsafe { KillTimer(Some(hwnd), DESKTOP_DEBOUNCE_TIMER) };
+            let _ = st.tx.send(BgEvent::DesktopDirty);
+            st.egui_ctx.request_repaint_of(ViewportId::ROOT);
             LRESULT(0)
         }
         WM_QUERYENDSESSION | WM_ENDSESSION => {
@@ -419,6 +461,7 @@ fn spawn_win32_helper(
             SetWindowLongPtrW(hwnd, GWLP_USERDATA, (&raw mut *helper) as isize);
         }
         let _tray = TrayIcon::new(hwnd, 1, "DeskLite 桌面整理");
+        let _z_hooks = install_desktop_z_win_event_hooks();
         let _ = hwnd_tx.send(hwnd.0 as isize);
 
         let mut msg = MSG::default();
@@ -429,6 +472,7 @@ fn spawn_win32_helper(
             }
         }
 
+        drop(_z_hooks);
         drop(_tray);
         unsafe {
             SetWindowLongPtrW(hwnd, GWLP_USERDATA, 0);
@@ -445,7 +489,7 @@ struct DeskLiteEguiApp {
     rx: Receiver<BgEvent>,
     tx: Sender<BgEvent>,
     helper_hwnd: isize,
-    host_styled: bool,
+    host_attach_passes: u8,
 }
 
 impl DeskLiteEguiApp {
@@ -556,6 +600,13 @@ impl DeskLiteEguiApp {
                     }
                     ctx.request_repaint_of(ViewportId::from_hash_of(("desklite_fence", fid)));
                 }
+                BgEvent::DesktopDirty => {
+                    let managed = {
+                        let guard = self.shared.lock().unwrap();
+                        collect_managed_desktop_paths(&guard.config)
+                    };
+                    hide_desktop_icons_for_paths(&managed);
+                }
                 BgEvent::TrayNewBlank => {
                     self.create_blank_fence();
                     needs_save = true;
@@ -575,17 +626,33 @@ impl DeskLiteEguiApp {
                     }
                 }
                 BgEvent::BindPortalResult(fid, dir) => {
-                    let mut guard = self.shared.lock().unwrap();
-                    if let Some(f) = guard.config.fence_mut(fid) {
-                        f.items = scan_portal_directory(Path::new(&dir));
-                        f.portal_dir = Some(dir);
-                        needs_save = true;
-                        needs_watcher_sync = true;
+                    let (old_paths, remaining) = {
+                        let mut guard = self.shared.lock().unwrap();
+                        let old_paths: Vec<String> = guard
+                            .config
+                            .fences
+                            .iter()
+                            .find(|f| f.id == fid && f.portal_dir.is_none())
+                            .map(|f| f.items.iter().map(|it| it.path.clone()).collect())
+                            .unwrap_or_default();
+                        if let Some(f) = guard.config.fence_mut(fid) {
+                            f.items = scan_portal_directory(Path::new(&dir));
+                            f.portal_dir = Some(dir);
+                            needs_save = true;
+                            needs_watcher_sync = true;
+                        }
+                        (old_paths, collect_managed_desktop_paths(&guard.config))
+                    };
+                    for op in old_paths {
+                        if is_directly_on_desktop(Path::new(&op)) {
+                            restore_desktop_icon_async(op, None, remaining.clone());
+                        }
                     }
                     ctx.request_repaint_of(ViewportId::from_hash_of(("desklite_fence", fid)));
                 }
                 BgEvent::FlushAndExit => {
                     self.save_now();
+                    restore_all_desktop_icons();
                     if self.helper_hwnd != 0 {
                         unsafe {
                             let _ = PostMessageW(
@@ -641,11 +708,26 @@ impl DeskLiteEguiApp {
                     });
                 }
                 FenceCommand::RequestDelete(fid) => {
-                    let mut guard = self.shared.lock().unwrap();
-                    if guard.config.remove_fence(fid) {
-                        guard.prune_removed_fences();
-                        needs_save = true;
-                        needs_watcher_sync = true;
+                    let (restore_paths, remaining) = {
+                        let mut guard = self.shared.lock().unwrap();
+                        let restore_paths: Vec<String> = guard
+                            .config
+                            .fences
+                            .iter()
+                            .find(|f| f.id == fid && f.portal_dir.is_none())
+                            .map(|f| f.items.iter().map(|it| it.path.clone()).collect())
+                            .unwrap_or_default();
+                        if guard.config.remove_fence(fid) {
+                            guard.prune_removed_fences();
+                            needs_save = true;
+                            needs_watcher_sync = true;
+                        }
+                        (restore_paths, collect_managed_desktop_paths(&guard.config))
+                    };
+                    for rp in restore_paths {
+                        if is_directly_on_desktop(Path::new(&rp)) {
+                            restore_desktop_icon_async(rp, None, remaining.clone());
+                        }
                     }
                 }
                 FenceCommand::SyncPortals => {
@@ -653,6 +735,7 @@ impl DeskLiteEguiApp {
                 }
                 FenceCommand::RequestExitApp => {
                     self.save_now();
+                    restore_all_desktop_icons();
                     if self.helper_hwnd != 0 {
                         unsafe {
                             let _ = PostMessageW(
@@ -696,15 +779,14 @@ impl eframe::App for DeskLiteEguiApp {
     }
 
     fn ui(&mut self, ui: &mut egui::Ui, frame: &mut eframe::Frame) {
-        if let Ok(handle) = frame.window_handle()
+        if self.host_attach_passes < 2
+            && let Ok(handle) = frame.window_handle()
             && let RawWindowHandle::Win32(h) = handle.as_raw()
         {
-            let clean = strip_alt_tab_from_host(h.hwnd.get());
-            if !self.host_styled {
-                self.host_styled = true;
+            let _ = strip_alt_tab_from_host(h.hwnd.get());
+            self.host_attach_passes += 1;
+            if self.host_attach_passes == 1 {
                 ui.ctx().request_repaint_after(Duration::from_millis(100));
-            } else {
-                let _ = clean;
             }
         }
 
@@ -771,6 +853,7 @@ impl eframe::App for DeskLiteEguiApp {
 
     fn on_exit(&mut self, _gl: Option<&eframe::glow::Context>) {
         self.save_now();
+        restore_all_desktop_icons();
         if self.helper_hwnd != 0 {
             unsafe {
                 let _ = PostMessageW(
@@ -795,6 +878,15 @@ fn main() {
     };
     let layout_path = default_layout_path();
     let config = load_or_bootstrap_layout(&layout_path, &topology);
+    let initial_managed = collect_managed_desktop_paths(&config);
+    hide_desktop_icons_for_paths(&initial_managed);
+    if !initial_managed.is_empty() {
+        let retry_managed = initial_managed.clone();
+        std::thread::spawn(move || {
+            std::thread::sleep(Duration::from_millis(350));
+            hide_desktop_icons_for_paths(&retry_managed);
+        });
+    }
 
     let Ok(icon_cache) = IconCache::new() else {
         return;
@@ -835,7 +927,7 @@ fn main() {
                 rx,
                 tx,
                 helper_hwnd,
-                host_styled: false,
+                host_attach_passes: 0,
             }))
         }),
     );
