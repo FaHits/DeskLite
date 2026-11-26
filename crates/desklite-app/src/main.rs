@@ -2118,6 +2118,7 @@ impl eframe::App for DeskLiteEguiApp {
             topology,
             hide_all_fences,
             free_desktop_hwnd,
+            show_free_desktop,
             inspector_meta,
         ) = {
             let guard = lock_unpoisoned(&self.shared);
@@ -2148,62 +2149,77 @@ impl eframe::App for DeskLiteEguiApp {
             } else {
                 None
             };
+            let has_unfiled_fence = guard
+                .config
+                .unfiled_desktop_fence_id(&guard.desktop_dirs)
+                .is_some();
+            // Do not spawn the full-screen WGL FreeDesktop overlay when an UnfiledDesktop
+            // fence already hosts unfiled desktop items (avoids duplicate icons, saves a
+            // full-screen GL framebuffer, and keeps the native Windows wallpaper unobstructed).
+            let show_free_desktop = !has_unfiled_fence
+                && !guard.config.active_free_icons().is_empty()
+                && !guard.config.hide_all_fences;
             (
                 guard.config.fences.clone(),
                 guard.builder_rects.clone(),
                 guard.topology.clone(),
                 guard.config.hide_all_fences,
                 guard.free_desktop_hwnd,
+                show_free_desktop,
                 insp,
             )
         };
 
         let monitors = topology.monitors();
         let vbounds = topology.virtual_bounds();
-        if free_desktop_hwnd != 0 && self.free_desktop_synced_key.as_ref() != Some(topology.key()) {
-            set_window_rect_no_z(
-                free_desktop_hwnd,
-                vbounds.left,
-                vbounds.top,
-                vbounds.width().max(1),
-                vbounds.height().max(1),
-            );
-            self.free_desktop_synced_key = Some(topology.key().clone());
-        }
+        if show_free_desktop {
+            if free_desktop_hwnd != 0
+                && self.free_desktop_synced_key.as_ref() != Some(topology.key())
+            {
+                set_window_rect_no_z(
+                    free_desktop_hwnd,
+                    vbounds.left,
+                    vbounds.top,
+                    vbounds.width().max(1),
+                    vbounds.height().max(1),
+                );
+                self.free_desktop_synced_key = Some(topology.key().clone());
+            }
 
-        let free_scale = if monitors.is_empty() {
-            1.0
-        } else {
-            (nearest_monitor(vbounds.center(), monitors).dpi_x as f32 / 96.0).max(0.5)
-        };
-        let free_vb = ViewportBuilder::default()
-            .with_title(FREE_DESKTOP_TITLE)
-            .with_decorations(false)
-            .with_transparent(true)
-            .with_taskbar(false)
-            .with_resizable(false)
-            .with_visible(true)
-            .with_window_level(WindowLevel::AlwaysOnBottom)
-            .with_position(Pos2::new(
-                vbounds.left as f32 / free_scale,
-                vbounds.top as f32 / free_scale,
-            ))
-            .with_inner_size(Vec2::new(
-                (vbounds.width().max(1) as f32) / free_scale,
-                (vbounds.height().max(1) as f32) / free_scale,
-            ));
-        let free_shared = Arc::clone(&self.shared);
-        let free_layout_path = self.layout_path.clone();
-        ctx.show_viewport_deferred(
-            ViewportId::from_hash_of("desklite_free_desktop"),
-            free_vb,
-            move |sub_ui, _class| {
-                let res = render_free_desktop_viewport(sub_ui, &free_shared);
-                if res.needs_immediate_save {
-                    save_shared_now(&free_layout_path, &free_shared, "free_desktop_viewport");
-                }
-            },
-        );
+            let free_scale = if monitors.is_empty() {
+                1.0
+            } else {
+                (nearest_monitor(vbounds.center(), monitors).dpi_x as f32 / 96.0).max(0.5)
+            };
+            let free_vb = ViewportBuilder::default()
+                .with_title(FREE_DESKTOP_TITLE)
+                .with_decorations(false)
+                .with_transparent(true)
+                .with_taskbar(false)
+                .with_resizable(false)
+                .with_visible(true)
+                .with_window_level(WindowLevel::AlwaysOnBottom)
+                .with_position(Pos2::new(
+                    vbounds.left as f32 / free_scale,
+                    vbounds.top as f32 / free_scale,
+                ))
+                .with_inner_size(Vec2::new(
+                    (vbounds.width().max(1) as f32) / free_scale,
+                    (vbounds.height().max(1) as f32) / free_scale,
+                ));
+            let free_shared = Arc::clone(&self.shared);
+            let free_layout_path = self.layout_path.clone();
+            ctx.show_viewport_deferred(
+                ViewportId::from_hash_of("desklite_free_desktop"),
+                free_vb,
+                move |sub_ui, _class| {
+                    let res = render_free_desktop_viewport(sub_ui, &free_shared);
+                    if res.needs_immediate_save {
+                        save_shared_now(&free_layout_path, &free_shared, "free_desktop_viewport");
+                    }
+                },
+            );
+        }
 
         for spec in fences {
             let fid = spec.id;
@@ -2334,7 +2350,7 @@ fn main() {
         clipboard_shortcuts: false,
         ..Default::default()
     };
-    native_options.glow_options.vsync = true;
+    native_options.glow_options.vsync = false;
 
     let _ = eframe::run_native(
         "DeskLite",

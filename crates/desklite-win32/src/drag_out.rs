@@ -513,48 +513,112 @@ pub fn start_file_drag_out_async(
         .name("desklite-drag-out".to_string())
         .spawn(move || {
             let outcome = unsafe {
-                let ole_ok = OleInitialize(None).is_ok();
-                let _ole_guard = OleGuard(ole_ok);
-                let data_obj: IDataObject = FileDropDataObject::new(req.paths).into();
-                let drop_kind = Arc::new(AtomicU8::new(ASYNC_DROP_NONE));
-                let target_hwnd = Arc::new(AtomicIsize::new(0));
-                let drop_x = Arc::new(AtomicI32::new(0));
-                let drop_y = Arc::new(AtomicI32::new(0));
-                let drop_src: IDropSource = AsyncDropSource {
-                    bucket_hwnds: req.bucket_hwnds,
-                    free_desktop_hwnd: req.free_desktop_hwnd,
-                    drop_kind: Arc::clone(&drop_kind),
-                    target_hwnd: Arc::clone(&target_hwnd),
-                    drop_x: Arc::clone(&drop_x),
-                    drop_y: Arc::clone(&drop_y),
-                }
-                .into();
-                let mut effect = DROPEFFECT(0);
-                let ok_effects = if req.is_desktop_resident {
-                    DROPEFFECT_COPY | DROPEFFECT_MOVE | DROPEFFECT_LINK
-                } else {
-                    DROPEFFECT_COPY | DROPEFFECT_LINK
-                };
-                let hr = DoDragDrop(&data_obj, &drop_src, ok_effects, &mut effect);
-                match drop_kind.load(Ordering::Acquire) {
-                    ASYNC_DROP_FENCE => DragTargetOutcome::DroppedOnFence {
-                        target_hwnd: target_hwnd.load(Ordering::Relaxed),
-                        screen_x: drop_x.load(Ordering::Relaxed),
-                        screen_y: drop_y.load(Ordering::Relaxed),
-                    },
-                    ASYNC_DROP_FREE_DESKTOP => DragTargetOutcome::DroppedOnFreeDesktop {
-                        screen_x: drop_x.load(Ordering::Relaxed),
-                        screen_y: drop_y.load(Ordering::Relaxed),
-                    },
-                    _ => {
-                        if hr == DRAGDROP_S_DROP {
-                            DragTargetOutcome::DroppedExternal {
-                                moved: (effect.0 & DROPEFFECT_MOVE.0) != 0,
-                            }
+                // Phase 1: Pure internal cursor tracking while the cursor stays over DeskLite
+                // windows or the desktop. This avoids calling OLE DoDragDrop on a background
+                // STA thread while hovering same-process winit IDropTarget windows (which would
+                // cause a cross-apartment COM SendMessage deadlock -> Application Hang).
+                let mut enter_external_ole = false;
+                let mut internal_outcome: Option<DragTargetOutcome> = None;
+                loop {
+                    let esc_down = (GetAsyncKeyState(0x1B) as u16 & 0x8000) != 0;
+                    if esc_down {
+                        internal_outcome = Some(DragTargetOutcome::Cancelled);
+                        break;
+                    }
+                    let mut pt = POINT::default();
+                    let has_pt = GetCursorPos(&mut pt).is_ok();
+                    let hit = if has_pt { WindowFromPoint(pt) } else { HWND::default() };
+                    let root = if !hit.is_invalid() {
+                        GetAncestor(hit, GA_ROOT)
+                    } else {
+                        HWND::default()
+                    };
+                    let hit_bucket = if !hit.is_invalid() {
+                        match_hwnd_in_slice(hit, root, &req.bucket_hwnds)
+                    } else {
+                        None
+                    };
+                    let hit_free = !hit.is_invalid()
+                        && req.free_desktop_hwnd != 0
+                        && (hit.0 as isize == req.free_desktop_hwnd
+                            || root.0 as isize == req.free_desktop_hwnd);
+                    let hit_native_desktop =
+                        !hit.is_invalid() && is_native_desktop_window(hit, root, pt);
+
+                    if !is_primary_mouse_down_async() {
+                        if let Some(target_hwnd) = hit_bucket {
+                            internal_outcome = Some(DragTargetOutcome::DroppedOnFence {
+                                target_hwnd,
+                                screen_x: pt.x,
+                                screen_y: pt.y,
+                            });
+                        } else if hit_free || hit_native_desktop {
+                            internal_outcome = Some(DragTargetOutcome::DroppedOnFreeDesktop {
+                                screen_x: pt.x,
+                                screen_y: pt.y,
+                            });
                         } else {
-                            DragTargetOutcome::Cancelled
+                            internal_outcome = Some(DragTargetOutcome::Cancelled);
+                        }
+                        break;
+                    }
+
+                    if !hit.is_invalid() && hit_bucket.is_none() && !hit_free && !hit_native_desktop
+                    {
+                        enter_external_ole = true;
+                        break;
+                    }
+                    std::thread::sleep(std::time::Duration::from_millis(12));
+                }
+
+                if let Some(done) = internal_outcome {
+                    done
+                } else if enter_external_ole {
+                    let ole_ok = OleInitialize(None).is_ok();
+                    let _ole_guard = OleGuard(ole_ok);
+                    let data_obj: IDataObject = FileDropDataObject::new(req.paths).into();
+                    let drop_kind = Arc::new(AtomicU8::new(ASYNC_DROP_NONE));
+                    let target_hwnd = Arc::new(AtomicIsize::new(0));
+                    let drop_x = Arc::new(AtomicI32::new(0));
+                    let drop_y = Arc::new(AtomicI32::new(0));
+                    let drop_src: IDropSource = AsyncDropSource {
+                        bucket_hwnds: req.bucket_hwnds,
+                        free_desktop_hwnd: req.free_desktop_hwnd,
+                        drop_kind: Arc::clone(&drop_kind),
+                        target_hwnd: Arc::clone(&target_hwnd),
+                        drop_x: Arc::clone(&drop_x),
+                        drop_y: Arc::clone(&drop_y),
+                    }
+                    .into();
+                    let mut effect = DROPEFFECT(0);
+                    let ok_effects = if req.is_desktop_resident {
+                        DROPEFFECT_COPY | DROPEFFECT_MOVE | DROPEFFECT_LINK
+                    } else {
+                        DROPEFFECT_COPY | DROPEFFECT_LINK
+                    };
+                    let hr = DoDragDrop(&data_obj, &drop_src, ok_effects, &mut effect);
+                    match drop_kind.load(Ordering::Acquire) {
+                        ASYNC_DROP_FENCE => DragTargetOutcome::DroppedOnFence {
+                            target_hwnd: target_hwnd.load(Ordering::Relaxed),
+                            screen_x: drop_x.load(Ordering::Relaxed),
+                            screen_y: drop_y.load(Ordering::Relaxed),
+                        },
+                        ASYNC_DROP_FREE_DESKTOP => DragTargetOutcome::DroppedOnFreeDesktop {
+                            screen_x: drop_x.load(Ordering::Relaxed),
+                            screen_y: drop_y.load(Ordering::Relaxed),
+                        },
+                        _ => {
+                            if hr == DRAGDROP_S_DROP {
+                                DragTargetOutcome::DroppedExternal {
+                                    moved: (effect.0 & DROPEFFECT_MOVE.0) != 0,
+                                }
+                            } else {
+                                DragTargetOutcome::Cancelled
+                            }
                         }
                     }
+                } else {
+                    DragTargetOutcome::Cancelled
                 }
             };
             let _ = tx.send(outcome);

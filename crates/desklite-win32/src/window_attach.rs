@@ -1040,6 +1040,12 @@ unsafe fn apply_transparent_canvas_chrome(hwnd: HWND, ex_extra: u32) {
             (&raw const no_border).cast(),
             size_of::<u32>() as u32,
         );
+    }
+}
+
+unsafe fn apply_glass_dwm_chrome(hwnd: HWND, ex_extra: u32) {
+    unsafe {
+        apply_transparent_canvas_chrome(hwnd, ex_extra);
 
         let margins = MARGINS {
             cxLeftWidth: -1,
@@ -1048,12 +1054,6 @@ unsafe fn apply_transparent_canvas_chrome(hwnd: HWND, ex_extra: u32) {
             cyBottomHeight: -1,
         };
         let _ = DwmExtendFrameIntoClientArea(hwnd, &margins);
-    }
-}
-
-unsafe fn apply_glass_dwm_chrome(hwnd: HWND, ex_extra: u32) {
-    unsafe {
-        apply_transparent_canvas_chrome(hwnd, ex_extra);
 
         let dark: BOOL = true.into();
         let _ = DwmSetWindowAttribute(

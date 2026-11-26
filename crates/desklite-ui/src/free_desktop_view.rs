@@ -483,8 +483,17 @@ pub fn render_free_desktop_viewport(
             .free_rename_prompt
             .as_ref()
             .map(|r| r.original_path.clone());
+        let has_unfiled_fence = guard
+            .config
+            .unfiled_desktop_fence_id(&guard.desktop_dirs)
+            .is_some();
+        let visible_free_icons = if has_unfiled_fence || guard.config.hide_all_fences {
+            Vec::new()
+        } else {
+            guard.config.active_free_icons().to_vec()
+        };
         (
-            guard.config.active_free_icons().to_vec(),
+            visible_free_icons,
             cw,
             ch,
             guard.topology.monitors().to_vec(),
