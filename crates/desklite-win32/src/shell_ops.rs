@@ -1,4 +1,5 @@
 use std::path::{Path, PathBuf};
+use std::sync::OnceLock;
 
 use desklite_core::{FenceItem, ItemKind};
 use windows::Win32::Foundation::HWND;
@@ -7,11 +8,11 @@ use windows::Win32::Storage::FileSystem::{
 };
 use windows::Win32::System::Com::{CLSCTX_INPROC_SERVER, CoCreateInstance, CoTaskMemFree};
 use windows::Win32::UI::Shell::{
-    FO_DELETE, FOF_ALLOWUNDO, FOLDERID_Desktop, FOLDERID_PublicDesktop, FOS_FORCEFILESYSTEM,
-    FOS_PICKFOLDERS, FileOpenDialog, IFileOpenDialog, KNOWN_FOLDER_FLAG, SEE_MASK_INVOKEIDLIST,
-    SHCNE_UPDATEDIR, SHCNF_PATHW, SHChangeNotify, SHELLEXECUTEINFOW, SHFILEINFOW, SHFILEOPSTRUCTW,
-    SHFileOperationW, SHGFI_DISPLAYNAME, SHGetFileInfoW, SHGetKnownFolderPath, SIGDN_FILESYSPATH,
-    ShellExecuteExW, ShellExecuteW,
+    FO_DELETE, FOF_ALLOWUNDO, FOF_NOERRORUI, FOLDERID_Desktop, FOLDERID_PublicDesktop,
+    FOS_FORCEFILESYSTEM, FOS_PICKFOLDERS, FileOpenDialog, IFileOpenDialog, KNOWN_FOLDER_FLAG,
+    SEE_MASK_INVOKEIDLIST, SHCNE_UPDATEDIR, SHCNF_PATHW, SHChangeNotify, SHELLEXECUTEINFOW,
+    SHFILEINFOW, SHFILEOPSTRUCTW, SHFileOperationW, SHGFI_DISPLAYNAME, SHGetFileInfoW,
+    SHGetKnownFolderPath, SIGDN_FILESYSPATH, ShellExecuteExW, ShellExecuteW,
 };
 use windows::Win32::UI::WindowsAndMessaging::SW_SHOWNORMAL;
 use windows::core::{GUID, HSTRING, PCWSTR, w};
@@ -181,23 +182,42 @@ fn query_known_folder(id: &GUID) -> Option<PathBuf> {
     }
 }
 
+static USER_DESKTOP_CACHE: OnceLock<Option<PathBuf>> = OnceLock::new();
+static ALL_DESKTOP_DIRS_CACHE: OnceLock<Vec<PathBuf>> = OnceLock::new();
+static ALL_DESKTOP_KEYS_CACHE: OnceLock<Vec<String>> = OnceLock::new();
+
 pub fn user_desktop_dir() -> Option<PathBuf> {
-    query_known_folder(&FOLDERID_Desktop)
+    USER_DESKTOP_CACHE
+        .get_or_init(|| query_known_folder(&FOLDERID_Desktop))
+        .clone()
 }
 
 pub fn all_desktop_dirs() -> Vec<PathBuf> {
-    let mut dirs = Vec::new();
-    if let Some(ud) = query_known_folder(&FOLDERID_Desktop) {
-        dirs.push(ud);
-    }
-    if let Some(pd) = query_known_folder(&FOLDERID_PublicDesktop)
-        && !dirs
+    ALL_DESKTOP_DIRS_CACHE
+        .get_or_init(|| {
+            let mut dirs = Vec::new();
+            if let Some(ud) = user_desktop_dir() {
+                dirs.push(ud);
+            }
+            if let Some(pd) = query_known_folder(&FOLDERID_PublicDesktop)
+                && !dirs
+                    .iter()
+                    .any(|d| normalize_path_key(d) == normalize_path_key(&pd))
+            {
+                dirs.push(pd);
+            }
+            dirs
+        })
+        .clone()
+}
+
+fn all_desktop_keys() -> &'static [String] {
+    ALL_DESKTOP_KEYS_CACHE.get_or_init(|| {
+        all_desktop_dirs()
             .iter()
-            .any(|d| normalize_path_key(d) == normalize_path_key(&pd))
-    {
-        dirs.push(pd);
-    }
-    dirs
+            .map(|d| normalize_path_key(d))
+            .collect()
+    })
 }
 
 pub fn desktop_vault_dir() -> PathBuf {
@@ -217,22 +237,16 @@ pub fn is_vault_path(path: &Path) -> bool {
     cand == vault || cand.starts_with(&format!("{vault}\\"))
 }
 
+pub fn is_desktop_dir_path(path: &Path) -> bool {
+    let key = normalize_path_key(path);
+    all_desktop_keys().iter().any(|k| k == &key)
+}
+
 pub fn is_directly_on_desktop(path: &Path) -> bool {
     let Some(parent) = path.parent() else {
         return false;
     };
-    let pkey = normalize_path_key(parent);
-    if let Some(ud) = query_known_folder(&FOLDERID_Desktop)
-        && pkey == normalize_path_key(&ud)
-    {
-        return true;
-    }
-    if let Some(pd) = query_known_folder(&FOLDERID_PublicDesktop)
-        && pkey == normalize_path_key(&pd)
-    {
-        return true;
-    }
-    false
+    is_desktop_dir_path(parent)
 }
 
 fn unique_dest_path(dir: &Path, file_name: &std::ffi::OsStr) -> PathBuf {
@@ -266,15 +280,28 @@ fn unique_dest_path(dir: &Path, file_name: &std::ffi::OsStr) -> PathBuf {
     ))
 }
 
-fn is_desktop_directory(dir: &Path) -> bool {
-    let key = normalize_path_key(dir);
-    all_desktop_dirs()
-        .into_iter()
-        .any(|d| normalize_path_key(&d) == key)
+fn io_error_to_win32_code(err: &std::io::Error) -> u32 {
+    if let Some(raw) = err.raw_os_error() {
+        return raw as u32;
+    }
+    match err.kind() {
+        std::io::ErrorKind::NotFound => 2,
+        std::io::ErrorKind::PermissionDenied => 5,
+        std::io::ErrorKind::InvalidInput => 87,
+        std::io::ErrorKind::AlreadyExists => 183,
+        std::io::ErrorKind::Unsupported => 50,
+        _ => 1,
+    }
+}
+
+fn is_same_or_descendant(parent: &Path, candidate: &Path) -> bool {
+    let pkey = normalize_path_key(parent);
+    let ckey = normalize_path_key(candidate);
+    ckey == pkey || ckey.starts_with(&format!("{pkey}\\"))
 }
 
 fn notify_shell_dir_updated(dir: &Path) {
-    if is_desktop_directory(dir) {
+    if is_desktop_dir_path(dir) {
         // Never send SHCNE_UPDATEDIR on Desktop: Explorer's CDefView rebuilds the entire
         // ListView and un-hides every managed DeskLite icon on the Desktop.
         return;
@@ -291,6 +318,12 @@ fn notify_shell_dir_updated(dir: &Path) {
 }
 
 fn copy_dir_recursive(src: &Path, dst: &Path) -> std::io::Result<()> {
+    if is_same_or_descendant(src, dst) {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "cannot copy directory into itself",
+        ));
+    }
     std::fs::create_dir_all(dst)?;
     for entry in std::fs::read_dir(src)? {
         let entry = entry?;
@@ -312,6 +345,12 @@ fn copy_dir_recursive(src: &Path, dst: &Path) -> std::io::Result<()> {
 }
 
 fn move_path_cross_volume(src: &Path, dst: &Path) -> std::io::Result<()> {
+    if is_same_or_descendant(src, dst) {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "cannot move directory into itself",
+        ));
+    }
     match std::fs::rename(src, dst) {
         Ok(()) => Ok(()),
         Err(err) => {
@@ -335,7 +374,14 @@ fn move_path_cross_volume(src: &Path, dst: &Path) -> std::io::Result<()> {
                         MOVEFILE_COPY_ALLOWED | MOVEFILE_WRITE_THROUGH,
                     )
                 }
-                .map_err(|_| err)
+                .map_err(|e| {
+                    let code = e.code().0 as u32 & 0xFFFF;
+                    if code != 0 {
+                        std::io::Error::from_raw_os_error(code as i32)
+                    } else {
+                        std::io::Error::last_os_error()
+                    }
+                })
             }
         }
     }
@@ -387,6 +433,9 @@ pub fn show_file_properties(path: &str) -> Result<(), Win32Error> {
 pub fn rename_file_in_place(old_path: &Path, new_name: &str) -> Result<FenceItem, Win32Error> {
     let trimmed = new_name.trim();
     if trimmed.is_empty()
+        || trimmed == "."
+        || trimmed == ".."
+        || trimmed.ends_with('.')
         || trimmed.contains(['\\', '/', ':', '*', '?', '"', '<', '>', '|'])
     {
         return Err(Win32Error::Status {
@@ -408,9 +457,9 @@ pub fn rename_file_in_place(old_path: &Path, new_name: &str) -> Result<FenceItem
             code: 183,
         });
     }
-    std::fs::rename(old_path, &new_path).map_err(|_| Win32Error::Status {
+    std::fs::rename(old_path, &new_path).map_err(|e| Win32Error::Status {
         op: "fs::rename",
-        code: std::io::Error::last_os_error().raw_os_error().unwrap_or(1) as u32,
+        code: io_error_to_win32_code(&e),
     })?;
     notify_shell_dir_updated(parent);
     Ok(resolve_dropped_item(&new_path, 0))
@@ -432,9 +481,9 @@ pub fn move_path_in_place(src: &Path, dst: &Path) -> Result<(), Win32Error> {
             code: 183,
         });
     }
-    move_path_cross_volume(src, dst).map_err(|_| Win32Error::Status {
+    move_path_cross_volume(src, dst).map_err(|e| Win32Error::Status {
         op: "move_path_in_place",
-        code: std::io::Error::last_os_error().raw_os_error().unwrap_or(1) as u32,
+        code: io_error_to_win32_code(&e),
     })?;
     if let Some(sp) = src.parent() {
         notify_shell_dir_updated(sp);
@@ -451,9 +500,13 @@ pub fn paste_files_to_directory_detailed(
     is_cut: bool,
 ) -> Result<Vec<(PathBuf, PathBuf)>, Win32Error> {
     if !target_dir.is_dir() {
-        return Ok(Vec::new());
+        return Err(Win32Error::Status {
+            op: "paste_files_to_directory_detailed(not_a_dir)",
+            code: 3,
+        });
     }
     let mut pairs = Vec::new();
+    let mut last_err: Option<Win32Error> = None;
     for raw in sources {
         let src = Path::new(raw);
         if !src.exists() {
@@ -465,6 +518,13 @@ pub fn paste_files_to_directory_detailed(
         if is_cut && src.parent().is_some_and(|p| normalize_path_key(p) == normalize_path_key(target_dir)) {
             continue;
         }
+        if src.is_dir() && is_same_or_descendant(src, target_dir) {
+            last_err = Some(Win32Error::Status {
+                op: "paste_files_to_directory_detailed(self_descendant)",
+                code: 87,
+            });
+            continue;
+        }
         let dst = unique_dest_path(target_dir, fname);
         let res = if is_cut {
             move_path_cross_volume(src, &dst)
@@ -473,12 +533,20 @@ pub fn paste_files_to_directory_detailed(
         } else {
             std::fs::copy(src, &dst).map(|_| ())
         };
-        if res.is_ok() {
-            pairs.push((src.to_path_buf(), dst));
+        match res {
+            Ok(()) => pairs.push((src.to_path_buf(), dst)),
+            Err(e) => {
+                last_err = Some(Win32Error::Status {
+                    op: if is_cut { "paste_move" } else { "paste_copy" },
+                    code: io_error_to_win32_code(&e),
+                });
+            }
         }
     }
     if !pairs.is_empty() {
         notify_shell_dir_updated(target_dir);
+    } else if let Some(err) = last_err {
+        return Err(err);
     }
     Ok(pairs)
 }
@@ -497,10 +565,10 @@ pub fn paste_files_to_directory(
 /// Sends `paths` to the Windows Recycle Bin (`SHFileOperationW` with `FO_DELETE | FOF_ALLOWUNDO`).
 /// Returns `Ok(true)` if executed without user abort.
 pub fn trash_files(paths: &[String]) -> Result<bool, Win32Error> {
-    let valid: Vec<&str> = paths
+    let valid: Vec<String> = paths
         .iter()
-        .map(String::as_str)
-        .filter(|p| !p.is_empty() && Path::new(p).exists())
+        .map(|s| s.trim_end_matches(['\\', '/']).to_string())
+        .filter(|p| !p.is_empty() && Path::new(p.as_str()).exists())
         .collect();
     if valid.is_empty() {
         return Ok(false);
@@ -515,11 +583,11 @@ pub fn trash_files(paths: &[String]) -> Result<bool, Win32Error> {
     let mut op = SHFILEOPSTRUCTW {
         wFunc: FO_DELETE,
         pFrom: PCWSTR(double_null.as_ptr()),
-        fFlags: FOF_ALLOWUNDO.0 as u16,
+        fFlags: (FOF_ALLOWUNDO | FOF_NOERRORUI).0 as u16,
         ..Default::default()
     };
     let rc = unsafe { SHFileOperationW(&mut op) };
-    if rc != 0 && op.fAnyOperationsAborted.as_bool() {
+    if op.fAnyOperationsAborted.as_bool() || rc == 1223 || rc == 0x75 {
         return Ok(false);
     }
     if rc != 0 {
@@ -528,5 +596,45 @@ pub fn trash_files(paths: &[String]) -> Result<bool, Win32Error> {
             code: rc as u32,
         });
     }
-    Ok(!op.fAnyOperationsAborted.as_bool())
+    Ok(true)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn is_same_or_descendant_handles_prefix_trap() {
+        assert!(is_same_or_descendant(
+            Path::new("C:\\Users\\Alice\\Folder"),
+            Path::new("C:\\Users\\Alice\\Folder")
+        ));
+        assert!(is_same_or_descendant(
+            Path::new("C:\\Users\\Alice\\Folder"),
+            Path::new("C:\\Users\\Alice\\Folder\\Sub\\a.txt")
+        ));
+        assert!(!is_same_or_descendant(
+            Path::new("C:\\Users\\Alice\\Folder"),
+            Path::new("C:\\Users\\Alice\\Folder2\\a.txt")
+        ));
+    }
+
+    #[test]
+    fn io_error_to_win32_code_maps_common_kinds() {
+        let e = std::io::Error::new(std::io::ErrorKind::Unsupported, "symlink");
+        assert_eq!(io_error_to_win32_code(&e), 50);
+        let e2 = std::io::Error::new(std::io::ErrorKind::InvalidInput, "self");
+        assert_eq!(io_error_to_win32_code(&e2), 87);
+    }
+
+    #[test]
+    fn desktop_dir_cache_matches_direct_children() {
+        if let Some(desktop) = user_desktop_dir() {
+            assert!(is_desktop_dir_path(&desktop));
+            let child = desktop.join("sample_test_item.txt");
+            assert!(is_directly_on_desktop(&child));
+            let nested = desktop.join("sub").join("sample_test_item.txt");
+            assert!(!is_directly_on_desktop(&nested));
+        }
+    }
 }

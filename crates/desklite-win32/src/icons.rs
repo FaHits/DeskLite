@@ -48,9 +48,28 @@ fn with_thread_wic<T>(f: impl FnOnce(&IWICImagingFactory) -> Option<T>) -> Optio
     })
 }
 
-#[derive(Default)]
+const DEFAULT_MAX_CACHE_ENTRIES: usize = 384;
+
+#[derive(Debug, Clone)]
+struct CacheEntry {
+    icon: DecodedIcon,
+    last_used: u64,
+}
+
 pub struct IconCache {
-    cache: HashMap<String, DecodedIcon>,
+    cache: HashMap<String, CacheEntry>,
+    max_entries: usize,
+    access_seq: u64,
+}
+
+impl Default for IconCache {
+    fn default() -> Self {
+        Self {
+            cache: HashMap::new(),
+            max_entries: DEFAULT_MAX_CACHE_ENTRIES,
+            access_seq: 0,
+        }
+    }
 }
 
 impl IconCache {
@@ -58,14 +77,74 @@ impl IconCache {
         Ok(Self::default())
     }
 
+    pub fn with_capacity(max_entries: usize) -> Result<Self, Win32Error> {
+        Ok(Self {
+            cache: HashMap::new(),
+            max_entries: max_entries.max(1),
+            access_seq: 0,
+        })
+    }
+
+    pub fn len(&self) -> usize {
+        self.cache.len()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.cache.is_empty()
+    }
+
+    pub fn clear(&mut self) {
+        self.cache.clear();
+    }
+
+    pub fn invalidate_path(&mut self, path: &Path) {
+        let raw = path.to_string_lossy();
+        let trimmed = raw.trim_end_matches(['\\', '/']).to_ascii_lowercase();
+        self.cache.remove(&trimmed);
+        let raw_lower = raw.to_ascii_lowercase();
+        if raw_lower != trimmed {
+            self.cache.remove(&raw_lower);
+        }
+    }
+
+    fn insert_lru(&mut self, key: String, icon: DecodedIcon) {
+        let max_entries = self.max_entries.max(1);
+        if !self.cache.contains_key(&key) {
+            while self.cache.len() >= max_entries {
+                let Some(oldest_key) = self
+                    .cache
+                    .iter()
+                    .min_by_key(|(_, entry)| entry.last_used)
+                    .map(|(k, _)| k.clone())
+                else {
+                    break;
+                };
+                self.cache.remove(&oldest_key);
+            }
+        }
+        self.access_seq = self.access_seq.wrapping_add(1);
+        let seq = self.access_seq;
+        self.cache.insert(
+            key,
+            CacheEntry {
+                icon,
+                last_used: seq,
+            },
+        );
+    }
+
     pub fn get_or_load(&mut self, path: &str) -> Option<&DecodedIcon> {
         let key = normalize_cache_key(path);
-        if !self.cache.contains_key(&key)
-            && let Some(decoded) = self.extract_icon(path)
-        {
-            self.cache.insert(key.clone(), decoded);
+        if !self.cache.contains_key(&key) {
+            let decoded = self.extract_icon(path)?;
+            self.insert_lru(key.clone(), decoded);
+            return self.cache.get(&key).map(|entry| &entry.icon);
         }
-        self.cache.get(&key)
+        self.access_seq = self.access_seq.wrapping_add(1);
+        let seq = self.access_seq;
+        let entry = self.cache.get_mut(&key)?;
+        entry.last_used = seq;
+        Some(&entry.icon)
     }
 
     fn extract_icon(&self, path: &str) -> Option<DecodedIcon> {
@@ -238,5 +317,46 @@ fn load_hicon_for_path(path: &str) -> Option<HICON> {
         } else {
             None
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn dummy_icon(tag: u8) -> DecodedIcon {
+        DecodedIcon {
+            width: 1,
+            height: 1,
+            pbgra: vec![tag, tag, tag, 255],
+        }
+    }
+
+    #[test]
+    fn icon_cache_lru_evicts_least_recently_used() {
+        let mut cache = IconCache::with_capacity(2).unwrap();
+        cache.insert_lru("a".to_string(), dummy_icon(1));
+        cache.insert_lru("b".to_string(), dummy_icon(2));
+        // Touch "a" so "b" becomes LRU.
+        assert!(cache.cache.contains_key("a"));
+        cache.access_seq += 1;
+        cache.cache.get_mut("a").unwrap().last_used = cache.access_seq;
+
+        cache.insert_lru("c".to_string(), dummy_icon(3));
+        assert_eq!(cache.len(), 2);
+        assert!(cache.cache.contains_key("a"));
+        assert!(!cache.cache.contains_key("b"));
+        assert!(cache.cache.contains_key("c"));
+    }
+
+    #[test]
+    fn icon_cache_invalidate_path_removes_exact_entry() {
+        let mut cache = IconCache::with_capacity(4).unwrap();
+        cache.insert_lru("c:\\users\\test\\desktop\\foo.txt".to_string(), dummy_icon(1));
+        cache.insert_lru("ext:.txt".to_string(), dummy_icon(2));
+
+        cache.invalidate_path(Path::new("C:\\Users\\Test\\Desktop\\foo.txt"));
+        assert!(!cache.cache.contains_key("c:\\users\\test\\desktop\\foo.txt"));
+        assert!(cache.cache.contains_key("ext:.txt"));
     }
 }

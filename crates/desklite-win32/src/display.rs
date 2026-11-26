@@ -8,7 +8,7 @@ use windows::Win32::Devices::Display::{
     DISPLAYCONFIG_SOURCE_DEVICE_NAME, DISPLAYCONFIG_TARGET_DEVICE_NAME, DisplayConfigGetDeviceInfo,
     GetDisplayConfigBufferSizes, QDC_ONLY_ACTIVE_PATHS, QDC_VIRTUAL_MODE_AWARE, QueryDisplayConfig,
 };
-use windows::Win32::Foundation::{ERROR_SUCCESS, LPARAM, RECT, TRUE};
+use windows::Win32::Foundation::{ERROR_INSUFFICIENT_BUFFER, ERROR_SUCCESS, LPARAM, RECT, TRUE};
 use windows::Win32::Graphics::Gdi::{
     EnumDisplayMonitors, GetMonitorInfoW, HDC, HMONITOR, MONITORINFOEXW,
 };
@@ -30,32 +30,43 @@ fn utf16_z_to_string(buf: &[u16]) -> String {
 }
 
 fn query_ccd_device_map() -> HashMap<String, CcdTargetInfo> {
-    let mut map = HashMap::new();
+    let mut grouped: HashMap<String, Vec<CcdTargetInfo>> = HashMap::new();
     let flags = QDC_ONLY_ACTIVE_PATHS | QDC_VIRTUAL_MODE_AWARE;
-    let mut num_paths = 0u32;
-    let mut num_modes = 0u32;
+    let mut paths: Vec<DISPLAYCONFIG_PATH_INFO> = Vec::new();
+    let mut queried_ok = false;
 
-    let rc = unsafe { GetDisplayConfigBufferSizes(flags, &mut num_paths, &mut num_modes) };
-    if rc != ERROR_SUCCESS || num_paths == 0 {
-        return map;
-    }
+    for _attempt in 0..5 {
+        let mut num_paths = 0u32;
+        let mut num_modes = 0u32;
+        let rc = unsafe { GetDisplayConfigBufferSizes(flags, &mut num_paths, &mut num_modes) };
+        if rc != ERROR_SUCCESS || num_paths == 0 {
+            return HashMap::new();
+        }
 
-    let mut paths = vec![DISPLAYCONFIG_PATH_INFO::default(); num_paths as usize];
-    let mut modes = vec![DISPLAYCONFIG_MODE_INFO::default(); num_modes as usize];
-    let rc = unsafe {
-        QueryDisplayConfig(
-            flags,
-            &mut num_paths,
-            paths.as_mut_ptr(),
-            &mut num_modes,
-            modes.as_mut_ptr(),
-            None,
-        )
-    };
-    if rc != ERROR_SUCCESS {
-        return map;
+        paths.resize(num_paths as usize, DISPLAYCONFIG_PATH_INFO::default());
+        let mut modes = vec![DISPLAYCONFIG_MODE_INFO::default(); num_modes as usize];
+        let rc = unsafe {
+            QueryDisplayConfig(
+                flags,
+                &mut num_paths,
+                paths.as_mut_ptr(),
+                &mut num_modes,
+                modes.as_mut_ptr(),
+                None,
+            )
+        };
+        if rc == ERROR_SUCCESS {
+            paths.truncate(num_paths as usize);
+            queried_ok = true;
+            break;
+        }
+        if rc != ERROR_INSUFFICIENT_BUFFER {
+            return HashMap::new();
+        }
     }
-    paths.truncate(num_paths as usize);
+    if !queried_ok {
+        return HashMap::new();
+    }
 
     for path in &paths {
         let mut src = DISPLAYCONFIG_SOURCE_DEVICE_NAME {
@@ -108,16 +119,40 @@ fn query_ccd_device_map() -> HashMap<String, CcdTargetInfo> {
             )
         };
 
-        map.insert(
-            gdi_name,
-            CcdTargetInfo {
+        let entries = grouped.entry(gdi_name).or_default();
+        if !entries.iter().any(|e| e.device_path == device_path) {
+            entries.push(CcdTargetInfo {
                 device_path,
                 friendly_name,
-            },
-        );
+            });
+        }
     }
 
-    map
+    grouped
+        .into_iter()
+        .map(|(gdi_name, mut targets)| {
+            targets.sort_by(|a, b| a.device_path.cmp(&b.device_path));
+            let merged = if targets.len() == 1 {
+                targets.into_iter().next().unwrap()
+            } else {
+                let device_path = targets
+                    .iter()
+                    .map(|t| t.device_path.as_str())
+                    .collect::<Vec<_>>()
+                    .join("|");
+                let friendly_name = targets
+                    .iter()
+                    .map(|t| t.friendly_name.as_str())
+                    .collect::<Vec<_>>()
+                    .join(" + ");
+                CcdTargetInfo {
+                    device_path,
+                    friendly_name,
+                }
+            };
+            (gdi_name, merged)
+        })
+        .collect()
 }
 
 struct EnumState {

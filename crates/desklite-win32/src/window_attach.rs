@@ -1,6 +1,6 @@
 use std::collections::{HashMap, HashSet};
 use std::mem::size_of;
-use std::sync::{Mutex, OnceLock};
+use std::sync::{Mutex, MutexGuard, OnceLock};
 
 use windows::Win32::Foundation::{HWND, LPARAM, LRESULT, POINT, RECT, WPARAM};
 use windows::Win32::Graphics::Dwm::{
@@ -31,10 +31,11 @@ use windows::Win32::UI::WindowsAndMessaging::{
     HWND_TOP, IsIconic, IsWindow, IsWindowVisible, PostMessageW, SC_MAXIMIZE, SC_MINIMIZE,
     SC_RESTORE, STYLESTRUCT, SWP_FRAMECHANGED, SWP_NOACTIVATE, SWP_NOMOVE, SWP_NOSIZE,
     SWP_NOZORDER, SetForegroundWindow, SetWindowLongPtrW, SetWindowPos, WINDOWPOS,
-    WINEVENT_OUTOFCONTEXT, WINEVENT_SKIPOWNPROCESS, WM_APP, WM_ENTERSIZEMOVE, WM_ERASEBKGND,
-    WM_EXITSIZEMOVE, WM_KEYDOWN, WM_LBUTTONDOWN, WM_MOVING, WM_NCACTIVATE, WM_NCCALCSIZE,
-    WM_NCDESTROY, WM_NCHITTEST, WM_NCPAINT, WM_RBUTTONDOWN, WM_SIZING, WM_STYLECHANGING,
-    WM_SYSCOMMAND, WM_WINDOWPOSCHANGING, WNDPROC, WS_BORDER, WS_CAPTION, WS_DLGFRAME,
+    WINEVENT_OUTOFCONTEXT, WINEVENT_SKIPOWNPROCESS, WM_APP, WM_CANCELMODE, WM_CAPTURECHANGED,
+    WM_ENTERSIZEMOVE, WM_ERASEBKGND, WM_EXITSIZEMOVE, WM_KEYDOWN, WM_LBUTTONDOWN, WM_MOVING,
+    WM_NCACTIVATE, WM_NCCALCSIZE, WM_NCDESTROY, WM_NCHITTEST, WM_NCPAINT, WM_RBUTTONDOWN,
+    WM_SIZING, WM_STYLECHANGING, WM_SYSCOMMAND, WM_WINDOWPOSCHANGING, WNDPROC, WS_BORDER,
+    WS_CAPTION, WS_DLGFRAME,
     WS_EX_APPWINDOW, WS_EX_CLIENTEDGE, WS_EX_DLGMODALFRAME, WS_EX_TOOLWINDOW, WS_EX_TOPMOST,
     WS_EX_WINDOWEDGE, WS_MAXIMIZE, WS_MAXIMIZEBOX, WS_MINIMIZE, WS_MINIMIZEBOX, WS_POPUP,
     WS_SYSMENU,
@@ -56,10 +57,15 @@ const DISALLOWED_EX_STYLES: u32 =
     WS_EX_APPWINDOW.0 | WS_EX_WINDOWEDGE.0 | WS_EX_DLGMODALFRAME.0 | WS_EX_CLIENTEDGE.0;
 
 static IN_SIZE_MOVE_HWND: std::sync::atomic::AtomicIsize = std::sync::atomic::AtomicIsize::new(0);
+static FREE_DESKTOP_HWND: std::sync::atomic::AtomicIsize = std::sync::atomic::AtomicIsize::new(0);
 static DEFERRED_Z_AFTER_SIZEMOVE: std::sync::atomic::AtomicBool =
     std::sync::atomic::AtomicBool::new(false);
 static LAST_SELF_Z_MS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 static START_MONO: OnceLock<std::time::Instant> = OnceLock::new();
+
+fn lock_unpoisoned<T>(m: &Mutex<T>) -> MutexGuard<'_, T> {
+    m.lock().unwrap_or_else(|e| e.into_inner())
+}
 
 fn mono_ms() -> u64 {
     START_MONO
@@ -68,8 +74,38 @@ fn mono_ms() -> u64 {
         .as_millis() as u64
 }
 
+pub fn free_desktop_hwnd() -> isize {
+    FREE_DESKTOP_HWND.load(std::sync::atomic::Ordering::Acquire)
+}
+
+pub fn is_free_desktop_hwnd(raw_hwnd: isize) -> bool {
+    raw_hwnd != 0 && free_desktop_hwnd() == raw_hwnd
+}
+
 pub fn is_in_size_move() -> bool {
-    IN_SIZE_MOVE_HWND.load(std::sync::atomic::Ordering::Acquire) != 0
+    let raw = IN_SIZE_MOVE_HWND.load(std::sync::atomic::Ordering::Acquire);
+    if raw == 0 {
+        return false;
+    }
+    let alive = unsafe { IsWindow(Some(HWND(raw as *mut _))).as_bool() };
+    if !alive || !is_primary_mouse_down() {
+        if IN_SIZE_MOVE_HWND
+            .compare_exchange(
+                raw,
+                0,
+                std::sync::atomic::Ordering::SeqCst,
+                std::sync::atomic::Ordering::Relaxed,
+            )
+            .is_ok()
+        {
+            let mut active = lock_unpoisoned(active_sizemove_rect());
+            if active.is_some_and(|(h, _)| h == raw) {
+                *active = None;
+            }
+        }
+        return false;
+    }
+    true
 }
 
 pub fn cursor_screen_pos() -> Option<(i32, i32)> {
@@ -200,9 +236,7 @@ pub fn live_sizemove_rect_for_hwnd(raw_hwnd: isize) -> Option<(i32, i32, i32, i3
     if raw_hwnd == 0 {
         return None;
     }
-    active_sizemove_rect()
-        .lock()
-        .unwrap()
+    (*lock_unpoisoned(active_sizemove_rect()))
         .filter(|(h, _)| *h == raw_hwnd)
         .map(|(_, r)| r)
 }
@@ -219,7 +253,7 @@ pub fn set_hwnd_locked(raw_hwnd: isize, locked: bool) {
     if raw_hwnd == 0 {
         return;
     }
-    let mut set = locked_hwnds().lock().unwrap();
+    let mut set = lock_unpoisoned(locked_hwnds());
     if locked {
         set.insert(raw_hwnd);
     } else {
@@ -228,14 +262,14 @@ pub fn set_hwnd_locked(raw_hwnd: isize, locked: bool) {
 }
 
 fn is_hwnd_locked(hwnd: HWND) -> bool {
-    locked_hwnds().lock().unwrap().contains(&(hwnd.0 as isize))
+    lock_unpoisoned(locked_hwnds()).contains(&(hwnd.0 as isize))
 }
 
 pub fn take_win32_hotkeys(raw_hwnd: isize) -> Vec<Win32Hotkey> {
     if raw_hwnd == 0 {
         return Vec::new();
     }
-    let mut queue = pending_hotkeys().lock().unwrap();
+    let mut queue = lock_unpoisoned(pending_hotkeys());
     let mut out = Vec::new();
     let mut remaining = Vec::with_capacity(queue.len());
     for (h, hk) in queue.drain(..) {
@@ -291,6 +325,28 @@ fn orig_procs() -> &'static Mutex<HashMap<isize, SubclassEntry>> {
     ORIG_WNDPROCS.get_or_init(|| Mutex::new(HashMap::new()))
 }
 
+fn snapshot_fence_hwnd_set() -> HashSet<isize> {
+    let mut set: HashSet<isize> = lock_unpoisoned(orig_procs()).keys().copied().collect();
+    let free = free_desktop_hwnd();
+    if free != 0 {
+        set.insert(free);
+    }
+    set
+}
+
+pub fn all_fence_hwnds() -> Vec<isize> {
+    snapshot_fence_hwnd_set().into_iter().collect()
+}
+
+pub fn all_bucket_fence_hwnds() -> Vec<isize> {
+    let free = free_desktop_hwnd();
+    lock_unpoisoned(orig_procs())
+        .keys()
+        .copied()
+        .filter(|&h| h != 0 && h != free)
+        .collect()
+}
+
 unsafe fn is_desktop_shell_class(hwnd: HWND) -> bool {
     let mut buf = [0u16; 48];
     let len = unsafe { GetClassNameW(hwnd, &mut buf) } as usize;
@@ -312,22 +368,22 @@ unsafe fn is_window_cloaked(hwnd: HWND) -> bool {
 }
 
 unsafe fn resolve_live_owner(owner_hwnd: isize) -> isize {
+    if let Some(tree) = probe_desktop_window_tree() {
+        return tree.worker_w.unwrap_or(tree.progman).0 as isize;
+    }
     if owner_hwnd != 0 && unsafe { IsWindow(Some(HWND(owner_hwnd as *mut _))).as_bool() } {
         return owner_hwnd;
     }
-    probe_desktop_window_tree()
-        .map(|t| t.worker_w.unwrap_or(t.progman).0 as isize)
-        .unwrap_or(0)
+    0
 }
 
 /// Walks top-down from `GetTopWindow(None)` down to `owner_hwnd` and returns the
-/// `hwndInsertAfter` anchor right below every visible non-topmost app window (and
-/// right above `owner_hwnd`), or after the last topmost window if all apps are minimized
-/// (e.g. during `Win+D`).
+/// `hwndInsertAfter` anchor preserving strict layering:
+/// `visible app windows > DeskLite bucket fences > FreeDesktop canvas > WorkerW/Progman`.
 unsafe fn find_desktop_layer_anchor(
     self_hwnd: HWND,
     owner_hwnd: isize,
-    map: &HashMap<isize, SubclassEntry>,
+    fence_hwnds: &HashSet<isize>,
 ) -> HWND {
     let live_owner = unsafe { resolve_live_owner(owner_hwnd) };
     if live_owner == 0 {
@@ -339,15 +395,30 @@ unsafe fn find_desktop_layer_anchor(
         _ => return HWND_BOTTOM,
     };
 
+    let free_raw = free_desktop_hwnd();
+    let self_raw = self_hwnd.0 as isize;
+    let is_free = free_raw != 0 && self_raw == free_raw;
+
     let mut last_topmost: Option<HWND> = None;
     let mut last_visible_app: Option<HWND> = None;
+    let mut last_bucket_fence: Option<HWND> = None;
 
     for _ in 0..2048 {
         if cur == owner {
             break;
         }
         let raw = cur.0 as isize;
-        let is_ours = cur == self_hwnd || map.contains_key(&raw);
+        let is_ours = cur == self_hwnd
+            || fence_hwnds.contains(&raw)
+            || (free_raw != 0 && raw == free_raw);
+        if is_free
+            && cur != self_hwnd
+            && fence_hwnds.contains(&raw)
+            && raw != free_raw
+            && unsafe { IsWindowVisible(cur).as_bool() }
+        {
+            last_bucket_fence = Some(cur);
+        }
         if !is_ours && unsafe { IsWindowVisible(cur).as_bool() } && !unsafe { IsIconic(cur).as_bool() } {
             let ex = unsafe { GetWindowLongPtrW(cur, GWL_EXSTYLE) } as u32;
             if (ex & WS_EX_TOPMOST.0) != 0 {
@@ -368,23 +439,37 @@ unsafe fn find_desktop_layer_anchor(
         };
     }
 
-    last_visible_app
-        .or(last_topmost)
-        .unwrap_or(HWND_TOP)
+    if is_free {
+        last_bucket_fence
+            .or(last_visible_app)
+            .or(last_topmost)
+            .unwrap_or(HWND_TOP)
+    } else {
+        last_visible_app
+            .or(last_topmost)
+            .unwrap_or(HWND_TOP)
+    }
 }
 
 unsafe fn is_strictly_in_desktop_layer(
     hwnd: HWND,
     owner_hwnd: isize,
-    map: &HashMap<isize, SubclassEntry>,
+    fence_hwnds: &HashSet<isize>,
 ) -> bool {
     let live_owner = unsafe { resolve_live_owner(owner_hwnd) };
     if live_owner == 0 {
         return true;
     }
     let owner = HWND(live_owner as *mut _);
+    let free_raw = free_desktop_hwnd();
+    let self_raw = hwnd.0 as isize;
+    let is_free = free_raw != 0 && self_raw == free_raw;
+    let free_visible =
+        free_raw != 0 && unsafe { IsWindowVisible(HWND(free_raw as *mut _)).as_bool() };
+
     let mut cur = hwnd;
     let mut saw_owner = false;
+    let mut saw_free_below = false;
     for _ in 0..2048 {
         let Ok(next) = (unsafe { GetWindow(cur, GW_HWNDNEXT) }) else {
             return false;
@@ -396,7 +481,19 @@ unsafe fn is_strictly_in_desktop_layer(
             saw_owner = true;
             break;
         }
-        if !map.contains_key(&(next.0 as isize))
+        let next_raw = next.0 as isize;
+        if free_raw != 0 && next_raw == free_raw {
+            saw_free_below = true;
+        }
+        if is_free
+            && fence_hwnds.contains(&next_raw)
+            && next_raw != free_raw
+            && unsafe { IsWindowVisible(next).as_bool() }
+        {
+            return false;
+        }
+        if !fence_hwnds.contains(&next_raw)
+            && next_raw != free_raw
             && unsafe { IsWindowVisible(next).as_bool() }
             && !unsafe { IsIconic(next).as_bool() }
             && !unsafe { is_desktop_shell_class(next) }
@@ -412,7 +509,7 @@ unsafe fn is_strictly_in_desktop_layer(
         }
         cur = next;
     }
-    saw_owner
+    saw_owner && (is_free || !free_visible || saw_free_below)
 }
 
 pub struct DesktopZHookGuard(Vec<HWINEVENTHOOK>);
@@ -500,7 +597,7 @@ pub fn post_reassert_all_fences_z() {
         return;
     }
     let hwnds: Vec<isize> = {
-        let mut map = orig_procs().lock().unwrap();
+        let mut map = lock_unpoisoned(orig_procs());
         let mut out = Vec::with_capacity(map.len());
         for (&raw, entry) in map.iter_mut() {
             if raw != 0 && !entry.pending_z {
@@ -520,7 +617,7 @@ pub fn post_reassert_all_fences_z() {
             )
         };
         if ok.is_err()
-            && let Some(e) = orig_procs().lock().unwrap().get_mut(&raw)
+            && let Some(e) = lock_unpoisoned(orig_procs()).get_mut(&raw)
         {
             e.pending_z = false;
         }
@@ -637,10 +734,11 @@ unsafe extern "system" fn bottom_subclass_proc(
             return LRESULT(0);
         }
     }
-    if msg == WM_MOVING && lparam.0 != 0 {
+    let is_free = is_free_desktop_hwnd(hwnd.0 as isize);
+    if !is_free && msg == WM_MOVING && lparam.0 != 0 {
         let rect = unsafe { &mut *(lparam.0 as *mut RECT) };
         unsafe { clamp_rect_to_cursor_work_area(rect, true) };
-        *active_sizemove_rect().lock().unwrap() =
+        *lock_unpoisoned(active_sizemove_rect()) =
             Some((hwnd.0 as isize, (rect.left, rect.top, rect.right, rect.bottom)));
         let insp = INSPECTOR_HWND.load(std::sync::atomic::Ordering::Acquire);
         if insp != 0 {
@@ -655,10 +753,10 @@ unsafe extern "system" fn bottom_subclass_proc(
         }
         return LRESULT(1);
     }
-    if msg == WM_SIZING && lparam.0 != 0 {
+    if !is_free && msg == WM_SIZING && lparam.0 != 0 {
         let rect = unsafe { &mut *(lparam.0 as *mut RECT) };
         unsafe { clamp_rect_to_cursor_work_area(rect, false) };
-        *active_sizemove_rect().lock().unwrap() =
+        *lock_unpoisoned(active_sizemove_rect()) =
             Some((hwnd.0 as isize, (rect.left, rect.top, rect.right, rect.bottom)));
         let insp = INSPECTOR_HWND.load(std::sync::atomic::Ordering::Acquire);
         if insp != 0 {
@@ -673,22 +771,31 @@ unsafe extern "system" fn bottom_subclass_proc(
         }
         return LRESULT(1);
     }
-    if msg == WM_ENTERSIZEMOVE {
+    if !is_free && msg == WM_ENTERSIZEMOVE {
         IN_SIZE_MOVE_HWND.store(hwnd.0 as isize, std::sync::atomic::Ordering::Release);
     }
-    if msg == WM_EXITSIZEMOVE {
-        *active_sizemove_rect().lock().unwrap() = None;
-        let _ = IN_SIZE_MOVE_HWND.compare_exchange(
-            hwnd.0 as isize,
-            0,
-            std::sync::atomic::Ordering::SeqCst,
-            std::sync::atomic::Ordering::Relaxed,
-        );
-        if DEFERRED_Z_AFTER_SIZEMOVE.swap(false, std::sync::atomic::Ordering::SeqCst) {
+    if msg == WM_EXITSIZEMOVE || msg == WM_CAPTURECHANGED || msg == WM_CANCELMODE {
+        let raw = hwnd.0 as isize;
+        let mut active = lock_unpoisoned(active_sizemove_rect());
+        if active.is_some_and(|(h, _)| h == raw) {
+            *active = None;
+        }
+        drop(active);
+        if IN_SIZE_MOVE_HWND
+            .compare_exchange(
+                raw,
+                0,
+                std::sync::atomic::Ordering::SeqCst,
+                std::sync::atomic::Ordering::Relaxed,
+            )
+            .is_ok()
+            && DEFERRED_Z_AFTER_SIZEMOVE.swap(false, std::sync::atomic::Ordering::SeqCst)
+        {
             post_reassert_all_fences_z();
         }
     }
-    if msg == WM_NCHITTEST
+    if !is_free
+        && msg == WM_NCHITTEST
         && let Some(hit) = unsafe { hit_test_resize_border(hwnd, lparam) }
     {
         return hit;
@@ -704,7 +811,7 @@ unsafe extern "system" fn bottom_subclass_proc(
         && ACTIVE_TEXT_EDIT_HWND.load(std::sync::atomic::Ordering::Acquire) != (hwnd.0 as isize)
         && let Some(hk) = decode_ctrl_hotkey(wparam, lparam)
     {
-        pending_hotkeys().lock().unwrap().push((hwnd.0 as isize, hk));
+        lock_unpoisoned(pending_hotkeys()).push((hwnd.0 as isize, hk));
         unsafe {
             let _ = RedrawWindow(Some(hwnd), None, None, RDW_INVALIDATE | RDW_INTERNALPAINT);
         }
@@ -712,7 +819,7 @@ unsafe extern "system" fn bottom_subclass_proc(
     }
 
     let (entry, owner_hwnd) = {
-        let map = orig_procs().lock().unwrap();
+        let map = lock_unpoisoned(orig_procs());
         let entry = map.get(&(hwnd.0 as isize)).copied();
         let owner = entry.map(|e| e.owner_hwnd).unwrap_or(0);
         (entry, owner)
@@ -728,7 +835,7 @@ unsafe extern "system" fn bottom_subclass_proc(
     }
 
     if msg == WM_APP_ENSURE_DESKTOP_Z {
-        if let Some(e) = orig_procs().lock().unwrap().get_mut(&(hwnd.0 as isize)) {
+        if let Some(e) = lock_unpoisoned(orig_procs()).get_mut(&(hwnd.0 as isize)) {
             e.pending_z = false;
         }
         if is_in_size_move() {
@@ -739,15 +846,14 @@ unsafe extern "system" fn bottom_subclass_proc(
         if live_owner != 0 {
             if live_owner != owner_hwnd {
                 unsafe { SetWindowLongPtrW(hwnd, GWLP_HWNDPARENT, live_owner) };
-                if let Some(e) = orig_procs().lock().unwrap().get_mut(&(hwnd.0 as isize)) {
+                if let Some(e) = lock_unpoisoned(orig_procs()).get_mut(&(hwnd.0 as isize)) {
                     e.owner_hwnd = live_owner;
                 }
             }
-            let map = orig_procs().lock().unwrap();
-            let ok = unsafe { is_strictly_in_desktop_layer(hwnd, live_owner, &map) };
+            let fence_hwnds = snapshot_fence_hwnd_set();
+            let ok = unsafe { is_strictly_in_desktop_layer(hwnd, live_owner, &fence_hwnds) };
             if !ok {
-                let anchor = unsafe { find_desktop_layer_anchor(hwnd, live_owner, &map) };
-                drop(map);
+                let anchor = unsafe { find_desktop_layer_anchor(hwnd, live_owner, &fence_hwnds) };
                 if anchor != hwnd {
                     LAST_SELF_Z_MS.store(mono_ms(), std::sync::atomic::Ordering::Release);
                     let _ = unsafe {
@@ -776,14 +882,29 @@ unsafe extern "system" fn bottom_subclass_proc(
                 DEFERRED_Z_AFTER_SIZEMOVE.store(true, std::sync::atomic::Ordering::Release);
             } else {
                 let live_owner = unsafe { resolve_live_owner(owner_hwnd) };
-                let map = orig_procs().lock().unwrap();
-                let already_ok = unsafe { is_strictly_in_desktop_layer(hwnd, live_owner, &map) };
+                if live_owner != 0 && live_owner != owner_hwnd {
+                    if let Some(e) = lock_unpoisoned(orig_procs()).get_mut(&(hwnd.0 as isize)) {
+                        e.owner_hwnd = live_owner;
+                    }
+                    unsafe {
+                        let _ = PostMessageW(
+                            Some(hwnd),
+                            WM_APP_ENSURE_DESKTOP_Z,
+                            WPARAM(0),
+                            LPARAM(0),
+                        );
+                    }
+                }
+                let fence_hwnds = snapshot_fence_hwnd_set();
+                let already_ok =
+                    unsafe { is_strictly_in_desktop_layer(hwnd, live_owner, &fence_hwnds) };
                 if already_ok
                     && (wp.hwndInsertAfter.0.is_null() || wp.hwndInsertAfter == HWND_BOTTOM)
                 {
                     wp.flags |= SWP_NOZORDER;
                 } else {
-                    let anchor = unsafe { find_desktop_layer_anchor(hwnd, live_owner, &map) };
+                    let anchor =
+                        unsafe { find_desktop_layer_anchor(hwnd, live_owner, &fence_hwnds) };
                     if anchor != hwnd {
                         wp.hwndInsertAfter = anchor;
                     }
@@ -800,18 +921,27 @@ unsafe extern "system" fn bottom_subclass_proc(
             std::sync::atomic::Ordering::SeqCst,
             std::sync::atomic::Ordering::Relaxed,
         );
+        let _ = FREE_DESKTOP_HWND.compare_exchange(
+            raw,
+            0,
+            std::sync::atomic::Ordering::SeqCst,
+            std::sync::atomic::Ordering::Relaxed,
+        );
         let _ = ACTIVE_TEXT_EDIT_HWND.compare_exchange(
             raw,
             0,
             std::sync::atomic::Ordering::SeqCst,
             std::sync::atomic::Ordering::Relaxed,
         );
-        if live_sizemove_rect_for_hwnd(raw).is_some() {
-            *active_sizemove_rect().lock().unwrap() = None;
+        {
+            let mut active = lock_unpoisoned(active_sizemove_rect());
+            if active.is_some_and(|(h, _)| h == raw) {
+                *active = None;
+            }
         }
-        locked_hwnds().lock().unwrap().remove(&raw);
-        pending_hotkeys().lock().unwrap().retain(|(h, _)| *h != raw);
-        orig_procs().lock().unwrap().remove(&raw);
+        lock_unpoisoned(locked_hwnds()).remove(&raw);
+        lock_unpoisoned(pending_hotkeys()).retain(|(h, _)| *h != raw);
+        lock_unpoisoned(orig_procs()).remove(&raw);
     }
     if let Some(sub) = entry {
         let wndproc: WNDPROC = unsafe { std::mem::transmute(sub.orig_proc) };
@@ -881,7 +1011,7 @@ pub fn strip_alt_tab_from_host(raw_hwnd: isize) -> bool {
     }
 }
 
-unsafe fn apply_glass_dwm_chrome(hwnd: HWND, ex_extra: u32) {
+unsafe fn apply_transparent_canvas_chrome(hwnd: HWND, ex_extra: u32) {
     unsafe {
         let style = GetWindowLongPtrW(hwnd, GWL_STYLE) as u32;
         let clean_style = (style & !DISALLOWED_STYLES) | WS_POPUP.0;
@@ -918,6 +1048,12 @@ unsafe fn apply_glass_dwm_chrome(hwnd: HWND, ex_extra: u32) {
             cyBottomHeight: -1,
         };
         let _ = DwmExtendFrameIntoClientArea(hwnd, &margins);
+    }
+}
+
+unsafe fn apply_glass_dwm_chrome(hwnd: HWND, ex_extra: u32) {
+    unsafe {
+        apply_transparent_canvas_chrome(hwnd, ex_extra);
 
         let dark: BOOL = true.into();
         let _ = DwmSetWindowAttribute(
@@ -951,36 +1087,36 @@ unsafe fn apply_glass_dwm_chrome(hwnd: HWND, ex_extra: u32) {
 /// - Disables DWM border & transition animations (`DWMWA_COLOR_NONE`, `DWMWA_TRANSITIONS_FORCEDISABLED`)
 ///   so focus switches never flash a white border and `Win+D` stays flicker-free.
 /// - Attaches desktop owner (`WorkerW` / `Progman`) and subclasses Z-order to stay below all
-///   visible app windows yet strictly above `WorkerW`.
+///   visible app windows yet strictly above `FreeDesktop` and `WorkerW`.
 pub fn attach_desktop_owner_and_rounded_corners(raw_hwnd: isize) {
     if raw_hwnd == 0 {
         return;
     }
     let hwnd = HWND(raw_hwnd as *mut _);
     unsafe {
-        let owner_hwnd = if let Some(tree) = probe_desktop_window_tree() {
-            let owner = tree.worker_w.unwrap_or(tree.progman);
-            SetWindowLongPtrW(hwnd, GWLP_HWNDPARENT, owner.0 as isize);
-            owner.0 as isize
-        } else {
-            0
-        };
+        let owner_hwnd = resolve_live_owner(0);
+        if owner_hwnd != 0 {
+            SetWindowLongPtrW(hwnd, GWLP_HWNDPARENT, owner_hwnd);
+        }
 
         apply_glass_dwm_chrome(hwnd, 0);
 
-        let mut map = orig_procs().lock().unwrap();
-        if let std::collections::hash_map::Entry::Vacant(e) = map.entry(raw_hwnd) {
-            let prev = SetWindowLongPtrW(hwnd, GWLP_WNDPROC, bottom_subclass_proc as *const () as isize);
-            if prev != 0 {
-                e.insert(SubclassEntry {
-                    orig_proc: prev,
-                    owner_hwnd,
-                    pending_z: false,
-                });
+        {
+            let mut map = lock_unpoisoned(orig_procs());
+            if let std::collections::hash_map::Entry::Vacant(e) = map.entry(raw_hwnd) {
+                let prev =
+                    SetWindowLongPtrW(hwnd, GWLP_WNDPROC, bottom_subclass_proc as *const () as isize);
+                if prev != 0 {
+                    e.insert(SubclassEntry {
+                        orig_proc: prev,
+                        owner_hwnd,
+                        pending_z: false,
+                    });
+                }
             }
         }
-        let insert_after = find_desktop_layer_anchor(hwnd, owner_hwnd, &map);
-        drop(map);
+        let fence_hwnds = snapshot_fence_hwnd_set();
+        let insert_after = find_desktop_layer_anchor(hwnd, owner_hwnd, &fence_hwnds);
 
         let _ = SetWindowPos(
             hwnd,
@@ -992,6 +1128,52 @@ pub fn attach_desktop_owner_and_rounded_corners(raw_hwnd: isize) {
             SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE | SWP_FRAMECHANGED,
         );
     }
+}
+
+/// Configures the full-screen transparent `FreeDesktop` canvas `HWND` to sit strictly
+/// below all DeskLite bucket fences and visible app windows, yet above `WorkerW`/`Progman`.
+pub fn attach_free_desktop_canvas(raw_hwnd: isize) {
+    if raw_hwnd == 0 {
+        return;
+    }
+    FREE_DESKTOP_HWND.store(raw_hwnd, std::sync::atomic::Ordering::Release);
+    let hwnd = HWND(raw_hwnd as *mut _);
+    unsafe {
+        let owner_hwnd = resolve_live_owner(0);
+        if owner_hwnd != 0 {
+            SetWindowLongPtrW(hwnd, GWLP_HWNDPARENT, owner_hwnd);
+        }
+
+        apply_transparent_canvas_chrome(hwnd, 0);
+
+        {
+            let mut map = lock_unpoisoned(orig_procs());
+            if let std::collections::hash_map::Entry::Vacant(e) = map.entry(raw_hwnd) {
+                let prev =
+                    SetWindowLongPtrW(hwnd, GWLP_WNDPROC, bottom_subclass_proc as *const () as isize);
+                if prev != 0 {
+                    e.insert(SubclassEntry {
+                        orig_proc: prev,
+                        owner_hwnd,
+                        pending_z: false,
+                    });
+                }
+            }
+        }
+        let fence_hwnds = snapshot_fence_hwnd_set();
+        let insert_after = find_desktop_layer_anchor(hwnd, owner_hwnd, &fence_hwnds);
+
+        let _ = SetWindowPos(
+            hwnd,
+            Some(insert_after),
+            0,
+            0,
+            0,
+            0,
+            SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE | SWP_FRAMECHANGED,
+        );
+    }
+    post_reassert_all_fences_z();
 }
 
 static INSPECTOR_ORIG_PROCS: OnceLock<Mutex<HashMap<isize, isize>>> = OnceLock::new();
@@ -1034,9 +1216,7 @@ unsafe extern "system" fn inspector_subclass_proc(
     {
         return hit;
     }
-    let orig = inspector_orig_procs()
-        .lock()
-        .unwrap()
+    let orig = lock_unpoisoned(inspector_orig_procs())
         .get(&(hwnd.0 as isize))
         .copied();
     if msg == WM_NCACTIVATE
@@ -1053,7 +1233,7 @@ unsafe extern "system" fn inspector_subclass_proc(
             std::sync::atomic::Ordering::SeqCst,
             std::sync::atomic::Ordering::Relaxed,
         );
-        inspector_orig_procs().lock().unwrap().remove(&raw);
+        lock_unpoisoned(inspector_orig_procs()).remove(&raw);
     }
     if let Some(prev) = orig {
         let wndproc: WNDPROC = unsafe { std::mem::transmute(prev) };
@@ -1072,7 +1252,7 @@ pub fn style_floating_inspector_window(raw_hwnd: isize) {
     let hwnd = HWND(raw_hwnd as *mut _);
     unsafe {
         apply_glass_dwm_chrome(hwnd, WS_EX_TOPMOST.0);
-        let mut map = inspector_orig_procs().lock().unwrap();
+        let mut map = lock_unpoisoned(inspector_orig_procs());
         if let std::collections::hash_map::Entry::Vacant(e) = map.entry(raw_hwnd) {
             let prev =
                 SetWindowLongPtrW(hwnd, GWLP_WNDPROC, inspector_subclass_proc as *const () as isize);

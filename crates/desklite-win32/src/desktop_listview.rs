@@ -1,7 +1,9 @@
+use std::collections::HashMap;
 use std::ffi::c_void;
 use std::mem::size_of;
 use std::path::Path;
-use std::sync::{Mutex, OnceLock};
+use std::sync::{Condvar, Mutex, OnceLock};
+use std::time::{Duration, Instant};
 
 use desklite_core::Point;
 use windows::Win32::Foundation::{CloseHandle, HANDLE, HWND, LPARAM, POINT, TRUE, WPARAM};
@@ -16,7 +18,7 @@ use windows::Win32::System::Threading::{
 };
 use windows::Win32::UI::Controls::{
     LVIF_TEXT, LVITEMW, LVM_DELETEITEM, LVM_GETITEMCOUNT, LVM_GETITEMPOSITION, LVM_GETITEMTEXTW,
-    LVM_GETORIGIN, LVM_SETITEMPOSITION32,
+    LVM_GETORIGIN, LVM_SETITEMPOSITION32, LVS_OWNERDATA,
 };
 use windows::Win32::UI::HiDpi::GetDpiForWindow;
 use windows::Win32::UI::Shell::{
@@ -24,8 +26,10 @@ use windows::Win32::UI::Shell::{
     SHCNF_FLUSHNOWAIT, SHCNF_PATHW, SHChangeNotify,
 };
 use windows::Win32::UI::WindowsAndMessaging::{
-    EnumChildWindows, EnumWindows, FindWindowExW, FindWindowW, GA_ROOT, GetAncestor, GetClassNameW,
-    GetDesktopWindow, GetWindowThreadProcessId, SendMessageW, WM_COMMAND,
+    EnumChildWindows, EnumWindows, FindWindowExW, FindWindowW, GA_ROOT, GWL_STYLE, GetAncestor,
+    GetClassNameW, GetDesktopWindow, GetWindowLongPtrW, GetWindowThreadProcessId,
+    IsWindowVisible, PostMessageW, SW_HIDE, SW_SHOW, SendMessageW, ShowWindow, WM_COMMAND,
+    WS_VISIBLE,
 };
 use windows::core::{BOOL, HSTRING, w};
 
@@ -168,6 +172,14 @@ pub fn probe_desktop_window_tree() -> Option<DesktopWindowTree> {
             let slot = unsafe { &*(lparam.0 as *const Option<DesktopWindowTree>) };
             if slot.is_some() {
                 return BOOL(0);
+            }
+            let mut cls = [0u16; 64];
+            let len = unsafe { GetClassNameW(hwnd, &mut cls) } as usize;
+            let top_cls = String::from_utf16_lossy(&cls[..len]);
+            // Skip ordinary File Explorer windows and common file dialogs so fallback never
+            // hijacks a non-desktop SHELLDLL_DefView.
+            if matches!(top_cls.as_str(), "CabinetWClass" | "ExploreWClass" | "#32770") {
+                return TRUE;
             }
             let _ = unsafe { EnumChildWindows(Some(hwnd), Some(enum_child), lparam) };
             let slot = unsafe { &*(lparam.0 as *const Option<DesktopWindowTree>) };
@@ -387,6 +399,13 @@ impl DesktopListView {
     }
 
     pub fn delete_icon(&self, index: usize) -> Result<(), Win32Error> {
+        let style = unsafe { GetWindowLongPtrW(self.tree.list_view, GWL_STYLE) } as u32;
+        if (style & LVS_OWNERDATA) != 0 {
+            return Err(Win32Error::Status {
+                op: "delete_icon(LVS_OWNERDATA_UNSUPPORTED)",
+                code: 50,
+            });
+        }
         let count = self.icon_count();
         if index >= count {
             return Err(Win32Error::IconIndexOutOfRange(index, count));
@@ -549,21 +568,94 @@ pub fn hide_desktop_icons_for_paths_async(managed_paths: Vec<String>) {
     });
 }
 
-static DELAYED_HIDE_GEN: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+/// Returns whether Windows Explorer's native desktop `SHELLDLL_DefView` is currently visible.
+pub fn is_shell_desktop_visible() -> Option<bool> {
+    let tree = probe_desktop_window_tree()?;
+    Some(unsafe { IsWindowVisible(tree.shell_def_view).as_bool() })
+}
+
+/// Shows or hides Windows Explorer's native desktop icon host (`SHELLDLL_DefView`) as a whole
+/// window (`SW_SHOW` / `SW_HIDE`), avoiding per-item `LVM_DELETEITEM` / `SHCNE_DELETE` races.
+pub fn set_shell_desktop_icons_visible(visible: bool) -> bool {
+    let Some(tree) = probe_desktop_window_tree() else {
+        return false;
+    };
+    let cmd = if visible { SW_SHOW } else { SW_HIDE };
+    unsafe {
+        let _ = ShowWindow(tree.shell_def_view, cmd);
+        if visible {
+            let lv_style = GetWindowLongPtrW(tree.list_view, GWL_STYLE) as u32;
+            if (lv_style & WS_VISIBLE.0) == 0 {
+                let _ = ShowWindow(tree.list_view, SW_SHOW);
+            }
+        } else if IsWindowVisible(tree.shell_def_view).as_bool() {
+            let _ = ShowWindow(tree.list_view, SW_HIDE);
+        }
+        IsWindowVisible(tree.shell_def_view).as_bool() == visible
+    }
+}
+
+#[derive(Default)]
+struct DelayedHideState {
+    pending_paths: HashMap<String, String>,
+    deadline: Option<Instant>,
+}
+
+static DELAYED_HIDE_QUEUE: OnceLock<std::sync::Arc<(Mutex<DelayedHideState>, Condvar)>> = OnceLock::new();
+
+fn delayed_hide_queue() -> &'static std::sync::Arc<(Mutex<DelayedHideState>, Condvar)> {
+    DELAYED_HIDE_QUEUE.get_or_init(|| {
+        let pair = std::sync::Arc::new((Mutex::new(DelayedHideState::default()), Condvar::new()));
+        let worker_pair = std::sync::Arc::clone(&pair);
+        std::thread::spawn(move || {
+            let (lock, cvar) = &*worker_pair;
+            loop {
+                let paths_to_hide: Vec<String> = {
+                    let mut guard = lock.lock().unwrap_or_else(|e| e.into_inner());
+                    loop {
+                        match guard.deadline {
+                            None => {
+                                guard = cvar.wait(guard).unwrap_or_else(|e| e.into_inner());
+                            }
+                            Some(dl) => {
+                                let now = Instant::now();
+                                if now >= dl {
+                                    guard.deadline = None;
+                                    let drained = std::mem::take(&mut guard.pending_paths);
+                                    break drained.into_values().collect();
+                                }
+                                let (g, _) = cvar
+                                    .wait_timeout(guard, dl.saturating_duration_since(now))
+                                    .unwrap_or_else(|e| e.into_inner());
+                                guard = g;
+                            }
+                        }
+                    }
+                };
+                if !paths_to_hide.is_empty() {
+                    hide_desktop_icons_for_paths(&paths_to_hide);
+                }
+            }
+        });
+        pair
+    })
+}
 
 /// Coalesced delayed re-hide pass for Desktop icons after Explorer finishes processing
 /// asynchronous filesystem watcher / shell rename/paste notifications.
+/// Merges all queued path sets into a single worker queue so consecutive calls never drop earlier paths.
 pub fn hide_desktop_icons_for_paths_delayed(managed_paths: Vec<String>, delay_ms: u64) {
     if managed_paths.is_empty() {
         return;
     }
-    let epoch = DELAYED_HIDE_GEN.fetch_add(1, std::sync::atomic::Ordering::SeqCst) + 1;
-    std::thread::spawn(move || {
-        std::thread::sleep(std::time::Duration::from_millis(delay_ms));
-        if DELAYED_HIDE_GEN.load(std::sync::atomic::Ordering::Acquire) == epoch {
-            hide_desktop_icons_for_paths(&managed_paths);
-        }
-    });
+    let (lock, cvar) = &**delayed_hide_queue();
+    let mut guard = lock.lock().unwrap_or_else(|e| e.into_inner());
+    for p in managed_paths {
+        let key = p.to_ascii_lowercase();
+        guard.pending_paths.entry(key).or_insert(p);
+    }
+    guard.deadline = Some(Instant::now() + Duration::from_millis(delay_ms));
+    cvar.notify_one();
 }
 
 /// Restores a batch of Desktop-resident icons onto `SysListView32` in one serialized pass.
@@ -654,18 +746,29 @@ pub fn restore_desktop_icon(
             let _ = lv.set_icon_position(idx2, lv_pt);
         }
     }
-    let _ = still_hidden_paths;
+    if !still_hidden_paths.is_empty() {
+        let target_key = path.to_string_lossy();
+        let filtered: Vec<String> = still_hidden_paths
+            .iter()
+            .filter(|s| !s.eq_ignore_ascii_case(&target_key))
+            .cloned()
+            .collect();
+        if !filtered.is_empty() {
+            hide_icons_unlocked(&lv, &filtered);
+        }
+    }
 }
 
 /// Restores all icons on Windows Desktop when DeskLite exits cleanly.
 pub fn restore_all_desktop_icons() {
+    let _ = set_shell_desktop_icons_visible(true);
     if let Ok(lv) = find_desktop_listview() {
         unsafe {
-            SendMessageW(
-                lv.tree.shell_def_view,
+            let _ = PostMessageW(
+                Some(lv.tree.shell_def_view),
                 WM_COMMAND,
-                Some(WPARAM(0x7103)),
-                Some(LPARAM(0)),
+                WPARAM(0x7103),
+                LPARAM(0),
             );
         }
     }
@@ -674,7 +777,7 @@ pub fn restore_all_desktop_icons() {
         unsafe {
             SHChangeNotify(
                 SHCNE_UPDATEDIR,
-                SHCNF_PATHW | SHCNF_FLUSH,
+                SHCNF_PATHW | SHCNF_FLUSHNOWAIT,
                 Some(wdir.as_ptr().cast()),
                 None,
             );
