@@ -12,8 +12,9 @@ use windows::Win32::System::Com::{
 };
 use windows::Win32::UI::Controls::IImageList;
 use windows::Win32::UI::Shell::{
-    SHGFI_ICON, SHGFI_LARGEICON, SHGFI_PIDL, SHGFI_SYSICONINDEX, SHGFI_USEFILEATTRIBUTES,
-    SHGetFileInfoW, SHGetImageList, SHIL_EXTRALARGE, SHParseDisplayName, SHFILEINFOW,
+    SHFILEINFOW, SHGFI_ICON, SHGFI_LARGEICON, SHGFI_PIDL, SHGFI_SYSICONINDEX,
+    SHGFI_USEFILEATTRIBUTES, SHGetFileInfoW, SHGetImageList, SHIL_EXTRALARGE, SHIL_JUMBO,
+    SHParseDisplayName,
 };
 use windows::Win32::UI::WindowsAndMessaging::{DestroyIcon, HICON};
 use windows::core::{HSTRING, PCWSTR};
@@ -68,6 +69,19 @@ impl IconCache {
     }
 
     fn extract_icon(&self, path: &str) -> Option<DecodedIcon> {
+        if Path::new(path).exists()
+            && let Some(jumbo_hicon) = load_sys_image_list_icon(path, SHIL_JUMBO as i32)
+        {
+            let jumbo = hicon_to_pbgra(jumbo_hicon);
+            unsafe {
+                let _ = DestroyIcon(jumbo_hicon);
+            }
+            if let Some(decoded) = jumbo
+                && has_pixels_outside_top_left(&decoded, 64)
+            {
+                return Some(decoded);
+            }
+        }
         let hicon = load_hicon_for_path(path)?;
         let decoded = hicon_to_pbgra(hicon);
         unsafe {
@@ -75,6 +89,47 @@ impl IconCache {
         }
         decoded
     }
+}
+
+fn has_pixels_outside_top_left(icon: &DecodedIcon, threshold: u32) -> bool {
+    if icon.width <= threshold && icon.height <= threshold {
+        return true;
+    }
+    let w = icon.width as usize;
+    let h = icon.height as usize;
+    let t = threshold as usize;
+    for y in 0..h {
+        let row_start = y * w * 4;
+        let x_start = if y < t { t.min(w) } else { 0 };
+        for x in x_start..w {
+            if icon.pbgra[row_start + x * 4 + 3] > 8 {
+                return true;
+            }
+        }
+    }
+    false
+}
+
+fn load_sys_image_list_icon(path: &str, list_id: i32) -> Option<HICON> {
+    let wpath = HSTRING::from(path);
+    let mut sfi = SHFILEINFOW::default();
+    unsafe {
+        let res = SHGetFileInfoW(
+            &wpath,
+            FILE_ATTRIBUTE_NORMAL,
+            Some(&mut sfi),
+            std::mem::size_of::<SHFILEINFOW>() as u32,
+            SHGFI_SYSICONINDEX,
+        );
+        if res != 0
+            && let Ok(img_list) = SHGetImageList::<IImageList>(list_id)
+            && let Ok(hicon) = img_list.GetIcon(sfi.iIcon, 0)
+            && !hicon.is_invalid()
+        {
+            return Some(hicon);
+        }
+    }
+    None
 }
 
 fn hicon_to_pbgra(hicon: HICON) -> Option<DecodedIcon> {

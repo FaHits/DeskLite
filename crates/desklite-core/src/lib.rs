@@ -9,7 +9,8 @@ pub use clamp::{
 };
 pub use layout::{
     CURRENT_SCHEMA_VERSION, DEFAULT_BACKDROP_ALPHA, DesktopIconPos, FenceItem, FenceKind,
-    FenceSpec, ItemKind, LayoutPreferences, MigrationReport, NativeLayoutConfig, TopologySnapshot,
+    FenceLayoutOverride, FenceSpec, ItemKind, LayoutPreferences, MigrationReport, NativeLayoutConfig,
+    TopologySnapshot,
 };
 pub use store::{StoreError, atomic_write_bytes, load_native_layout, save_native_layout};
 pub use topology::{DisplayTopology, MonitorDescriptor, Point, Rect, TopologyError, TopologyKey};

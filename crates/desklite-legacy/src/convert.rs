@@ -159,8 +159,10 @@ pub fn legacy_to_native(
             kind: FenceKind::from(b.kind),
             rect: b.rect,
             collapsed: false,
+            locked: false,
             portal_dir: None,
             backdrop_alpha: desklite_core::DEFAULT_BACKDROP_ALPHA,
+            layout_override: None,
             items,
         });
     }

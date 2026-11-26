@@ -14,16 +14,21 @@ use desklite_core::{
     save_native_layout,
 };
 use desklite_legacy::{LegacyOptions, legacy_to_native, load_legacy_dir};
-use desklite_ui::fence_view::{FenceCommand, RenamePrompt, collect_managed_desktop_paths};
+use desklite_ui::fence_view::{
+    CollapsedMenuCommand, FenceCommand, RenamePrompt, apply_collapsed_menu_command,
+    collect_managed_desktop_paths,
+};
 use desklite_ui::{
-    COLLAPSED_HEIGHT, SharedFenceState, configure_egui_theme, install_chinese_fonts,
-    render_fence_viewport,
+    COLLAPSED_HEIGHT, INSPECTOR_HEIGHT, INSPECTOR_TITLE, INSPECTOR_WIDTH, SharedFenceState,
+    configure_egui_theme, install_chinese_fonts, render_fence_viewport, render_inspector_viewport,
 };
 use desklite_win32::{
     FolderWatcher, IconCache, TrayIcon, WM_APP_PORTAL_DIRTY, WM_APP_TRAY, all_desktop_dirs,
-    enable_per_monitor_dpi_v2, hide_desktop_icons_for_paths, install_desktop_z_win_event_hooks,
+    clipboard_has_files, enable_dark_popup_menus, enable_per_monitor_dpi_v2,
+    hide_desktop_icons_for_paths, hide_desktop_icons_for_paths_async,
+    hide_desktop_icons_for_paths_delayed, install_desktop_z_win_event_hooks,
     is_directly_on_desktop, is_vault_path, migrate_vault_item_to_desktop, pick_folder_dialog,
-    probe_display_topology, restore_all_desktop_icons, restore_desktop_icon_async,
+    probe_display_topology, restore_all_desktop_icons, restore_desktop_icons_async,
     scan_portal_directory, strip_alt_tab_from_host,
 };
 use egui::{Pos2, Vec2, ViewportBuilder, ViewportCommand, ViewportId, WindowLevel};
@@ -38,12 +43,12 @@ use windows::Win32::UI::Shell::ShellExecuteW;
 use windows::Win32::UI::WindowsAndMessaging::{
     AppendMenuW, CREATESTRUCTW, CreatePopupMenu, CreateWindowExW, DefWindowProcW, DestroyMenu,
     DestroyWindow, DispatchMessageW, GetCursorPos, GetMessageW, GetWindowLongPtrW, GWLP_USERDATA,
-    KillTimer, MF_SEPARATOR, MF_STRING, MSG, PBT_APMRESUMEAUTOMATIC, PostMessageW, PostQuitMessage,
-    RegisterClassExW, SW_SHOWNORMAL, SetForegroundWindow, SetTimer, SetWindowLongPtrW,
-    TPM_BOTTOMALIGN, TPM_LEFTALIGN, TPM_RETURNCMD, TrackPopupMenuEx, TranslateMessage, WM_APP,
-    WM_CREATE, WM_DESTROY, WM_DISPLAYCHANGE, WM_DPICHANGED, WM_ENDSESSION, WM_POWERBROADCAST,
-    WM_QUERYENDSESSION, WM_RBUTTONUP, WM_SETTINGCHANGE, WM_TIMER, WNDCLASSEXW, WS_EX_TOOLWINDOW,
-    WS_POPUP,
+    KillTimer, MF_CHECKED, MF_GRAYED, MF_POPUP, MF_SEPARATOR, MF_STRING, MSG,
+    PBT_APMRESUMEAUTOMATIC, PostMessageW, PostQuitMessage, RegisterClassExW, SW_SHOWNORMAL,
+    SetForegroundWindow, SetTimer, SetWindowLongPtrW, TPM_BOTTOMALIGN, TPM_LEFTALIGN,
+    TPM_RETURNCMD, TPM_TOPALIGN, TrackPopupMenuEx, TranslateMessage, WM_APP, WM_CREATE, WM_DESTROY,
+    WM_DISPLAYCHANGE, WM_DPICHANGED, WM_ENDSESSION, WM_POWERBROADCAST, WM_QUERYENDSESSION,
+    WM_RBUTTONUP, WM_SETTINGCHANGE, WM_TIMER, WNDCLASSEXW, WS_EX_TOOLWINDOW, WS_POPUP,
 };
 use windows::core::{HSTRING, w};
 
@@ -53,12 +58,35 @@ const DESKTOP_DEBOUNCE_TIMER: usize = 102;
 const DESKTOP_DEBOUNCE_MS: u32 = 160;
 const WM_APP_SYNC_WATCHERS: u32 = WM_APP + 20;
 const WM_APP_SHUTDOWN: u32 = WM_APP + 21;
+const WM_APP_SHOW_FENCE_MENU: u32 = WM_APP + 22;
+const WM_APP_SHOW_FENCE_MENU_BODY: u32 = WM_APP + 23;
 
 const TRAY_CMD_NEW_BLANK: u32 = 1001;
 const TRAY_CMD_NEW_PORTAL: u32 = 1002;
 const TRAY_CMD_REALIGN: u32 = 1003;
 const TRAY_CMD_OPEN_CONFIG_DIR: u32 = 1004;
 const TRAY_CMD_EXIT: u32 = 1005;
+
+const FENCE_CMD_TOGGLE_COLLAPSE: u32 = 2001;
+const FENCE_CMD_RENAME: u32 = 2002;
+const FENCE_CMD_TOGGLE_KIND: u32 = 2003;
+const FENCE_CMD_OPEN_PORTAL: u32 = 2004;
+const FENCE_CMD_UNBIND_PORTAL: u32 = 2005;
+const FENCE_CMD_BIND_PORTAL: u32 = 2006;
+const FENCE_CMD_SORT_NAME: u32 = 2007;
+const FENCE_CMD_SORT_KIND: u32 = 2008;
+const FENCE_CMD_SORT_MODIFIED: u32 = 2009;
+const FENCE_CMD_NEW_BLANK: u32 = 2010;
+const FENCE_CMD_NEW_PORTAL: u32 = 2011;
+const FENCE_CMD_DELETE: u32 = 2012;
+const FENCE_CMD_EXIT: u32 = 2013;
+const FENCE_CMD_TOGGLE_LOCK: u32 = 2014;
+const FENCE_CMD_DUPLICATE_STYLE: u32 = 2015;
+const FENCE_CMD_PARAMS_EDITOR: u32 = 2016;
+const FENCE_CMD_PASTE: u32 = 2017;
+const FENCE_CMD_UNDO: u32 = 2018;
+const FENCE_CMD_SELECT_ALL: u32 = 2019;
+const FENCE_CMD_REFRESH_PORTAL: u32 = 2020;
 
 struct SingleInstanceGuard(HANDLE);
 impl Drop for SingleInstanceGuard {
@@ -111,8 +139,10 @@ fn create_starter_fence(topo: &DisplayTopology) -> FenceSpec {
         kind: FenceKind::IconGrid,
         rect: Rect::new(left, work.top + 24, right, (work.top + 360).min(work.bottom)),
         collapsed: false,
+        locked: false,
         portal_dir: None,
         backdrop_alpha: DEFAULT_BACKDROP_ALPHA,
+        layout_override: None,
         items: Vec::new(),
     }
 }
@@ -184,6 +214,7 @@ enum BgEvent {
     TrayNewPortal(String),
     TrayRealign,
     BindPortalResult(i32, String),
+    FenceMenuCommand(i32, CollapsedMenuCommand),
     FlushAndExit,
 }
 
@@ -307,6 +338,179 @@ impl HelperState {
             _ => {}
         }
     }
+
+    fn show_fence_menu(&self, fence_id: i32, x: i32, y: i32, include_body_actions: bool) {
+        let info = {
+            let guard = self.shared.lock().unwrap();
+            let has_undo = !guard.undo_stack.is_empty();
+            guard.config.fences.iter().find(|f| f.id == fence_id).map(|f| {
+                (
+                    f.collapsed,
+                    f.locked,
+                    f.portal_dir.is_some(),
+                    matches!(f.kind, FenceKind::FileList),
+                    f.portal_dir.is_none() && f.items.len() > 1,
+                    !f.items.is_empty(),
+                    has_undo,
+                )
+            })
+        };
+        let Some((collapsed, locked, is_portal, is_list, can_sort, has_items, has_undo)) = info
+        else {
+            return;
+        };
+        let Ok(menu) = (unsafe { CreatePopupMenu() }) else {
+            return;
+        };
+        unsafe {
+            if include_body_actions {
+                let paste_flags = if clipboard_has_files() {
+                    MF_STRING
+                } else {
+                    MF_STRING | MF_GRAYED
+                };
+                let _ = AppendMenuW(menu, paste_flags, FENCE_CMD_PASTE as usize, w!("粘贴\tCtrl+V"));
+                let undo_flags = if has_undo {
+                    MF_STRING
+                } else {
+                    MF_STRING | MF_GRAYED
+                };
+                let _ = AppendMenuW(menu, undo_flags, FENCE_CMD_UNDO as usize, w!("撤销\tCtrl+Z"));
+                if has_items {
+                    let _ = AppendMenuW(
+                        menu,
+                        MF_STRING,
+                        FENCE_CMD_SELECT_ALL as usize,
+                        w!("全选\tCtrl+A"),
+                    );
+                }
+                if is_portal {
+                    let _ = AppendMenuW(
+                        menu,
+                        MF_STRING,
+                        FENCE_CMD_REFRESH_PORTAL as usize,
+                        w!("刷新\tF5"),
+                    );
+                }
+                let _ = AppendMenuW(menu, MF_SEPARATOR, 0, None);
+            }
+            let collapse_txt = if collapsed { w!("展开格子") } else { w!("折叠格子") };
+            let _ = AppendMenuW(menu, MF_STRING, FENCE_CMD_TOGGLE_COLLAPSE as usize, collapse_txt);
+            let _ = AppendMenuW(menu, MF_STRING, FENCE_CMD_RENAME as usize, w!("重命名格子"));
+            let view_txt = if is_list {
+                w!("切换为图标网格")
+            } else {
+                w!("切换为紧凑列表")
+            };
+            let _ = AppendMenuW(menu, MF_STRING, FENCE_CMD_TOGGLE_KIND as usize, view_txt);
+            let lock_flags = if locked {
+                MF_STRING | MF_CHECKED
+            } else {
+                MF_STRING
+            };
+            let _ = AppendMenuW(
+                menu,
+                lock_flags,
+                FENCE_CMD_TOGGLE_LOCK as usize,
+                w!("锁定位置与大小"),
+            );
+            let _ = AppendMenuW(
+                menu,
+                MF_STRING,
+                FENCE_CMD_PARAMS_EDITOR as usize,
+                w!("格子参数设置..."),
+            );
+            let _ = AppendMenuW(
+                menu,
+                MF_STRING,
+                FENCE_CMD_DUPLICATE_STYLE as usize,
+                w!("复制相同样式格子"),
+            );
+            if is_portal {
+                let _ = AppendMenuW(
+                    menu,
+                    MF_STRING,
+                    FENCE_CMD_OPEN_PORTAL as usize,
+                    w!("在资源管理器中打开文件夹"),
+                );
+                let _ = AppendMenuW(
+                    menu,
+                    MF_STRING,
+                    FENCE_CMD_UNBIND_PORTAL as usize,
+                    w!("取消文件夹映射"),
+                );
+            } else {
+                let _ = AppendMenuW(
+                    menu,
+                    MF_STRING,
+                    FENCE_CMD_BIND_PORTAL as usize,
+                    w!("绑定文件夹映射..."),
+                );
+            }
+            if can_sort
+                && let Ok(sub) = CreatePopupMenu()
+            {
+                let _ = AppendMenuW(sub, MF_STRING, FENCE_CMD_SORT_NAME as usize, w!("按名称排序"));
+                let _ = AppendMenuW(sub, MF_STRING, FENCE_CMD_SORT_KIND as usize, w!("按类型排序"));
+                let _ = AppendMenuW(
+                    sub,
+                    MF_STRING,
+                    FENCE_CMD_SORT_MODIFIED as usize,
+                    w!("按修改时间排序"),
+                );
+                let _ = AppendMenuW(menu, MF_POPUP, sub.0 as usize, w!("排序方式"));
+            }
+            let _ = AppendMenuW(menu, MF_SEPARATOR, 0, None);
+            let _ = AppendMenuW(menu, MF_STRING, FENCE_CMD_NEW_BLANK as usize, w!("新建空白格子"));
+            let _ = AppendMenuW(menu, MF_STRING, FENCE_CMD_NEW_PORTAL as usize, w!("新建文件夹格子..."));
+            let _ = AppendMenuW(menu, MF_STRING, FENCE_CMD_DELETE as usize, w!("删除此格子"));
+            let _ = AppendMenuW(menu, MF_SEPARATOR, 0, None);
+            let _ = AppendMenuW(menu, MF_STRING, FENCE_CMD_EXIT as usize, w!("退出 DeskLite"));
+        }
+
+        let cmd = unsafe {
+            let _ = SetForegroundWindow(self.hwnd);
+            TrackPopupMenuEx(
+                menu,
+                (TPM_LEFTALIGN | TPM_TOPALIGN | TPM_RETURNCMD).0,
+                x,
+                y,
+                self.hwnd,
+                None,
+            )
+        };
+        unsafe {
+            let _ = DestroyMenu(menu);
+        }
+
+        let action = match cmd.0 as u32 {
+            FENCE_CMD_TOGGLE_COLLAPSE => Some(CollapsedMenuCommand::ToggleCollapse),
+            FENCE_CMD_RENAME => Some(CollapsedMenuCommand::RenameFence),
+            FENCE_CMD_TOGGLE_KIND => Some(CollapsedMenuCommand::ToggleKind),
+            FENCE_CMD_TOGGLE_LOCK => Some(CollapsedMenuCommand::ToggleLock),
+            FENCE_CMD_DUPLICATE_STYLE => Some(CollapsedMenuCommand::DuplicateStyle),
+            FENCE_CMD_PARAMS_EDITOR => Some(CollapsedMenuCommand::OpenParamsEditor),
+            FENCE_CMD_OPEN_PORTAL => Some(CollapsedMenuCommand::OpenPortalFolder),
+            FENCE_CMD_UNBIND_PORTAL => Some(CollapsedMenuCommand::UnbindPortal),
+            FENCE_CMD_BIND_PORTAL => Some(CollapsedMenuCommand::BindPortal),
+            FENCE_CMD_SORT_NAME => Some(CollapsedMenuCommand::SortName),
+            FENCE_CMD_SORT_KIND => Some(CollapsedMenuCommand::SortKind),
+            FENCE_CMD_SORT_MODIFIED => Some(CollapsedMenuCommand::SortModified),
+            FENCE_CMD_PASTE => Some(CollapsedMenuCommand::PasteFromClipboard),
+            FENCE_CMD_UNDO => Some(CollapsedMenuCommand::UndoLast),
+            FENCE_CMD_SELECT_ALL => Some(CollapsedMenuCommand::SelectAll),
+            FENCE_CMD_REFRESH_PORTAL => Some(CollapsedMenuCommand::RefreshPortal),
+            FENCE_CMD_NEW_BLANK => Some(CollapsedMenuCommand::CreateBlank),
+            FENCE_CMD_NEW_PORTAL => Some(CollapsedMenuCommand::CreatePortal),
+            FENCE_CMD_DELETE => Some(CollapsedMenuCommand::DeleteFence),
+            FENCE_CMD_EXIT => Some(CollapsedMenuCommand::ExitApp),
+            _ => None,
+        };
+        if let Some(action) = action {
+            let _ = self.tx.send(BgEvent::FenceMenuCommand(fence_id, action));
+            self.egui_ctx.request_repaint_of(ViewportId::ROOT);
+        }
+    }
 }
 
 unsafe extern "system" fn helper_wnd_proc(
@@ -345,6 +549,13 @@ unsafe extern "system" fn helper_wnd_proc(
                 let _ = st.tx.send(BgEvent::PortalDirty(fid));
                 st.egui_ctx.request_repaint_of(ViewportId::ROOT);
             }
+            LRESULT(0)
+        }
+        WM_APP_SHOW_FENCE_MENU | WM_APP_SHOW_FENCE_MENU_BODY => {
+            let fid = wparam.0 as i32;
+            let x = (lparam.0 & 0xFFFF) as i16 as i32;
+            let y = ((lparam.0 >> 16) & 0xFFFF) as i16 as i32;
+            st.show_fence_menu(fid, x, y, msg == WM_APP_SHOW_FENCE_MENU_BODY);
             LRESULT(0)
         }
         WM_APP_TRAY => {
@@ -530,8 +741,10 @@ impl DeskLiteEguiApp {
             kind: FenceKind::IconGrid,
             rect,
             collapsed: false,
+            locked: false,
             portal_dir: None,
             backdrop_alpha: DEFAULT_BACKDROP_ALPHA,
+            layout_override: None,
             items: Vec::new(),
         });
         let topo = guard.topology.clone();
@@ -568,8 +781,10 @@ impl DeskLiteEguiApp {
             kind: FenceKind::IconGrid,
             rect,
             collapsed: false,
+            locked: false,
             portal_dir: Some(dir),
             backdrop_alpha: DEFAULT_BACKDROP_ALPHA,
+            layout_override: None,
             items,
         });
         let topo = guard.topology.clone();
@@ -592,11 +807,25 @@ impl DeskLiteEguiApp {
                     needs_save = true;
                 }
                 BgEvent::PortalDirty(fid) => {
-                    let mut guard = self.shared.lock().unwrap();
-                    if let Some(f) = guard.config.fence_mut(fid)
-                        && let Some(ref dir) = f.portal_dir
-                    {
-                        f.items = scan_portal_directory(Path::new(dir));
+                    let managed = {
+                        let mut guard = self.shared.lock().unwrap();
+                        let mut updated_desktop = false;
+                        if let Some(f) = guard.config.fence_mut(fid)
+                            && let Some(ref dir) = f.portal_dir
+                        {
+                            let p = Path::new(dir);
+                            f.items = scan_portal_directory(p);
+                            updated_desktop = f.items.iter().any(|it| is_directly_on_desktop(Path::new(&it.path)));
+                        }
+                        if updated_desktop {
+                            Some(collect_managed_desktop_paths(&guard.config))
+                        } else {
+                            None
+                        }
+                    };
+                    if let Some(paths) = managed {
+                        hide_desktop_icons_for_paths_async(paths.clone());
+                        hide_desktop_icons_for_paths_delayed(paths, 220);
                     }
                     ctx.request_repaint_of(ViewportId::from_hash_of(("desklite_fence", fid)));
                 }
@@ -605,7 +834,8 @@ impl DeskLiteEguiApp {
                         let guard = self.shared.lock().unwrap();
                         collect_managed_desktop_paths(&guard.config)
                     };
-                    hide_desktop_icons_for_paths(&managed);
+                    hide_desktop_icons_for_paths_async(managed.clone());
+                    hide_desktop_icons_for_paths_delayed(managed, 220);
                 }
                 BgEvent::TrayNewBlank => {
                     self.create_blank_fence();
@@ -613,6 +843,11 @@ impl DeskLiteEguiApp {
                 }
                 BgEvent::TrayNewPortal(dir) => {
                     self.create_portal_fence(dir);
+                    let managed = {
+                        let guard = self.shared.lock().unwrap();
+                        collect_managed_desktop_paths(&guard.config)
+                    };
+                    hide_desktop_icons_for_paths_async(managed);
                     needs_save = true;
                     needs_watcher_sync = true;
                 }
@@ -632,7 +867,7 @@ impl DeskLiteEguiApp {
                             .config
                             .fences
                             .iter()
-                            .find(|f| f.id == fid && f.portal_dir.is_none())
+                            .find(|f| f.id == fid)
                             .map(|f| f.items.iter().map(|it| it.path.clone()).collect())
                             .unwrap_or_default();
                         if let Some(f) = guard.config.fence_mut(fid) {
@@ -643,12 +878,21 @@ impl DeskLiteEguiApp {
                         }
                         (old_paths, collect_managed_desktop_paths(&guard.config))
                     };
-                    for op in old_paths {
-                        if is_directly_on_desktop(Path::new(&op)) {
-                            restore_desktop_icon_async(op, None, remaining.clone());
-                        }
-                    }
+                    let to_restore: Vec<String> = old_paths
+                        .into_iter()
+                        .filter(|op| {
+                            is_directly_on_desktop(Path::new(op))
+                                && !remaining.iter().any(|r| r.eq_ignore_ascii_case(op))
+                        })
+                        .collect();
+                    restore_desktop_icons_async(to_restore);
+                    hide_desktop_icons_for_paths_async(remaining);
                     ctx.request_repaint_of(ViewportId::from_hash_of(("desklite_fence", fid)));
+                }
+                BgEvent::FenceMenuCommand(fid, action) => {
+                    if apply_collapsed_menu_command(fid, action, &self.shared, ctx) {
+                        needs_save = true;
+                    }
                 }
                 BgEvent::FlushAndExit => {
                     self.save_now();
@@ -714,7 +958,7 @@ impl DeskLiteEguiApp {
                             .config
                             .fences
                             .iter()
-                            .find(|f| f.id == fid && f.portal_dir.is_none())
+                            .find(|f| f.id == fid)
                             .map(|f| f.items.iter().map(|it| it.path.clone()).collect())
                             .unwrap_or_default();
                         if guard.config.remove_fence(fid) {
@@ -724,14 +968,41 @@ impl DeskLiteEguiApp {
                         }
                         (restore_paths, collect_managed_desktop_paths(&guard.config))
                     };
-                    for rp in restore_paths {
-                        if is_directly_on_desktop(Path::new(&rp)) {
-                            restore_desktop_icon_async(rp, None, remaining.clone());
-                        }
-                    }
+                    let to_restore: Vec<String> = restore_paths
+                        .into_iter()
+                        .filter(|rp| {
+                            is_directly_on_desktop(Path::new(rp))
+                                && !remaining.iter().any(|r| r.eq_ignore_ascii_case(rp))
+                        })
+                        .collect();
+                    restore_desktop_icons_async(to_restore);
                 }
                 FenceCommand::SyncPortals => {
                     needs_watcher_sync = true;
+                }
+                FenceCommand::ShowFenceMenu {
+                    fence_id,
+                    screen_x,
+                    screen_y,
+                    include_body_actions,
+                } => {
+                    if self.helper_hwnd != 0 {
+                        let packed = (((screen_y as i16 as u16) as usize) << 16)
+                            | ((screen_x as i16 as u16) as usize);
+                        let msg = if include_body_actions {
+                            WM_APP_SHOW_FENCE_MENU_BODY
+                        } else {
+                            WM_APP_SHOW_FENCE_MENU
+                        };
+                        unsafe {
+                            let _ = PostMessageW(
+                                Some(HWND(self.helper_hwnd as *mut _)),
+                                msg,
+                                WPARAM(fence_id as usize),
+                                LPARAM(packed as isize),
+                            );
+                        }
+                    }
                 }
                 FenceCommand::RequestExitApp => {
                     self.save_now();
@@ -795,12 +1066,40 @@ impl eframe::App for DeskLiteEguiApp {
             return;
         }
 
-        let (fences, builder_rects, monitors) = {
+        let (fences, builder_rects, monitors, inspector_meta) = {
             let guard = self.shared.lock().unwrap();
+            let insp = if guard.inspector_spawned {
+                guard.inspector.as_ref().map(|ins| {
+                    let scale = if guard.topology.monitors().is_empty() {
+                        1.0
+                    } else {
+                        (nearest_monitor(
+                            desklite_core::Point {
+                                x: ins.initial_pos.0,
+                                y: ins.initial_pos.1,
+                            },
+                            guard.topology.monitors(),
+                        )
+                        .dpi_x as f32
+                            / 96.0)
+                            .max(0.5)
+                    };
+                    (
+                        ins.open,
+                        Pos2::new(
+                            ins.initial_pos.0 as f32 / scale,
+                            ins.initial_pos.1 as f32 / scale,
+                        ),
+                    )
+                })
+            } else {
+                None
+            };
             (
                 guard.config.fences.clone(),
                 guard.builder_rects.clone(),
                 guard.topology.monitors().to_vec(),
+                insp,
             )
         };
 
@@ -849,6 +1148,35 @@ impl eframe::App for DeskLiteEguiApp {
                 }
             });
         }
+
+        if let Some((insp_open, init_pos)) = inspector_meta {
+            let ivb = ViewportBuilder::default()
+                .with_title(INSPECTOR_TITLE)
+                .with_decorations(false)
+                .with_transparent(true)
+                .with_taskbar(false)
+                .with_resizable(true)
+                .with_visible(insp_open)
+                .with_window_level(WindowLevel::AlwaysOnTop)
+                .with_position(init_pos)
+                .with_inner_size(Vec2::new(INSPECTOR_WIDTH, INSPECTOR_HEIGHT))
+                .with_min_inner_size(Vec2::new(370.0, 440.0));
+            let shared = Arc::clone(&self.shared);
+            let layout_path = self.layout_path.clone();
+            ctx.show_viewport_deferred(
+                ViewportId::from_hash_of("desklite_inspector"),
+                ivb,
+                move |sub_ui, _class| {
+                    let res = render_inspector_viewport(sub_ui, &shared);
+                    if res.needs_immediate_save {
+                        let mut guard = shared.lock().unwrap();
+                        let _ = save_native_layout(&layout_path, &guard.config);
+                        guard.dirty_layout = false;
+                        guard.pending_save_at = None;
+                    }
+                },
+            );
+        }
     }
 
     fn on_exit(&mut self, _gl: Option<&eframe::glow::Context>) {
@@ -873,6 +1201,7 @@ fn main() {
     };
 
     enable_per_monitor_dpi_v2();
+    enable_dark_popup_menus();
     let Ok(topology) = probe_display_topology() else {
         return;
     };
@@ -898,7 +1227,7 @@ fn main() {
     )));
     let (tx, rx) = mpsc::channel();
 
-    let native_options = eframe::NativeOptions {
+    let mut native_options = eframe::NativeOptions {
         viewport: ViewportBuilder::default()
             .with_title("DeskLite Host")
             .with_decorations(false)
@@ -906,8 +1235,10 @@ fn main() {
             .with_taskbar(false)
             .with_position(Pos2::new(-32000.0, -32000.0))
             .with_inner_size(Vec2::new(1.0, 1.0)),
+        clipboard_shortcuts: false,
         ..Default::default()
     };
+    native_options.glow_options.vsync = false;
 
     let _ = eframe::run_native(
         "DeskLite",

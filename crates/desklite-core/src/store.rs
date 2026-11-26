@@ -109,8 +109,10 @@ mod tests {
             kind: FenceKind::IconGrid,
             rect: Rect::new(100, 100, 400, 400),
             collapsed: false,
+            locked: false,
             portal_dir: None,
             backdrop_alpha: crate::layout::DEFAULT_BACKDROP_ALPHA,
+            layout_override: None,
             items: vec![],
         });
         save_native_layout(&target, &cfg).unwrap();

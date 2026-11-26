@@ -6,12 +6,16 @@ use std::sync::atomic::{AtomicBool, AtomicI32, Ordering};
 
 use windows::Win32::Foundation::{
     DRAGDROP_S_CANCEL, DRAGDROP_S_DROP, DRAGDROP_S_USEDEFAULTCURSORS, DV_E_FORMATETC, E_NOTIMPL,
-    GlobalFree, HGLOBAL, HWND, POINT, S_FALSE, S_OK,
+    GlobalFree, HANDLE, HGLOBAL, HWND, POINT, S_FALSE, S_OK,
 };
 use windows::Win32::Graphics::Gdi::ScreenToClient;
 use windows::Win32::System::Com::{
     DATADIR_GET, DVASPECT_CONTENT, FORMATETC, IAdviseSink, IDataObject, IDataObject_Impl,
     IEnumFORMATETC, IEnumFORMATETC_Impl, IEnumSTATDATA, STGMEDIUM, STGMEDIUM_0, TYMED_HGLOBAL,
+};
+use windows::Win32::System::DataExchange::{
+    CloseClipboard, EmptyClipboard, GetClipboardData, IsClipboardFormatAvailable, OpenClipboard,
+    RegisterClipboardFormatW, SetClipboardData,
 };
 use windows::Win32::System::Diagnostics::Debug::{ReadProcessMemory, WriteProcessMemory};
 use windows::Win32::System::Memory::{
@@ -19,22 +23,22 @@ use windows::Win32::System::Memory::{
     MEM_RESERVE, PAGE_READWRITE, VirtualAllocEx, VirtualFreeEx,
 };
 use windows::Win32::System::Ole::{
-    CF_HDROP, DROPEFFECT, DROPEFFECT_COPY, DROPEFFECT_LINK, DROPEFFECT_MOVE, DoDragDrop,
-    IDropSource, IDropSource_Impl, OleInitialize, OleUninitialize,
+    CF_HDROP, CF_UNICODETEXT, DROPEFFECT, DROPEFFECT_COPY, DROPEFFECT_LINK, DROPEFFECT_MOVE,
+    DoDragDrop, IDropSource, IDropSource_Impl, OleInitialize, OleUninitialize,
 };
 use windows::Win32::System::SystemServices::{MK_LBUTTON, MODIFIERKEYS_FLAGS};
 use windows::Win32::System::Threading::{
     OpenProcess, PROCESS_VM_OPERATION, PROCESS_VM_READ, PROCESS_VM_WRITE,
 };
 use windows::Win32::UI::Controls::{LVHITTESTINFO, LVM_HITTEST};
-use windows::Win32::UI::Shell::DROPFILES;
+use windows::Win32::UI::Shell::{DROPFILES, DragQueryFileW, HDROP};
 use windows::Win32::UI::WindowsAndMessaging::{
     GA_ROOT, GetAncestor, GetClassNameW, GetCursorPos, GetWindowThreadProcessId, SendMessageW,
     WindowFromPoint,
 };
-use windows::core::{BOOL, HRESULT, Ref, Result as WinResult, implement};
+use windows::core::{BOOL, HRESULT, Ref, Result as WinResult, implement, w};
 
-use crate::Win32Error;
+use crate::{Win32Error, win_err};
 use crate::desktop_listview::probe_desktop_window_tree;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -106,6 +110,41 @@ struct FileDropDataObject {
     format: FORMATETC,
 }
 
+fn build_hdrop_hglobal(paths: &[String]) -> WinResult<HGLOBAL> {
+    let mut utf16_buf: Vec<u16> = Vec::new();
+    for p in paths {
+        utf16_buf.extend(p.encode_utf16());
+        utf16_buf.push(0);
+    }
+    utf16_buf.push(0);
+
+    let header_bytes = size_of::<DROPFILES>();
+    let total_bytes = header_bytes + utf16_buf.len() * size_of::<u16>();
+
+    unsafe {
+        let hglobal = GlobalAlloc(GMEM_MOVEABLE | GMEM_ZEROINIT, total_bytes)?;
+        let ptr = GlobalLock(hglobal);
+        if ptr.is_null() {
+            let _ = GlobalFree(Some(hglobal));
+            return Err(windows::core::Error::from_thread());
+        }
+        let df = DROPFILES {
+            pFiles: header_bytes as u32,
+            pt: POINT::default(),
+            fNC: BOOL(0),
+            fWide: BOOL(1),
+        };
+        copy_nonoverlapping(&df as *const DROPFILES as *const u8, ptr.cast::<u8>(), header_bytes);
+        copy_nonoverlapping(
+            utf16_buf.as_ptr().cast::<u8>(),
+            ptr.cast::<u8>().add(header_bytes),
+            utf16_buf.len() * size_of::<u16>(),
+        );
+        let _ = GlobalUnlock(hglobal);
+        Ok(hglobal)
+    }
+}
+
 impl FileDropDataObject {
     fn new(paths: Vec<String>) -> Self {
         let format = FORMATETC {
@@ -129,38 +168,7 @@ impl FileDropDataObject {
     }
 
     fn build_hdrop(&self) -> WinResult<HGLOBAL> {
-        let mut utf16_buf: Vec<u16> = Vec::new();
-        for p in &self.paths {
-            utf16_buf.extend(p.encode_utf16());
-            utf16_buf.push(0);
-        }
-        utf16_buf.push(0);
-
-        let header_bytes = size_of::<DROPFILES>();
-        let total_bytes = header_bytes + utf16_buf.len() * size_of::<u16>();
-
-        unsafe {
-            let hglobal = GlobalAlloc(GMEM_MOVEABLE | GMEM_ZEROINIT, total_bytes)?;
-            let ptr = GlobalLock(hglobal);
-            if ptr.is_null() {
-                let _ = GlobalFree(Some(hglobal));
-                return Err(windows::core::Error::from_thread());
-            }
-            let df = DROPFILES {
-                pFiles: header_bytes as u32,
-                pt: POINT::default(),
-                fNC: BOOL(0),
-                fWide: BOOL(1),
-            };
-            copy_nonoverlapping(&df as *const DROPFILES as *const u8, ptr.cast::<u8>(), header_bytes);
-            copy_nonoverlapping(
-                utf16_buf.as_ptr().cast::<u8>(),
-                ptr.cast::<u8>().add(header_bytes),
-                utf16_buf.len() * size_of::<u16>(),
-            );
-            let _ = GlobalUnlock(hglobal);
-            Ok(hglobal)
-        }
+        build_hdrop_hglobal(&self.paths)
     }
 }
 
@@ -440,5 +448,247 @@ pub fn start_file_drag_out(
         } else {
             Ok(DragOutOutcome::Cancelled)
         }
+    }
+}
+
+struct ClipboardGuard;
+
+impl Drop for ClipboardGuard {
+    fn drop(&mut self) {
+        unsafe {
+            let _ = CloseClipboard();
+        }
+    }
+}
+
+fn build_drop_effect_hglobal(effect: u32) -> WinResult<HGLOBAL> {
+    unsafe {
+        let hglobal = GlobalAlloc(GMEM_MOVEABLE | GMEM_ZEROINIT, size_of::<u32>())?;
+        let ptr = GlobalLock(hglobal);
+        if ptr.is_null() {
+            let _ = GlobalFree(Some(hglobal));
+            return Err(windows::core::Error::from_thread());
+        }
+        *(ptr.cast::<u32>()) = effect;
+        let _ = GlobalUnlock(hglobal);
+        Ok(hglobal)
+    }
+}
+
+fn open_clipboard_with_retry(owner_hwnd: isize) -> Result<ClipboardGuard, Win32Error> {
+    const DELAYS_MS: [u64; 11] = [3, 5, 8, 10, 12, 15, 15, 15, 20, 20, 20];
+    let owner = (owner_hwnd != 0).then_some(HWND(owner_hwnd as *mut _));
+    let mut last_err = None;
+    for attempt in 0..=DELAYS_MS.len() {
+        if unsafe { OpenClipboard(owner) }.is_ok() {
+            return Ok(ClipboardGuard);
+        }
+        last_err = Some(windows::core::Error::from_thread());
+        if let Some(&ms) = DELAYS_MS.get(attempt) {
+            std::thread::sleep(std::time::Duration::from_millis(ms));
+        }
+    }
+    Err(win_err(
+        "OpenClipboard",
+        last_err.unwrap_or_else(windows::core::Error::from_thread),
+    ))
+}
+
+/// Fast non-blocking check whether `CF_HDROP` files are currently present on the clipboard.
+pub fn clipboard_has_files() -> bool {
+    unsafe { IsClipboardFormatAvailable(CF_HDROP.0 as u32) }.is_ok()
+}
+
+/// Places `paths` onto the Windows clipboard as `CF_HDROP` with `Preferred DropEffect`
+/// (`DROPEFFECT_COPY` or `DROPEFFECT_MOVE` for cut) so Explorer/apps honor Copy & Cut.
+pub fn set_clipboard_files(paths: &[String], cut: bool) -> Result<(), Win32Error> {
+    set_clipboard_files_for_window(0, paths, cut)
+}
+
+/// Same as `set_clipboard_files`, binding clipboard ownership to `owner_hwnd` so
+/// `EmptyClipboard()` succeeds reliably even under clipboard-history contention.
+pub fn set_clipboard_files_for_window(
+    owner_hwnd: isize,
+    paths: &[String],
+    cut: bool,
+) -> Result<(), Win32Error> {
+    let valid: Vec<String> = paths
+        .iter()
+        .filter(|p| !p.is_empty() && std::path::Path::new(p.as_str()).exists())
+        .cloned()
+        .collect();
+    if valid.is_empty() {
+        return Ok(());
+    }
+
+    let hdrop = build_hdrop_hglobal(&valid).map_err(|e| win_err("build_hdrop_hglobal", e))?;
+    let effect_val = if cut { DROPEFFECT_MOVE.0 } else { DROPEFFECT_COPY.0 };
+    let heffect = build_drop_effect_hglobal(effect_val).ok();
+
+    let _guard = match open_clipboard_with_retry(owner_hwnd) {
+        Ok(g) => g,
+        Err(e) => {
+            unsafe {
+                let _ = GlobalFree(Some(hdrop));
+                if let Some(he) = heffect {
+                    let _ = GlobalFree(Some(he));
+                }
+            }
+            return Err(e);
+        }
+    };
+
+    if let Err(e) = unsafe { EmptyClipboard() } {
+        unsafe {
+            let _ = GlobalFree(Some(hdrop));
+            if let Some(he) = heffect {
+                let _ = GlobalFree(Some(he));
+            }
+        }
+        return Err(win_err("EmptyClipboard", e));
+    }
+    if let Err(e) = unsafe { SetClipboardData(CF_HDROP.0 as u32, Some(HANDLE(hdrop.0))) } {
+        unsafe {
+            let _ = GlobalFree(Some(hdrop));
+            if let Some(he) = heffect {
+                let _ = GlobalFree(Some(he));
+            }
+        }
+        return Err(win_err("SetClipboardData(CF_HDROP)", e));
+    }
+
+    if let Some(he) = heffect {
+        let fmt = unsafe { RegisterClipboardFormatW(w!("Preferred DropEffect")) };
+        if fmt == 0 || unsafe { SetClipboardData(fmt, Some(HANDLE(he.0))) }.is_err() {
+            unsafe {
+                let _ = GlobalFree(Some(he));
+            }
+        }
+    }
+    Ok(())
+}
+
+/// Copies `paths` onto the Windows clipboard as `CF_HDROP`.
+pub fn copy_files_to_clipboard(paths: &[String]) -> Result<(), Win32Error> {
+    set_clipboard_files(paths, false)
+}
+
+/// Copies UTF-16 text (`CF_UNICODETEXT`) onto the Windows clipboard (e.g. file paths).
+pub fn copy_text_to_clipboard(text: &str) -> Result<(), Win32Error> {
+    if text.is_empty() {
+        return Ok(());
+    }
+    let mut utf16: Vec<u16> = text.encode_utf16().collect();
+    utf16.push(0);
+    let bytes = utf16.len() * size_of::<u16>();
+    let hglobal = unsafe { GlobalAlloc(GMEM_MOVEABLE | GMEM_ZEROINIT, bytes) }
+        .map_err(|e| win_err("GlobalAlloc(CF_UNICODETEXT)", e))?;
+    unsafe {
+        let ptr = GlobalLock(hglobal);
+        if ptr.is_null() {
+            let _ = GlobalFree(Some(hglobal));
+            return Err(win_err(
+                "GlobalLock(CF_UNICODETEXT)",
+                windows::core::Error::from_thread(),
+            ));
+        }
+        copy_nonoverlapping(utf16.as_ptr().cast::<u8>(), ptr.cast::<u8>(), bytes);
+        let _ = GlobalUnlock(hglobal);
+    }
+
+    let _guard = match open_clipboard_with_retry(0) {
+        Ok(g) => g,
+        Err(e) => {
+            unsafe {
+                let _ = GlobalFree(Some(hglobal));
+            }
+            return Err(e);
+        }
+    };
+    if let Err(e) = unsafe { EmptyClipboard() } {
+        unsafe {
+            let _ = GlobalFree(Some(hglobal));
+        }
+        return Err(win_err("EmptyClipboard", e));
+    }
+    if let Err(e) = unsafe { SetClipboardData(CF_UNICODETEXT.0 as u32, Some(HANDLE(hglobal.0))) } {
+        unsafe {
+            let _ = GlobalFree(Some(hglobal));
+        }
+        return Err(win_err("SetClipboardData(CF_UNICODETEXT)", e));
+    }
+    Ok(())
+}
+
+/// Reads `CF_HDROP` file paths and whether `Preferred DropEffect` indicates Cut (`DROPEFFECT_MOVE`).
+pub fn read_clipboard_files() -> Option<(Vec<String>, bool)> {
+    if unsafe { IsClipboardFormatAvailable(CF_HDROP.0 as u32) }.is_err() {
+        return None;
+    }
+    let _guard = open_clipboard_with_retry(0).ok()?;
+    let hdata = unsafe { GetClipboardData(CF_HDROP.0 as u32) }.ok()?;
+    let hdrop = HDROP(hdata.0);
+    let count = unsafe { DragQueryFileW(hdrop, u32::MAX, None) };
+    if count == 0 {
+        return None;
+    }
+    let mut paths = Vec::with_capacity(count as usize);
+    for idx in 0..count {
+        let len = unsafe { DragQueryFileW(hdrop, idx, None) } as usize;
+        if len == 0 {
+            continue;
+        }
+        let mut buf = vec![0u16; len + 1];
+        let copied = unsafe { DragQueryFileW(hdrop, idx, Some(&mut buf)) } as usize;
+        let s = String::from_utf16_lossy(&buf[..copied]);
+        if !s.is_empty() {
+            paths.push(s);
+        }
+    }
+    if paths.is_empty() {
+        return None;
+    }
+
+    let mut is_cut = false;
+    let fmt = unsafe { RegisterClipboardFormatW(w!("Preferred DropEffect")) };
+    if fmt != 0
+        && let Ok(heff) = unsafe { GetClipboardData(fmt) }
+    {
+        let hg = HGLOBAL(heff.0);
+        let ptr = unsafe { GlobalLock(hg) };
+        if !ptr.is_null() {
+            let eff = unsafe { *(ptr.cast::<u32>()) };
+            is_cut = (eff & DROPEFFECT_MOVE.0) != 0 && (eff & DROPEFFECT_COPY.0) == 0;
+            let _ = unsafe { GlobalUnlock(hg) };
+        }
+    }
+    Some((paths, is_cut))
+}
+
+/// Reads UTF-16 text (`CF_UNICODETEXT`) from the Windows clipboard.
+pub fn read_clipboard_text() -> Option<String> {
+    if unsafe { IsClipboardFormatAvailable(CF_UNICODETEXT.0 as u32) }.is_err() {
+        return None;
+    }
+    let _guard = open_clipboard_with_retry(0).ok()?;
+    let hdata = unsafe { GetClipboardData(CF_UNICODETEXT.0 as u32) }.ok()?;
+    let hg = HGLOBAL(hdata.0);
+    let ptr = unsafe { GlobalLock(hg) };
+    if ptr.is_null() {
+        return None;
+    }
+    let text = unsafe {
+        let wptr = ptr.cast::<u16>();
+        let mut len = 0usize;
+        while *wptr.add(len) != 0 {
+            len += 1;
+        }
+        String::from_utf16_lossy(std::slice::from_raw_parts(wptr, len))
+    };
+    let _ = unsafe { GlobalUnlock(hg) };
+    if text.is_empty() {
+        None
+    } else {
+        Some(text)
     }
 }

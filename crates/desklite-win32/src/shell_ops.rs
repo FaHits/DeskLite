@@ -7,13 +7,14 @@ use windows::Win32::Storage::FileSystem::{
 };
 use windows::Win32::System::Com::{CLSCTX_INPROC_SERVER, CoCreateInstance, CoTaskMemFree};
 use windows::Win32::UI::Shell::{
-    FOLDERID_Desktop, FOLDERID_PublicDesktop, FOS_FORCEFILESYSTEM, FOS_PICKFOLDERS,
-    FileOpenDialog, IFileOpenDialog, KNOWN_FOLDER_FLAG, SHCNE_UPDATEDIR, SHCNF_PATHW,
-    SHChangeNotify, SHFILEINFOW, SHGFI_DISPLAYNAME, SHGetFileInfoW, SHGetKnownFolderPath,
-    SIGDN_FILESYSPATH, ShellExecuteW,
+    FO_DELETE, FOF_ALLOWUNDO, FOLDERID_Desktop, FOLDERID_PublicDesktop, FOS_FORCEFILESYSTEM,
+    FOS_PICKFOLDERS, FileOpenDialog, IFileOpenDialog, KNOWN_FOLDER_FLAG, SEE_MASK_INVOKEIDLIST,
+    SHCNE_UPDATEDIR, SHCNF_PATHW, SHChangeNotify, SHELLEXECUTEINFOW, SHFILEINFOW, SHFILEOPSTRUCTW,
+    SHFileOperationW, SHGFI_DISPLAYNAME, SHGetFileInfoW, SHGetKnownFolderPath, SIGDN_FILESYSPATH,
+    ShellExecuteExW, ShellExecuteW,
 };
 use windows::Win32::UI::WindowsAndMessaging::SW_SHOWNORMAL;
-use windows::core::{GUID, HSTRING, w};
+use windows::core::{GUID, HSTRING, PCWSTR, w};
 
 use crate::{Win32Error, win_err};
 
@@ -265,7 +266,19 @@ fn unique_dest_path(dir: &Path, file_name: &std::ffi::OsStr) -> PathBuf {
     ))
 }
 
+fn is_desktop_directory(dir: &Path) -> bool {
+    let key = normalize_path_key(dir);
+    all_desktop_dirs()
+        .into_iter()
+        .any(|d| normalize_path_key(&d) == key)
+}
+
 fn notify_shell_dir_updated(dir: &Path) {
+    if is_desktop_directory(dir) {
+        // Never send SHCNE_UPDATEDIR on Desktop: Explorer's CDefView rebuilds the entire
+        // ListView and un-hides every managed DeskLite icon on the Desktop.
+        return;
+    }
     let wdir = HSTRING::from(dir.to_string_lossy().as_ref());
     unsafe {
         SHChangeNotify(
@@ -344,4 +357,176 @@ pub fn migrate_vault_item_to_desktop(path: &Path) -> Option<PathBuf> {
         }
         Err(_) => None,
     }
+}
+
+pub fn launch_as_admin(path: &str) -> Result<(), Win32Error> {
+    let wpath = HSTRING::from(path);
+    let hinst = unsafe { ShellExecuteW(None, w!("runas"), &wpath, None, None, SW_SHOWNORMAL) };
+    if (hinst.0 as isize) <= 32 {
+        return Err(Win32Error::Status {
+            op: "ShellExecuteW(runas)",
+            code: hinst.0 as usize as u32,
+        });
+    }
+    Ok(())
+}
+
+pub fn show_file_properties(path: &str) -> Result<(), Win32Error> {
+    let wpath = HSTRING::from(path);
+    let mut sei = SHELLEXECUTEINFOW {
+        cbSize: std::mem::size_of::<SHELLEXECUTEINFOW>() as u32,
+        fMask: SEE_MASK_INVOKEIDLIST,
+        lpVerb: w!("properties"),
+        lpFile: PCWSTR(wpath.as_ptr()),
+        nShow: SW_SHOWNORMAL.0,
+        ..Default::default()
+    };
+    unsafe { ShellExecuteExW(&mut sei) }.map_err(|e| win_err("ShellExecuteExW(properties)", e))
+}
+
+pub fn rename_file_in_place(old_path: &Path, new_name: &str) -> Result<FenceItem, Win32Error> {
+    let trimmed = new_name.trim();
+    if trimmed.is_empty()
+        || trimmed.contains(['\\', '/', ':', '*', '?', '"', '<', '>', '|'])
+    {
+        return Err(Win32Error::Status {
+            op: "rename_file_in_place(invalid_name)",
+            code: 87,
+        });
+    }
+    let parent = old_path.parent().ok_or(Win32Error::Status {
+        op: "rename_file_in_place(no_parent)",
+        code: 2,
+    })?;
+    let new_path = parent.join(trimmed);
+    let same_ci = old_path
+        .to_string_lossy()
+        .eq_ignore_ascii_case(&new_path.to_string_lossy());
+    if !same_ci && new_path.exists() {
+        return Err(Win32Error::Status {
+            op: "rename_file_in_place(already_exists)",
+            code: 183,
+        });
+    }
+    std::fs::rename(old_path, &new_path).map_err(|_| Win32Error::Status {
+        op: "fs::rename",
+        code: std::io::Error::last_os_error().raw_os_error().unwrap_or(1) as u32,
+    })?;
+    notify_shell_dir_updated(parent);
+    Ok(resolve_dropped_item(&new_path, 0))
+}
+
+pub fn move_path_in_place(src: &Path, dst: &Path) -> Result<(), Win32Error> {
+    if !src.exists() {
+        return Err(Win32Error::Status {
+            op: "move_path_in_place(missing_src)",
+            code: 2,
+        });
+    }
+    if src.to_string_lossy().eq_ignore_ascii_case(&dst.to_string_lossy()) {
+        return Ok(());
+    }
+    if dst.exists() {
+        return Err(Win32Error::Status {
+            op: "move_path_in_place(already_exists)",
+            code: 183,
+        });
+    }
+    move_path_cross_volume(src, dst).map_err(|_| Win32Error::Status {
+        op: "move_path_in_place",
+        code: std::io::Error::last_os_error().raw_os_error().unwrap_or(1) as u32,
+    })?;
+    if let Some(sp) = src.parent() {
+        notify_shell_dir_updated(sp);
+    }
+    if let Some(dp) = dst.parent() {
+        notify_shell_dir_updated(dp);
+    }
+    Ok(())
+}
+
+pub fn paste_files_to_directory_detailed(
+    sources: &[String],
+    target_dir: &Path,
+    is_cut: bool,
+) -> Result<Vec<(PathBuf, PathBuf)>, Win32Error> {
+    if !target_dir.is_dir() {
+        return Ok(Vec::new());
+    }
+    let mut pairs = Vec::new();
+    for raw in sources {
+        let src = Path::new(raw);
+        if !src.exists() {
+            continue;
+        }
+        let Some(fname) = src.file_name() else {
+            continue;
+        };
+        if is_cut && src.parent().is_some_and(|p| normalize_path_key(p) == normalize_path_key(target_dir)) {
+            continue;
+        }
+        let dst = unique_dest_path(target_dir, fname);
+        let res = if is_cut {
+            move_path_cross_volume(src, &dst)
+        } else if src.is_dir() {
+            copy_dir_recursive(src, &dst)
+        } else {
+            std::fs::copy(src, &dst).map(|_| ())
+        };
+        if res.is_ok() {
+            pairs.push((src.to_path_buf(), dst));
+        }
+    }
+    if !pairs.is_empty() {
+        notify_shell_dir_updated(target_dir);
+    }
+    Ok(pairs)
+}
+
+pub fn paste_files_to_directory(
+    sources: &[String],
+    target_dir: &Path,
+    is_cut: bool,
+) -> Result<Vec<PathBuf>, Win32Error> {
+    Ok(paste_files_to_directory_detailed(sources, target_dir, is_cut)?
+        .into_iter()
+        .map(|(_, dst)| dst)
+        .collect())
+}
+
+/// Sends `paths` to the Windows Recycle Bin (`SHFileOperationW` with `FO_DELETE | FOF_ALLOWUNDO`).
+/// Returns `Ok(true)` if executed without user abort.
+pub fn trash_files(paths: &[String]) -> Result<bool, Win32Error> {
+    let valid: Vec<&str> = paths
+        .iter()
+        .map(String::as_str)
+        .filter(|p| !p.is_empty() && Path::new(p).exists())
+        .collect();
+    if valid.is_empty() {
+        return Ok(false);
+    }
+    let mut double_null: Vec<u16> = Vec::new();
+    for p in valid {
+        double_null.extend(p.encode_utf16());
+        double_null.push(0);
+    }
+    double_null.push(0);
+
+    let mut op = SHFILEOPSTRUCTW {
+        wFunc: FO_DELETE,
+        pFrom: PCWSTR(double_null.as_ptr()),
+        fFlags: FOF_ALLOWUNDO.0 as u16,
+        ..Default::default()
+    };
+    let rc = unsafe { SHFileOperationW(&mut op) };
+    if rc != 0 && op.fAnyOperationsAborted.as_bool() {
+        return Ok(false);
+    }
+    if rc != 0 {
+        return Err(Win32Error::Status {
+            op: "SHFileOperationW(FO_DELETE)",
+            code: rc as u32,
+        });
+    }
+    Ok(!op.fAnyOperationsAborted.as_bool())
 }

@@ -24,6 +24,14 @@ const fn default_snap_px() -> i32 {
     12
 }
 
+const fn default_list_row_h() -> i32 {
+    30
+}
+
+const fn default_list_icon_px() -> i32 {
+    18
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum FenceKind {
@@ -94,6 +102,27 @@ pub struct FenceItem {
     pub path: String,
 }
 
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct FenceLayoutOverride {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub icon_cell_w: Option<i32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub icon_cell_h: Option<i32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub list_row_h: Option<i32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub list_icon_px: Option<i32>,
+}
+
+impl FenceLayoutOverride {
+    pub fn is_empty(&self) -> bool {
+        self.icon_cell_w.is_none()
+            && self.icon_cell_h.is_none()
+            && self.list_row_h.is_none()
+            && self.list_icon_px.is_none()
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct FenceSpec {
     pub id: i32,
@@ -102,10 +131,14 @@ pub struct FenceSpec {
     pub rect: Rect,
     #[serde(default)]
     pub collapsed: bool,
+    #[serde(default)]
+    pub locked: bool,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub portal_dir: Option<String>,
     #[serde(default = "default_backdrop_alpha")]
     pub backdrop_alpha: u8,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub layout_override: Option<FenceLayoutOverride>,
     pub items: Vec<FenceItem>,
 }
 
@@ -117,6 +150,10 @@ pub struct LayoutPreferences {
     pub icon_cell_h: i32,
     #[serde(default = "default_snap_px")]
     pub snap_threshold_px: i32,
+    #[serde(default = "default_list_row_h")]
+    pub list_row_h: i32,
+    #[serde(default = "default_list_icon_px")]
+    pub list_icon_px: i32,
 }
 
 impl Default for LayoutPreferences {
@@ -125,6 +162,8 @@ impl Default for LayoutPreferences {
             icon_cell_w: default_cell_w(),
             icon_cell_h: default_cell_h(),
             snap_threshold_px: default_snap_px(),
+            list_row_h: default_list_row_h(),
+            list_icon_px: default_list_icon_px(),
         }
     }
 }
@@ -327,8 +366,10 @@ mod tests {
                 kind: FenceKind::IconGrid,
                 rect: Rect::new(2800, 100, 3100, 400),
                 collapsed: false,
+                locked: false,
                 portal_dir: None,
                 backdrop_alpha: DEFAULT_BACKDROP_ALPHA,
+                layout_override: None,
                 items: vec![],
             }],
             ..Default::default()

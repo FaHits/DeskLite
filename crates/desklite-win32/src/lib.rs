@@ -38,24 +38,36 @@ pub(crate) fn win_err(op: &'static str, source: windows::core::Error) -> Win32Er
 
 pub use desktop_listview::{
     DesktopIconInfo, DesktopListView, find_desktop_listview, hide_desktop_icons_for_paths,
+    hide_desktop_icons_for_paths_async, hide_desktop_icons_for_paths_delayed,
     probe_desktop_window_tree, restore_all_desktop_icons, restore_desktop_icon,
-    restore_desktop_icon_async,
+    restore_desktop_icon_async, restore_desktop_icons_async,
 };
 pub use display::probe_display_topology;
 pub use dpi::enable_per_monitor_dpi_v2;
-pub use drag_out::{DragOutOutcome, start_file_drag_out};
+pub use drag_out::{
+    DragOutOutcome, clipboard_has_files, copy_files_to_clipboard, copy_text_to_clipboard,
+    read_clipboard_files, read_clipboard_text, set_clipboard_files, set_clipboard_files_for_window,
+    start_file_drag_out,
+};
 pub use events::{DisplayEventKind, run_event_monitor};
 pub use fence_poc::{FencePocConfig, run_bottom_fence_poc};
 pub use folder_watch::{FolderWatcher, WM_APP_PORTAL_DIRTY};
 pub use icons::{DecodedIcon, IconCache};
 pub use shell_ops::{
-    all_desktop_dirs, is_directly_on_desktop, is_vault_path, launch_item,
-    migrate_vault_item_to_desktop, pick_folder_dialog, resolve_dropped_item,
-    reveal_in_explorer, scan_portal_directory,
+    all_desktop_dirs, is_directly_on_desktop, is_vault_path, launch_as_admin, launch_item,
+    migrate_vault_item_to_desktop, move_path_in_place, paste_files_to_directory,
+    paste_files_to_directory_detailed, pick_folder_dialog, rename_file_in_place,
+    resolve_dropped_item, reveal_in_explorer, scan_portal_directory, show_file_properties,
+    trash_files, user_desktop_dir,
 };
 pub use tray::{TrayIcon, WM_APP_TRAY};
 pub use window_attach::{
-    DesktopZHookGuard, attach_desktop_owner_and_rounded_corners, find_window_by_exact_title,
-    foreground_window_handle, install_desktop_z_win_event_hooks, post_reassert_all_fences_z,
-    strip_alt_tab_from_host,
+    DesktopZHookGuard, Win32Hotkey, allow_foreground_self,
+    attach_desktop_owner_and_rounded_corners, cursor_screen_pos, enable_dark_popup_menus,
+    find_window_by_exact_title, focus_window_now, foreground_window_handle,
+    install_desktop_z_win_event_hooks, is_ctrl_key_down, is_in_size_move, is_primary_mouse_down,
+    move_window_no_z, live_sizemove_rect_for_hwnd, post_reassert_all_fences_z,
+    set_active_text_edit_hwnd, set_hwnd_locked, set_inspector_hwnd, set_window_rect_no_z,
+    strip_alt_tab_from_host, style_floating_inspector_window, take_win32_hotkeys,
+    window_outer_rect,
 };

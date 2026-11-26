@@ -539,6 +539,62 @@ pub fn hide_desktop_icons_for_paths(managed_paths: &[String]) {
     hide_icons_unlocked(&lv, managed_paths);
 }
 
+/// Non-blocking wrapper around `hide_desktop_icons_for_paths`.
+pub fn hide_desktop_icons_for_paths_async(managed_paths: Vec<String>) {
+    if managed_paths.is_empty() {
+        return;
+    }
+    std::thread::spawn(move || {
+        hide_desktop_icons_for_paths(&managed_paths);
+    });
+}
+
+static DELAYED_HIDE_GEN: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// Coalesced delayed re-hide pass for Desktop icons after Explorer finishes processing
+/// asynchronous filesystem watcher / shell rename/paste notifications.
+pub fn hide_desktop_icons_for_paths_delayed(managed_paths: Vec<String>, delay_ms: u64) {
+    if managed_paths.is_empty() {
+        return;
+    }
+    let epoch = DELAYED_HIDE_GEN.fetch_add(1, std::sync::atomic::Ordering::SeqCst) + 1;
+    std::thread::spawn(move || {
+        std::thread::sleep(std::time::Duration::from_millis(delay_ms));
+        if DELAYED_HIDE_GEN.load(std::sync::atomic::Ordering::Acquire) == epoch {
+            hide_desktop_icons_for_paths(&managed_paths);
+        }
+    });
+}
+
+/// Restores a batch of Desktop-resident icons onto `SysListView32` in one serialized pass.
+pub fn restore_desktop_icons_async(paths: Vec<String>) {
+    let desktop_paths: Vec<String> = paths
+        .into_iter()
+        .filter(|s| {
+            let p = Path::new(s.as_str());
+            is_directly_on_desktop(p) && p.exists()
+        })
+        .collect();
+    if desktop_paths.is_empty() {
+        return;
+    }
+    std::thread::spawn(move || {
+        let _guard = lv_sync_lock().lock().unwrap_or_else(|e| e.into_inner());
+        let Ok(lv) = find_desktop_listview() else {
+            return;
+        };
+        let Ok(icons) = lv.enumerate_icons() else {
+            return;
+        };
+        for raw in desktop_paths {
+            let p = Path::new(&raw);
+            if find_icon_index_for_path(&icons, p).is_none() {
+                notify_shell_item(p, true, true);
+            }
+        }
+    });
+}
+
 /// Restores a Desktop-resident icon back onto `SysListView32` (off the UI thread so egui never stalls),
 /// optionally placing it at `(screen_x, screen_y)` while keeping other managed items hidden.
 pub fn restore_desktop_icon_async(
