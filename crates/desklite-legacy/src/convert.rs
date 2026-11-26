@@ -3,8 +3,8 @@ use std::fs;
 use std::path::Path;
 
 use desklite_core::{
-    DisplayTopology, FenceItem, FenceKind, FenceSpec, ItemKind, NativeLayoutConfig, Rect,
-    TopologySnapshot, atomic_write_bytes, clamp_rect_to_monitors,
+    DisplayTopology, FenceItem, FenceKind, FenceRole, FenceSpec, ItemKind, NativeLayoutConfig,
+    Point, Rect, TopologySnapshot, atomic_write_bytes, clamp_rect_to_monitors,
 };
 
 use crate::LegacyError;
@@ -85,7 +85,7 @@ pub fn save_legacy_dir(
             let p = dir.join(name);
             if p.exists() {
                 let archived = dir.join(format!("{name}.legacy_archived"));
-                let _ = fs::rename(&p, &archived);
+                fs::rename(&p, &archived)?;
                 cleaned.push(name.to_string());
             }
         }
@@ -160,6 +160,7 @@ pub fn legacy_to_native(
             rect: b.rect,
             collapsed: false,
             locked: false,
+            role: Some(FenceRole::DesktopBucket),
             portal_dir: None,
             backdrop_alpha: desklite_core::DEFAULT_BACKDROP_ALPHA,
             layout_override: None,
@@ -167,9 +168,27 @@ pub fn legacy_to_native(
         });
     }
 
+    cfg.enforce_desktop_single_ownership(&[]);
+
+    let mut free_legacy_items: Vec<FenceItem> = bundle
+        .xml
+        .items
+        .iter()
+        .filter(|it| it.box_id == 1)
+        .map(|it| FenceItem {
+            display_name: it.display_name.clone(),
+            order: it.order,
+            kind: ItemKind::from(it.kind),
+            path: it.path.clone(),
+        })
+        .collect();
+    free_legacy_items.sort_by_key(|it| it.order);
+
     if let Some(topo) = topology {
         let mut rects = BTreeMap::new();
-        for f in &cfg.fences {
+        for f in &mut cfg.fences {
+            let (clamped, _) = clamp_rect_to_monitors(f.rect, topo.monitors())?;
+            f.rect = clamped;
             rects.insert(f.id, f.rect);
         }
         let key = topo.key().clone();
@@ -183,6 +202,13 @@ pub fn legacy_to_native(
                 free_icons: Vec::new(),
             },
         );
+        cfg.reconcile_free_icons(
+            &free_legacy_items,
+            Point { x: 24, y: 24 },
+            (cfg.preferences.icon_cell_w, cfg.preferences.icon_cell_h),
+            topo.monitors(),
+            &[],
+        )?;
     }
 
     Ok(cfg)

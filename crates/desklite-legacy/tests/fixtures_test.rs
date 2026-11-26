@@ -1,10 +1,12 @@
 use std::path::PathBuf;
 
-use desklite_core::{DisplayTopology, MonitorDescriptor, Rect};
+use desklite_core::{DisplayTopology, FenceRole, MonitorDescriptor, Rect};
 use desklite_legacy::{
-    LegacyOptions, build_fences_xml, legacy_to_native, load_legacy_dir, repair_legacy_dir,
-    save_legacy_dir,
+    LegacyBundle, LegacyOptions, build_fences_xml, legacy_to_native, load_legacy_dir,
+    repair_legacy_dir, save_legacy_dir,
 };
+use desklite_legacy::fences_xml::FencesXmlModel;
+use desklite_legacy::records::{LegacyBoxRecord, LegacyItemRecord};
 
 fn fixture_dir() -> PathBuf {
     PathBuf::from(env!("CARGO_MANIFEST_DIR"))
@@ -99,4 +101,79 @@ fn legacy_repair_clamps_out_of_bounds_box_and_writes_consistent_files() {
     // Also test direct save_legacy_dir idempotence.
     save_legacy_dir(&tmp, &reloaded, &opts).unwrap();
     let _ = std::fs::remove_dir_all(&tmp);
+}
+
+#[test]
+fn legacy_to_native_imports_free_desktop_items_and_clamps_boxes() {
+    let topo = demo_primary_topology();
+    let bundle = LegacyBundle {
+        xml: FencesXmlModel {
+            boxes: vec![
+                LegacyBoxRecord {
+                    tag: "Box".into(),
+                    id: 1,
+                    name: String::new(),
+                    rect: Rect::new(0, 0, 2560, 1440),
+                    reserved_6_7: [0, 0],
+                    kind: 3,
+                    reserved_9_22: [0; 14],
+                    tail: String::new(),
+                },
+                LegacyBoxRecord {
+                    tag: "Box".into(),
+                    id: 101,
+                    name: "Work".into(),
+                    rect: Rect::new(2700, 100, 3000, 400),
+                    reserved_6_7: [0, 0],
+                    kind: 3,
+                    reserved_9_22: [0; 14],
+                    tail: String::new(),
+                },
+            ],
+            screens: vec![],
+            items: vec![
+                LegacyItemRecord {
+                    tag: "Item".into(),
+                    display_name: "Bucketed.lnk".into(),
+                    box_id: 101,
+                    order: 0,
+                    kind: 2,
+                    path: r"C:\Users\Alice\Desktop\Bucketed.lnk".into(),
+                    reserved: 0,
+                },
+                LegacyItemRecord {
+                    tag: "Item".into(),
+                    display_name: "FreeOne.lnk".into(),
+                    box_id: 1,
+                    order: 1,
+                    kind: 2,
+                    path: r"C:\Users\Alice\Desktop\FreeOne.lnk".into(),
+                    reserved: 0,
+                },
+                LegacyItemRecord {
+                    tag: "Item".into(),
+                    display_name: "FreeTwo.txt".into(),
+                    box_id: 1,
+                    order: 0,
+                    kind: 4,
+                    path: r"C:\Users\Alice\Desktop\FreeTwo.txt".into(),
+                    reserved: 0,
+                },
+            ],
+        },
+        con: None,
+    };
+
+    let native = legacy_to_native(&bundle, Some(&topo)).unwrap();
+    assert_eq!(native.fences.len(), 1);
+    assert_eq!(native.fences[0].role, Some(FenceRole::DesktopBucket));
+    // Box 101 was off-screen to the right and clamped onto demo_primary_topology.
+    assert_eq!(native.fences[0].rect, Rect::new(2260, 100, 2560, 400));
+
+    let free_icons = native.active_free_icons();
+    assert_eq!(free_icons.len(), 2);
+    // Sorted by XML order: FreeTwo.txt (order 0) then FreeOne.lnk (order 1).
+    assert_eq!(free_icons[0].display_name, "FreeTwo.txt");
+    assert_eq!(free_icons[1].display_name, "FreeOne.lnk");
+    assert_ne!(free_icons[0].pos, free_icons[1].pos);
 }

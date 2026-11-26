@@ -12,7 +12,8 @@ use desklite_legacy::{
 };
 use desklite_win32::{
     DisplayEventKind, FencePocConfig, enable_per_monitor_dpi_v2, find_desktop_listview,
-    probe_desktop_window_tree, probe_display_topology, run_bottom_fence_poc, run_event_monitor,
+    probe_desktop_window_tree, probe_display_topology, restore_all_desktop_icons,
+    run_bottom_fence_poc, run_event_monitor,
 };
 
 #[derive(Parser)]
@@ -80,6 +81,8 @@ enum Commands {
         #[arg(long, default_value_t = 1000)]
         hold_ms: u64,
     },
+    /// Restore native Windows desktop icons visibility and redraw desktop view
+    RestoreDesktop,
     /// Launch a Direct2D + Win11 DWM Acrylic bottom-most PoC fence window
     PocFence {
         #[arg(long, default_value = "DeskLite PoC Fence (Alt+F4 / Close to exit)")]
@@ -385,6 +388,10 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
                 "Icon[{index}] restored=({}, {})",
                 restored.x, restored.y
             );
+        }
+        Commands::RestoreDesktop => {
+            restore_all_desktop_icons();
+            println!("Requested native desktop icons visibility and refresh.");
         }
         Commands::PocFence {
             title,

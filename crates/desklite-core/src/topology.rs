@@ -158,10 +158,6 @@ fn compute_topology_key(monitors: &[MonitorDescriptor]) -> TopologyKey {
             m.rect.top,
             m.rect.right,
             m.rect.bottom,
-            m.work_area.left,
-            m.work_area.top,
-            m.work_area.right,
-            m.work_area.bottom,
         ] {
             h = fnv1a_i32(h, v);
         }
@@ -233,5 +229,15 @@ mod tests {
         assert_ne!(a.key(), b_swapped_primary.key());
         assert_ne!(a.key(), c_dpi_changed.key());
         assert_ne!(a.key(), d_left_right_flipped.key());
+    }
+
+    #[test]
+    fn key_ignores_work_area_taskbar_changes() {
+        let mut base = mon("DP-1", 0, 0, 2560, 1440, 96, true);
+        let t1 = DisplayTopology::try_from_monitors(vec![base.clone()]).unwrap();
+        // Simulate taskbar auto-hide or resizing changing only work_area.
+        base.work_area = Rect::new(0, 0, 2560, 1440);
+        let t2 = DisplayTopology::try_from_monitors(vec![base]).unwrap();
+        assert_eq!(t1.key(), t2.key());
     }
 }
