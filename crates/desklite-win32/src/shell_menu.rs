@@ -1,7 +1,8 @@
-use std::cell::Cell;
+use std::cell::{Cell, RefCell};
 use std::collections::HashSet;
 use std::mem::size_of;
 use std::path::Path;
+use std::time::{Duration, Instant};
 
 use windows::Win32::Foundation::{HWND, LPARAM, LRESULT, POINT, WPARAM};
 use windows::Win32::System::Com::{COINIT_APARTMENTTHREADED, CoInitializeEx};
@@ -520,6 +521,85 @@ pub fn append_menu_separator(menu: HMENU) {
     let _ = unsafe { AppendMenuW(menu, MENU_ITEM_FLAGS(MF_SEPARATOR.0), 0, None) };
 }
 
+struct PrefetchedShellMenu {
+    paths: Vec<String>,
+    shift_down: bool,
+    built_at: Instant,
+    menu: OwnedMenu,
+    cm: IContextMenu,
+}
+
+thread_local! {
+    static PREFETCHED_SHELL_MENU: RefCell<Option<PrefetchedShellMenu>> = const { RefCell::new(None) };
+}
+
+const PREFETCH_SHELL_MENU_TTL: Duration = Duration::from_millis(2500);
+
+fn build_shell_items_menu_pair(
+    invoke_hwnd: HWND,
+    paths: &[String],
+    shift_down: bool,
+) -> Option<(OwnedMenu, Option<IContextMenu>)> {
+    let menu = OwnedMenu::new()?;
+    let cm_opt = acquire_items_context_menu(invoke_hwnd, paths);
+    if let Some(cm) = &cm_opt {
+        let mut flags = CMF_NORMAL | CMF_ASYNCVERBSTATE;
+        if paths.len() == 1 {
+            flags |= CMF_CANRENAME;
+        }
+        if shift_down {
+            flags |= CMF_EXTENDEDVERBS;
+        }
+        let hr = unsafe {
+            cm.QueryContextMenu(menu.0, 0, SHELL_MENU_CMD_FIRST, SHELL_MENU_CMD_LAST, flags)
+        };
+        if !hr.is_err() && unsafe { GetMenuItemCount(Some(menu.0)) } > 0 {
+            return Some((menu, Some(cm.clone())));
+        }
+    }
+    Some((menu, None))
+}
+
+/// Pre-builds the Windows Shell `IContextMenu` & `HMENU` on the current STA thread when an item
+/// is single-clicked so a subsequent right-click pops up in <1ms without waiting for extensions.
+pub fn prefetch_shell_items_menu(invoke_hwnd: HWND, paths: &[String]) {
+    if !paths_share_same_shell_parent(paths) {
+        clear_prefetched_shell_menu();
+        return;
+    }
+    let shift_down = is_vk_down(VK_SHIFT.0);
+    let already_fresh = PREFETCHED_SHELL_MENU.with(|cell| {
+        cell.borrow().as_ref().is_some_and(|c| {
+            c.paths == paths
+                && c.shift_down == shift_down
+                && c.built_at.elapsed() <= Duration::from_millis(1500)
+        })
+    });
+    if already_fresh {
+        return;
+    }
+    // Drop any previous cached menu before querying the new one.
+    clear_prefetched_shell_menu();
+    if let Some((menu, Some(cm))) = build_shell_items_menu_pair(invoke_hwnd, paths, shift_down) {
+        PREFETCHED_SHELL_MENU.with(|cell| {
+            *cell.borrow_mut() = Some(PrefetchedShellMenu {
+                paths: paths.to_vec(),
+                shift_down,
+                built_at: Instant::now(),
+                menu,
+                cm,
+            });
+        });
+    }
+}
+
+/// Releases any unused prefetched `IContextMenu`/`HMENU` entry on the current thread.
+pub fn clear_prefetched_shell_menu() {
+    PREFETCHED_SHELL_MENU.with(|cell| {
+        let _ = cell.borrow_mut().take();
+    });
+}
+
 /// Shows a hybrid Win32 context menu combining DeskLite actions at the top with full native Windows
 /// Explorer `IContextMenu` (`IContextMenu2` / `IContextMenu3`) shell items below.
 ///
@@ -533,32 +613,30 @@ pub fn show_hybrid_shell_items_menu(
     fallback_items: &[CustomMenuItem],
     track_popup: impl FnOnce(HMENU) -> u32,
 ) -> HybridMenuOutcome {
-    let Some(menu) = OwnedMenu::new() else {
+    let shift_down = is_vk_down(VK_SHIFT.0);
+    let cached_hit = PREFETCHED_SHELL_MENU.with(|cell| {
+        let taken = cell.borrow_mut().take();
+        taken.filter(|c| {
+            c.paths == paths
+                && c.shift_down == shift_down
+                && c.built_at.elapsed() <= PREFETCH_SHELL_MENU_TTL
+        })
+    });
+
+    let (menu, cm_opt) = if let Some(cached) = cached_hit {
+        (cached.menu, Some(cached.cm))
+    } else if let Some(pair) = build_shell_items_menu_pair(invoke_hwnd, paths, shift_down) {
+        pair
+    } else {
         return HybridMenuOutcome::Cancelled;
     };
 
-    let cm_opt = acquire_items_context_menu(invoke_hwnd, paths);
-    let mut shell_ready = false;
+    let shell_ready = cm_opt.is_some();
     let mut ignored_menus = HashSet::new();
 
-    if let Some(cm) = &cm_opt {
-        let mut flags = CMF_NORMAL | CMF_ASYNCVERBSTATE;
-        if paths.len() == 1 {
-            flags |= CMF_CANRENAME;
-        }
-        if is_vk_down(VK_SHIFT.0) {
-            flags |= CMF_EXTENDEDVERBS;
-        }
-        let hr = unsafe {
-            cm.QueryContextMenu(menu.0, 0, SHELL_MENU_CMD_FIRST, SHELL_MENU_CMD_LAST, flags)
-        };
-        if !hr.is_err() && unsafe { GetMenuItemCount(Some(menu.0)) } > 0 {
-            shell_ready = true;
-            insert_custom_items_at_top(menu.0, top_custom_items, true, &mut ignored_menus);
-        }
-    }
-
-    if !shell_ready {
+    if shell_ready {
+        insert_custom_items_at_top(menu.0, top_custom_items, true, &mut ignored_menus);
+    } else {
         let mut unused_ignored = HashSet::new();
         append_custom_items(menu.0, fallback_items, &mut unused_ignored);
     }

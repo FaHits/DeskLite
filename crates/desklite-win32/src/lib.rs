@@ -71,8 +71,9 @@ pub use shell_menu::{
     ActiveShellMenuGuard, CUSTOM_MENU_CMD_BASE, CustomMenuItem, HybridMenuOutcome,
     SHELL_MENU_CMD_FIRST, SHELL_MENU_CMD_LAST, ShellVerbInterception, append_custom_items,
     append_lazy_desktop_background_submenu, append_menu_separator, classify_shell_verb,
-    handle_active_shell_menu_msg, invoke_shell_context_command, is_shell_menu_cmd_id,
-    paths_share_same_shell_parent, show_hybrid_shell_items_menu, warmup_shell_context_menu,
+    clear_prefetched_shell_menu, handle_active_shell_menu_msg, invoke_shell_context_command,
+    is_shell_menu_cmd_id, paths_share_same_shell_parent, prefetch_shell_items_menu,
+    show_hybrid_shell_items_menu, warmup_shell_context_menu,
 };
 pub use shell_ops::{
     all_desktop_dirs, delete_files_permanently, is_desktop_dir_path, is_directly_on_desktop,

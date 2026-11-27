@@ -32,17 +32,19 @@ use desklite_win32::{
     ActiveShellMenuGuard, CUSTOM_MENU_CMD_BASE, CustomMenuItem, FolderWatcher,
     FreeDesktopController, FreeDesktopEvent, HybridMenuOutcome, IconCache, TrayIcon,
     WM_APP_PORTAL_DIRTY, WM_APP_TRAY, all_desktop_dirs, append_lazy_desktop_background_submenu,
-    clipboard_has_files, enable_dark_popup_menus, enable_per_monitor_dpi_v2, focus_window_now,
-    force_foreground_for_popup, handle_active_shell_menu_msg, hide_all_fences_immediately,
+    clipboard_has_files, clear_prefetched_shell_menu, enable_dark_popup_menus,
+    enable_per_monitor_dpi_v2, focus_window_now, force_foreground_for_popup,
+    foreground_window_handle, handle_active_shell_menu_msg, hide_all_fences_immediately,
     install_desktop_z_win_event_hooks, install_ui_thread_cloak_hook, invoke_shell_context_command,
     is_desktop_dir_path, is_directly_on_desktop, is_display_wake_power_broadcast,
     is_shell_menu_cmd_id, is_vault_path, launch_item, migrate_vault_item_to_desktop,
-    pick_folder_dialog, post_reassert_all_fences_z, probe_display_topology,
-    reassert_desktop_z_order_sync, register_power_and_session_notifications,
-    restore_all_desktop_icons, scan_portal_directory, set_external_foreground_notify_target,
-    set_shell_desktop_icons_visible, set_window_cloaked, set_window_rect_no_z,
-    set_z_reassert_notify_target, show_hybrid_shell_items_menu, strip_alt_tab_from_host,
-    unregister_power_and_session_notifications, warmup_shell_context_menu,
+    pick_folder_dialog, post_reassert_all_fences_z, prefetch_shell_items_menu,
+    probe_display_topology, reassert_desktop_z_order_sync,
+    register_power_and_session_notifications, restore_all_desktop_icons, scan_portal_directory,
+    set_external_foreground_notify_target, set_shell_desktop_icons_visible, set_window_cloaked,
+    set_window_rect_no_z, set_z_reassert_notify_target, show_hybrid_shell_items_menu,
+    strip_alt_tab_from_host, unregister_power_and_session_notifications,
+    warmup_shell_context_menu,
 };
 use egui::{Pos2, Vec2, ViewportBuilder, ViewportCommand, ViewportId, WindowLevel};
 use raw_window_handle::{HasWindowHandle, RawWindowHandle};
@@ -83,6 +85,8 @@ const Z_REASSERT_TIMER_2: usize = 107;
 const Z_REASSERT_DELAY_2_MS: u32 = 170;
 const SHELL_WARMUP_TIMER: usize = 108;
 const SHELL_WARMUP_DELAY_MS: u32 = 1000;
+const PREFETCH_EXPIRE_TIMER: usize = 109;
+const PREFETCH_EXPIRE_DELAY_MS: u32 = 3000;
 
 const WM_APP_SYNC_WATCHERS: u32 = WM_APP + 20;
 const WM_APP_SHUTDOWN: u32 = WM_APP + 21;
@@ -98,6 +102,7 @@ const WM_APP_EXTERNAL_FOREGROUND: u32 = WM_APP + 30;
 const WM_APP_REASSERT_DESKTOP_Z: u32 = WM_APP + 31;
 const WM_APP_SHOW_FENCE_ITEM_MENU: u32 = WM_APP + 32;
 const WM_APP_FAST_FREE_MENU: u32 = WM_APP + 33;
+const WM_APP_PREFETCH_SHELL_MENU: u32 = WM_APP + 34;
 
 const TRAY_CMD_NEW_BLANK: u32 = 1001;
 const TRAY_CMD_NEW_PORTAL: u32 = 1003;
@@ -530,6 +535,7 @@ enum BgEvent {
 static TASKBAR_CREATED_MSG: AtomicU32 = AtomicU32::new(0);
 
 type FenceItemMenuReq = Option<(i32, Vec<String>, bool)>;
+type PrefetchMenuReq = Option<(Vec<String>, isize)>;
 
 struct HelperState {
     hwnd: HWND,
@@ -539,6 +545,7 @@ struct HelperState {
     free_icon_menu_paths: Arc<Mutex<Vec<String>>>,
     fence_item_menu_req: Arc<Mutex<FenceItemMenuReq>>,
     fast_free_menu_event: Arc<Mutex<Option<FreeDesktopEvent>>>,
+    prefetch_menu_req: Arc<Mutex<PrefetchMenuReq>>,
     tx: Sender<BgEvent>,
     egui_ctx: egui::Context,
     tray: Option<TrayIcon>,
@@ -1209,7 +1216,7 @@ impl HelperState {
         }
         let keep_external_focus = matches!(
             raw_cmd,
-            FREE_CMD_NEW_BLANK
+            0 | FREE_CMD_NEW_BLANK
                 | FREE_CMD_NEW_PORTAL
                 | FREE_CMD_OPEN_DESKTOP_DIR
                 | FREE_CMD_OPEN_CONFIG_DIR
@@ -1217,7 +1224,31 @@ impl HelperState {
         );
         if !keep_external_focus {
             let free_hwnd = lock_unpoisoned(&self.shared).free_desktop_hwnd;
-            focus_window_now(free_hwnd);
+            self.restore_focus_unless_external(free_hwnd);
+        }
+    }
+
+    fn is_desklite_window(&self, raw_hwnd: isize) -> bool {
+        if raw_hwnd == 0 {
+            return false;
+        }
+        if raw_hwnd == (self.hwnd.0 as isize) {
+            return true;
+        }
+        let guard = lock_unpoisoned(&self.shared);
+        raw_hwnd == guard.free_desktop_hwnd
+            || guard.attached_hwnds.values().any(|&h| h == raw_hwnd)
+    }
+
+    /// Restores focus back to a DeskLite window after a popup menu closes ONLY when the user
+    /// did not click an external application (such as Antigravity/Chrome/Explorer) to dismiss it.
+    fn restore_focus_unless_external(&self, target_hwnd: isize) {
+        if target_hwnd == 0 {
+            return;
+        }
+        let fg = foreground_window_handle();
+        if fg == 0 || self.is_desklite_window(fg) {
+            focus_window_now(target_hwnd);
         }
     }
 
@@ -1362,7 +1393,7 @@ impl HelperState {
 
         match outcome {
             HybridMenuOutcome::Cancelled => {
-                focus_window_now(free_hwnd);
+                self.restore_focus_unless_external(free_hwnd);
             }
             HybridMenuOutcome::Custom(raw_cmd) => {
                 let action = match raw_cmd {
@@ -1396,7 +1427,7 @@ impl HelperState {
                         | FREE_ICON_CMD_PROPERTIES
                 );
                 if !keep_external_focus {
-                    focus_window_now(free_hwnd);
+                    self.restore_focus_unless_external(free_hwnd);
                 }
             }
             HybridMenuOutcome::InterceptedRename => {
@@ -1410,7 +1441,7 @@ impl HelperState {
                     .tx
                     .send(BgEvent::FreeIconMenuCmd(paths, FreeIconMenuCommand::Copy { cut }));
                 self.egui_ctx.request_repaint_of(ViewportId::ROOT);
-                focus_window_now(free_hwnd);
+                self.restore_focus_unless_external(free_hwnd);
             }
             HybridMenuOutcome::ShellInvoked { verb } => {
                 if verb.as_deref() != Some("open") {
@@ -1506,7 +1537,7 @@ impl HelperState {
 
         match outcome {
             HybridMenuOutcome::Cancelled => {
-                focus_window_now(fence_hwnd);
+                self.restore_focus_unless_external(fence_hwnd);
             }
             HybridMenuOutcome::Custom(raw_cmd) => {
                 let action = match raw_cmd {
@@ -1542,7 +1573,7 @@ impl HelperState {
                         | FREE_ICON_CMD_PROPERTIES
                 );
                 if !keep_external_focus {
-                    focus_window_now(fence_hwnd);
+                    self.restore_focus_unless_external(fence_hwnd);
                 }
             }
             HybridMenuOutcome::InterceptedRename => {
@@ -1552,7 +1583,7 @@ impl HelperState {
                     FenceItemMenuCommand::Rename,
                 ));
                 self.egui_ctx.request_repaint_of(ViewportId::ROOT);
-                focus_window_now(fence_hwnd);
+                self.restore_focus_unless_external(fence_hwnd);
             }
             HybridMenuOutcome::InterceptedCopy { cut } => {
                 let _ = self.tx.send(BgEvent::FenceItemMenuCmd(
@@ -1561,7 +1592,7 @@ impl HelperState {
                     FenceItemMenuCommand::Copy { cut },
                 ));
                 self.egui_ctx.request_repaint_of(ViewportId::ROOT);
-                focus_window_now(fence_hwnd);
+                self.restore_focus_unless_external(fence_hwnd);
             }
             HybridMenuOutcome::ShellInvoked { verb } => {
                 if verb.as_deref() != Some("open") {
@@ -1722,10 +1753,13 @@ unsafe extern "system" fn helper_wnd_proc(
             let _ = unsafe { KillTimer(Some(hwnd), Z_REASSERT_TIMER_1) };
             let _ = unsafe { KillTimer(Some(hwnd), Z_REASSERT_TIMER_2) };
             let _ = unsafe { KillTimer(Some(hwnd), SHELL_WARMUP_TIMER) };
+            let _ = unsafe { KillTimer(Some(hwnd), PREFETCH_EXPIRE_TIMER) };
+            clear_prefetched_shell_menu();
             unsafe { PostQuitMessage(0) };
             LRESULT(0)
         }
         WM_APP_PORTAL_DIRTY => {
+            clear_prefetched_shell_menu();
             let fid = wparam.0 as i32;
             if fid < 0 {
                 st.dirty_desktop = true;
@@ -1762,6 +1796,27 @@ unsafe extern "system" fn helper_wnd_proc(
                 lock_unpoisoned(&st.fence_item_menu_req).take()
             {
                 st.show_fence_item_menu(fid, paths, is_bucket, x, y);
+            }
+            LRESULT(0)
+        }
+        WM_APP_PREFETCH_SHELL_MENU => {
+            if !st.shutting_down
+                && let Some((paths, owner_raw)) = lock_unpoisoned(&st.prefetch_menu_req).take()
+            {
+                let invoke_hwnd = if owner_raw != 0 {
+                    HWND(owner_raw as *mut _)
+                } else {
+                    hwnd
+                };
+                prefetch_shell_items_menu(invoke_hwnd, &paths);
+                unsafe {
+                    SetTimer(
+                        Some(hwnd),
+                        PREFETCH_EXPIRE_TIMER,
+                        PREFETCH_EXPIRE_DELAY_MS,
+                        None,
+                    );
+                }
             }
             LRESULT(0)
         }
@@ -1851,15 +1906,16 @@ unsafe extern "system" fn helper_wnd_proc(
                         .find(|p| Path::new(p).exists())
                 };
                 if let Some(sample) = sample_path {
-                    thread::spawn(move || {
-                        let hr = unsafe { CoInitializeEx(None, COINIT_APARTMENTTHREADED) };
-                        warmup_shell_context_menu(&sample);
-                        if hr.is_ok() {
-                            unsafe { CoUninitialize() };
-                        }
-                    });
+                    // Run directly on the persistent helper STA thread so third-party Shell COM
+                    // extensions stay cached inside the exact apartment that pops context menus.
+                    warmup_shell_context_menu(&sample);
                 }
             }
+            LRESULT(0)
+        }
+        WM_TIMER if wparam.0 == PREFETCH_EXPIRE_TIMER => {
+            let _ = unsafe { KillTimer(Some(hwnd), PREFETCH_EXPIRE_TIMER) };
+            clear_prefetched_shell_menu();
             LRESULT(0)
         }
         WM_TIMER if wparam.0 == Z_REASSERT_TIMER_1 || wparam.0 == Z_REASSERT_TIMER_2 => {
@@ -1916,6 +1972,7 @@ fn spawn_win32_helper(
     free_icon_menu_paths: Arc<Mutex<Vec<String>>>,
     fence_item_menu_req: Arc<Mutex<FenceItemMenuReq>>,
     fast_free_menu_event: Arc<Mutex<Option<FreeDesktopEvent>>>,
+    prefetch_menu_req: Arc<Mutex<PrefetchMenuReq>>,
     tx: Sender<BgEvent>,
     egui_ctx: egui::Context,
 ) -> isize {
@@ -1965,6 +2022,7 @@ fn spawn_win32_helper(
             free_icon_menu_paths,
             fence_item_menu_req,
             fast_free_menu_event,
+            prefetch_menu_req,
             tx,
             egui_ctx,
             tray: TrayIcon::new(hwnd, 1, "DeskLite 桌面整理").ok(),
@@ -2586,6 +2644,7 @@ impl DeskLiteEguiApp {
                         LPARAM(packed as isize),
                     );
                 }
+                FenceCommand::PrefetchShellMenu { .. } => {}
                 FenceCommand::FreeDesktopMenuAction(action) => {
                     if apply_free_desktop_menu_command(action, &self.shared, ctx) {
                         needs_save = true;
@@ -2857,6 +2916,7 @@ fn main() {
     let free_icon_menu_paths = Arc::new(Mutex::new(Vec::new()));
     let fence_item_menu_req = Arc::new(Mutex::new(None));
     let fast_free_menu_event = Arc::new(Mutex::new(None));
+    let prefetch_menu_req = Arc::new(Mutex::new(None));
     let (tx, rx) = mpsc::channel();
 
     let mut native_options = eframe::NativeOptions {
@@ -2885,6 +2945,7 @@ fn main() {
                 Arc::clone(&free_icon_menu_paths),
                 Arc::clone(&fence_item_menu_req),
                 Arc::clone(&fast_free_menu_event),
+                Arc::clone(&prefetch_menu_req),
                 tx.clone(),
                 cc.egui_ctx.clone(),
             );
@@ -2921,6 +2982,7 @@ fn main() {
                 guard.set_drag_notify_target(helper_hwnd, WM_APP_DRAG_DONE);
                 guard.set_free_desktop_notify_target(helper_hwnd, WM_APP_REFRESH_FREE_DESKTOP);
                 let item_req_slot = Arc::clone(&fence_item_menu_req);
+                let prefetch_slot = Arc::clone(&prefetch_menu_req);
                 guard.menu_dispatcher = Some(Arc::new(move |cmd| {
                     if helper_hwnd == 0 {
                         return;
@@ -2965,6 +3027,17 @@ fn main() {
                                     WM_APP_SHOW_FENCE_ITEM_MENU,
                                     WPARAM(0),
                                     LPARAM(packed as isize),
+                                );
+                            }
+                        }
+                        FenceCommand::PrefetchShellMenu { paths, owner_hwnd } => {
+                            *lock_unpoisoned(&prefetch_slot) = Some((paths, owner_hwnd));
+                            unsafe {
+                                let _ = PostMessageW(
+                                    Some(target),
+                                    WM_APP_PREFETCH_SHELL_MENU,
+                                    WPARAM(0),
+                                    LPARAM(0),
                                 );
                             }
                         }

@@ -452,6 +452,14 @@ pub fn execute_item_action(
                 set.clear();
                 set.insert(idx);
                 guard.selection_anchor.insert(fence_id, idx);
+                if let Some(it) = spec.items.get(idx)
+                    && let Some(dispatcher) = guard.menu_dispatcher.clone()
+                {
+                    dispatcher(FenceCommand::PrefetchShellMenu {
+                        paths: vec![it.path.clone()],
+                        owner_hwnd: my_hwnd,
+                    });
+                }
             }
         }
         ItemUiAction::OpenContextMenu {

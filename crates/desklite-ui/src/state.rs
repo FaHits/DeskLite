@@ -66,6 +66,10 @@ pub enum FenceCommand {
         screen_x: i32,
         screen_y: i32,
     },
+    PrefetchShellMenu {
+        paths: Vec<String>,
+        owner_hwnd: isize,
+    },
     FreeDesktopMenuAction(FreeDesktopMenuCommand),
 }
 
@@ -783,7 +787,9 @@ impl SharedFenceState {
         if let Some(dispatcher) = &self.menu_dispatcher
             && matches!(
                 cmd,
-                FenceCommand::ShowFenceMenu { .. } | FenceCommand::ShowFenceItemMenu { .. }
+                FenceCommand::ShowFenceMenu { .. }
+                    | FenceCommand::ShowFenceItemMenu { .. }
+                    | FenceCommand::PrefetchShellMenu { .. }
             )
         {
             dispatcher(cmd);

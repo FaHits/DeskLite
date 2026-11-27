@@ -430,6 +430,12 @@ pub fn handle_free_desktop_event(
                 guard.free_selected_paths.insert(key.clone());
                 guard.free_selection_anchor = Some(key.clone());
                 guard.free_focus_path = Some(key);
+                if let Some(dispatcher) = guard.menu_dispatcher.clone() {
+                    dispatcher(FenceCommand::PrefetchShellMenu {
+                        paths: vec![path.clone()],
+                        owner_hwnd: guard.free_desktop_hwnd,
+                    });
+                }
             }
             if shift {
                 guard.free_focus_path = Some(normalize_path_key(&path));
