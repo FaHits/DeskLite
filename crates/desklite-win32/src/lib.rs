@@ -82,8 +82,9 @@ pub use window_attach::{
     install_desktop_z_win_event_hooks, invalidate_window_no_erase, is_ctrl_key_down,
     is_file_drag_active, is_free_desktop_hwnd, is_in_size_move, is_popup_menu_hwnd,
     is_primary_mouse_down, live_sizemove_rect_for_hwnd, move_window_no_z,
-    post_reassert_all_fences_z, post_window_message, set_active_text_edit_hwnd,
-    set_external_foreground_notify_target, set_file_drag_active, set_hwnd_locked,
-    set_inspector_hwnd, set_window_rect_no_z, strip_alt_tab_from_host,
-    style_floating_inspector_window, take_win32_hotkeys, window_outer_rect,
+    post_reassert_all_fences_z, post_window_message, reassert_desktop_z_order_sync,
+    set_active_text_edit_hwnd, set_external_foreground_notify_target, set_file_drag_active,
+    set_hwnd_locked, set_inspector_hwnd, set_window_rect_no_z, set_z_reassert_notify_target,
+    strip_alt_tab_from_host, style_floating_inspector_window, take_win32_hotkeys,
+    window_outer_rect,
 };

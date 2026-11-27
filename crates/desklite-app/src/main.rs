@@ -34,8 +34,9 @@ use desklite_win32::{
     hide_all_fences_immediately, install_desktop_z_win_event_hooks, is_desktop_dir_path,
     is_display_wake_power_broadcast, is_vault_path, launch_item, migrate_vault_item_to_desktop,
     pick_folder_dialog, post_reassert_all_fences_z, probe_display_topology,
-    register_power_and_session_notifications, restore_all_desktop_icons, scan_portal_directory,
-    set_external_foreground_notify_target, set_shell_desktop_icons_visible, set_window_rect_no_z,
+    reassert_desktop_z_order_sync, register_power_and_session_notifications,
+    restore_all_desktop_icons, scan_portal_directory, set_external_foreground_notify_target,
+    set_shell_desktop_icons_visible, set_window_rect_no_z, set_z_reassert_notify_target,
     strip_alt_tab_from_host, unregister_power_and_session_notifications,
 };
 use egui::{Pos2, Vec2, ViewportBuilder, ViewportCommand, ViewportId, WindowLevel};
@@ -71,6 +72,10 @@ const SHELL_VERIFY_DELAY_2_MS: u32 = 700;
 const TRANSIENT_RETRY_TIMER: usize = 105;
 const TRANSIENT_RETRY_MS: u32 = 350;
 const MAX_TRANSIENT_RETRIES: u8 = 8;
+const Z_REASSERT_TIMER_1: usize = 106;
+const Z_REASSERT_DELAY_1_MS: u32 = 50;
+const Z_REASSERT_TIMER_2: usize = 107;
+const Z_REASSERT_DELAY_2_MS: u32 = 170;
 
 const WM_APP_SYNC_WATCHERS: u32 = WM_APP + 20;
 const WM_APP_SHUTDOWN: u32 = WM_APP + 21;
@@ -83,6 +88,7 @@ const WM_APP_SCHEDULE_SHELL_VERIFY: u32 = WM_APP + 27;
 const WM_APP_FREE_DESKTOP_EVENT: u32 = WM_APP + 28;
 const WM_APP_REFRESH_FREE_DESKTOP: u32 = WM_APP + 29;
 const WM_APP_EXTERNAL_FOREGROUND: u32 = WM_APP + 30;
+const WM_APP_REASSERT_DESKTOP_Z: u32 = WM_APP + 31;
 
 const TRAY_CMD_NEW_BLANK: u32 = 1001;
 const TRAY_CMD_NEW_PORTAL: u32 = 1003;
@@ -1348,6 +1354,16 @@ unsafe extern "system" fn helper_wnd_proc(
             st.egui_ctx.request_repaint_of(ViewportId::ROOT);
             LRESULT(0)
         }
+        WM_APP_REASSERT_DESKTOP_Z => {
+            if !st.shutting_down {
+                reassert_desktop_z_order_sync();
+                unsafe {
+                    SetTimer(Some(hwnd), Z_REASSERT_TIMER_1, Z_REASSERT_DELAY_1_MS, None);
+                    SetTimer(Some(hwnd), Z_REASSERT_TIMER_2, Z_REASSERT_DELAY_2_MS, None);
+                }
+            }
+            LRESULT(0)
+        }
         WM_APP_DRAG_DONE => {
             let (changed, fids, free_snap) = {
                 let mut guard = lock_unpoisoned(&st.shared);
@@ -1372,6 +1388,7 @@ unsafe extern "system" fn helper_wnd_proc(
         }
         WM_APP_SHUTDOWN => {
             st.shutting_down = true;
+            set_z_reassert_notify_target(0, 0);
             st.watchers.clear();
             st.tray = None;
             let _ = unsafe { KillTimer(Some(hwnd), DISPLAY_DEBOUNCE_TIMER) };
@@ -1379,6 +1396,8 @@ unsafe extern "system" fn helper_wnd_proc(
             let _ = unsafe { KillTimer(Some(hwnd), SHELL_VERIFY_TIMER_1) };
             let _ = unsafe { KillTimer(Some(hwnd), SHELL_VERIFY_TIMER_2) };
             let _ = unsafe { KillTimer(Some(hwnd), TRANSIENT_RETRY_TIMER) };
+            let _ = unsafe { KillTimer(Some(hwnd), Z_REASSERT_TIMER_1) };
+            let _ = unsafe { KillTimer(Some(hwnd), Z_REASSERT_TIMER_2) };
             unsafe { PostQuitMessage(0) };
             LRESULT(0)
         }
@@ -1478,6 +1497,13 @@ unsafe extern "system" fn helper_wnd_proc(
             }
             LRESULT(0)
         }
+        WM_TIMER if wparam.0 == Z_REASSERT_TIMER_1 || wparam.0 == Z_REASSERT_TIMER_2 => {
+            let _ = unsafe { KillTimer(Some(hwnd), wparam.0) };
+            if !st.shutting_down {
+                reassert_desktop_z_order_sync();
+            }
+            LRESULT(0)
+        }
         WM_QUERYENDSESSION => {
             sync_topology_and_save(&st.layout_path, &st.shared, "WM_QUERYENDSESSION");
             LRESULT(1)
@@ -1497,6 +1523,7 @@ unsafe extern "system" fn helper_wnd_proc(
             LRESULT(0)
         }
         WM_DESTROY => {
+            set_z_reassert_notify_target(0, 0);
             st.watchers.clear();
             st.tray = None;
             unsafe { PostQuitMessage(0) };
@@ -1585,6 +1612,7 @@ fn spawn_win32_helper(
             SetWindowLongPtrW(hwnd, GWLP_USERDATA, (&raw mut *helper) as isize);
         }
         set_external_foreground_notify_target(hwnd.0 as isize, WM_APP_EXTERNAL_FOREGROUND);
+        set_z_reassert_notify_target(hwnd.0 as isize, WM_APP_REASSERT_DESKTOP_Z);
         let _z_hooks = install_desktop_z_win_event_hooks();
         let _ = hwnd_tx.send(hwnd.0 as isize);
 
@@ -2268,7 +2296,6 @@ impl eframe::App for DeskLiteEguiApp {
                 .with_transparent(true)
                 .with_taskbar(false)
                 .with_visible(!hide_all_fences)
-                .with_window_level(WindowLevel::AlwaysOnBottom)
                 .with_position(init_pos)
                 .with_inner_size(Vec2::new(
                     (brect.width().max(MIN_FENCE_WIDTH) as f32) / mon_scale,

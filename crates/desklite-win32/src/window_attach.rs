@@ -4,7 +4,7 @@ use std::sync::{Mutex, MutexGuard, OnceLock};
 
 use windows::Win32::Foundation::{HWND, LPARAM, LRESULT, POINT, RECT, WPARAM};
 use windows::Win32::Graphics::Dwm::{
-    DWMSBT_TRANSIENTWINDOW, DWMWA_BORDER_COLOR, DWMWA_CLOAKED, DWMWA_COLOR_NONE,
+    DWMSBT_NONE, DWMWA_BORDER_COLOR, DWMWA_CLOAKED, DWMWA_COLOR_NONE, DWMWA_EXCLUDED_FROM_PEEK,
     DWMWA_SYSTEMBACKDROP_TYPE, DWMWA_TRANSITIONS_FORCEDISABLED, DWMWA_USE_IMMERSIVE_DARK_MODE,
     DWMWA_WINDOW_CORNER_PREFERENCE, DWMWCP_ROUND, DwmExtendFrameIntoClientArea,
     DwmGetWindowAttribute, DwmSetWindowAttribute,
@@ -30,9 +30,10 @@ use windows::Win32::UI::WindowsAndMessaging::{
     HTBOTTOMLEFT, HTBOTTOMRIGHT, HTCLIENT, HTLEFT, HTRIGHT, HTTOP, HTTOPLEFT, HTTOPRIGHT,
     HWND_BOTTOM, HWND_TOP, IDC_ARROW, IsIconic, IsWindow, IsWindowVisible, LoadCursorW,
     PostMessageW, SC_MAXIMIZE, SC_MINIMIZE, SC_RESTORE, STYLESTRUCT, SW_HIDE, SWP_FRAMECHANGED,
-    SWP_NOACTIVATE, SWP_NOMOVE, SWP_NOSIZE, SWP_NOZORDER, SetCursor, SetForegroundWindow,
-    SetWindowLongPtrW, SetWindowPos, ShowWindow, WINDOWPOS, WINEVENT_OUTOFCONTEXT,
-    WINEVENT_SKIPOWNPROCESS, WM_APP, WM_CANCELMODE, WM_CAPTURECHANGED, WM_ENTERSIZEMOVE,
+    SWP_NOACTIVATE, SWP_NOMOVE, SWP_NOSENDCHANGING, SWP_NOSIZE, SWP_NOZORDER, SetCursor,
+    SetForegroundWindow, SetWindowLongPtrW, SetWindowPos, ShowWindow, WINDOWPOS,
+    WINEVENT_OUTOFCONTEXT, WINEVENT_SKIPOWNPROCESS, WM_APP, WM_CANCELMODE, WM_CAPTURECHANGED,
+    WM_ENTERSIZEMOVE,
     WM_ERASEBKGND, WM_EXITSIZEMOVE, WM_KEYDOWN, WM_LBUTTONDOWN, WM_MOVING, WM_NCACTIVATE,
     WM_NCCALCSIZE, WM_NCDESTROY, WM_NCHITTEST, WM_NCPAINT, WM_RBUTTONDOWN, WM_SETCURSOR,
     WM_SIZING, WM_STYLECHANGING, WM_SYSCOMMAND, WM_WINDOWPOSCHANGING, WNDPROC, WS_BORDER,
@@ -61,15 +62,28 @@ static FREE_DESKTOP_HWND: std::sync::atomic::AtomicIsize = std::sync::atomic::At
 static FILE_DRAG_ACTIVE: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 static DEFERRED_Z_AFTER_SIZEMOVE: std::sync::atomic::AtomicBool =
     std::sync::atomic::AtomicBool::new(false);
-static LAST_SELF_Z_MS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+static REASSERTING_HWND: std::sync::atomic::AtomicIsize = std::sync::atomic::AtomicIsize::new(0);
+static SELF_Z_REORDER_IN_FLIGHT: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+static Z_REASSERT_NOTIFY_HWND: std::sync::atomic::AtomicIsize =
+    std::sync::atomic::AtomicIsize::new(0);
+static Z_REASSERT_NOTIFY_MSG: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+static Z_REASSERT_QUEUED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+static Z_REASSERT_LOCK: OnceLock<Mutex<()>> = OnceLock::new();
 static EXTERNAL_FG_NOTIFY_HWND: std::sync::atomic::AtomicIsize =
     std::sync::atomic::AtomicIsize::new(0);
 static EXTERNAL_FG_NOTIFY_MSG: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
-static START_MONO: OnceLock<std::time::Instant> = OnceLock::new();
 
 pub fn set_external_foreground_notify_target(hwnd: isize, msg: u32) {
     EXTERNAL_FG_NOTIFY_MSG.store(msg, std::sync::atomic::Ordering::Release);
     EXTERNAL_FG_NOTIFY_HWND.store(hwnd, std::sync::atomic::Ordering::Release);
+}
+
+/// Registers the helper window target for coalesced desktop Z-order reassertion messages.
+pub fn set_z_reassert_notify_target(hwnd: isize, msg: u32) {
+    Z_REASSERT_QUEUED.store(false, std::sync::atomic::Ordering::Release);
+    Z_REASSERT_NOTIFY_MSG.store(msg, std::sync::atomic::Ordering::Release);
+    Z_REASSERT_NOTIFY_HWND.store(hwnd, std::sync::atomic::Ordering::Release);
 }
 
 pub fn set_file_drag_active(active: bool) {
@@ -82,13 +96,6 @@ pub fn is_file_drag_active() -> bool {
 
 fn lock_unpoisoned<T>(m: &Mutex<T>) -> MutexGuard<'_, T> {
     m.lock().unwrap_or_else(|e| e.into_inner())
-}
-
-fn mono_ms() -> u64 {
-    START_MONO
-        .get_or_init(std::time::Instant::now)
-        .elapsed()
-        .as_millis() as u64
 }
 
 pub fn free_desktop_hwnd() -> isize {
@@ -156,8 +163,11 @@ pub fn is_ctrl_key_down() -> bool {
 
 pub fn focus_window_now(raw_hwnd: isize) {
     if raw_hwnd != 0 {
+        let hwnd = HWND(raw_hwnd as *mut _);
         unsafe {
-            let _ = SetForegroundWindow(HWND(raw_hwnd as *mut _));
+            if GetForegroundWindow() != hwnd {
+                let _ = SetForegroundWindow(hwnd);
+            }
         }
     }
 }
@@ -466,8 +476,288 @@ unsafe fn resolve_live_owner(owner_hwnd: isize) -> isize {
     0
 }
 
-/// Walks top-down from `GetTopWindow(None)` down to `owner_hwnd` and returns the
-/// `hwndInsertAfter` anchor preserving strict layering:
+unsafe fn visible_progman_hwnd() -> isize {
+    match unsafe { FindWindowW(w!("Progman"), None) } {
+        Ok(p) if !p.is_invalid() && unsafe { IsWindowVisible(p).as_bool() } => p.0 as isize,
+        _ => 0,
+    }
+}
+
+struct DesktopZOrderAnalysis {
+    live_owner: isize,
+    last_topmost: Option<HWND>,
+    last_visible_app: Option<HWND>,
+    is_compliant: bool,
+    chain: Vec<isize>,
+}
+
+fn evaluate_z_chain_plan(
+    above_owner_raws: &[isize],
+    app_hwnds: &HashSet<isize>,
+    expected_fences: &[isize],
+    free_hwnd: Option<isize>,
+    saw_owner: bool,
+) -> (bool, Vec<isize>) {
+    let expected_set: HashSet<isize> = expected_fences.iter().copied().collect();
+    let mut seen_fences: Vec<isize> = Vec::with_capacity(expected_fences.len());
+    let mut seen_fence_set: HashSet<isize> = HashSet::with_capacity(expected_fences.len());
+    let mut seen_any_desklite = false;
+    let mut saw_free = false;
+    let mut free_before_fence = false;
+    let mut app_below_desklite = false;
+
+    for &raw in above_owner_raws {
+        if free_hwnd == Some(raw) {
+            seen_any_desklite = true;
+            saw_free = true;
+        } else if expected_set.contains(&raw) {
+            seen_any_desklite = true;
+            if saw_free {
+                free_before_fence = true;
+            }
+            if seen_fence_set.insert(raw) {
+                seen_fences.push(raw);
+            }
+        } else if seen_any_desklite && app_hwnds.contains(&raw) {
+            app_below_desklite = true;
+        }
+    }
+
+    let mut missing_fences: Vec<isize> = expected_fences
+        .iter()
+        .copied()
+        .filter(|raw| !seen_fence_set.contains(raw))
+        .collect();
+    missing_fences.sort_unstable();
+
+    let mut chain = Vec::with_capacity(expected_fences.len() + usize::from(free_hwnd.is_some()));
+    chain.extend(seen_fences);
+    chain.extend(missing_fences.iter().copied());
+    if let Some(free) = free_hwnd {
+        chain.push(free);
+    }
+
+    let is_compliant = saw_owner
+        && missing_fences.is_empty()
+        && free_hwnd.is_none_or(|_| saw_free)
+        && !free_before_fence
+        && !app_below_desklite;
+
+    (is_compliant, chain)
+}
+
+unsafe fn analyze_desktop_z_order(live_owner: isize) -> DesktopZOrderAnalysis {
+    let expected_fences: Vec<isize> = all_bucket_fence_hwnds()
+        .into_iter()
+        .filter(|&raw| {
+            let h = HWND(raw as *mut _);
+            unsafe { IsWindow(Some(h)).as_bool() && IsWindowVisible(h).as_bool() }
+        })
+        .collect();
+    let expected_set: HashSet<isize> = expected_fences.iter().copied().collect();
+
+    let free_raw = free_desktop_hwnd();
+    let visible_free = if free_raw != 0 {
+        let fh = HWND(free_raw as *mut _);
+        (unsafe { IsWindow(Some(fh)).as_bool() && IsWindowVisible(fh).as_bool() })
+            .then_some(free_raw)
+    } else {
+        None
+    };
+
+    if live_owner == 0 {
+        let mut chain = expected_fences;
+        chain.sort_unstable();
+        if let Some(f) = visible_free {
+            chain.push(f);
+        }
+        return DesktopZOrderAnalysis {
+            live_owner,
+            last_topmost: None,
+            last_visible_app: None,
+            is_compliant: true,
+            chain,
+        };
+    }
+
+    let progman_visible = unsafe { visible_progman_hwnd() };
+    let mut above_owner_raws = Vec::new();
+    let mut app_hwnds = HashSet::new();
+    let mut last_topmost: Option<HWND> = None;
+    let mut last_visible_app: Option<HWND> = None;
+    let mut saw_owner = false;
+
+    let mut cur = match unsafe { GetTopWindow(None) } {
+        Ok(top) if !top.is_invalid() => top,
+        _ => {
+            let mut chain = expected_fences;
+            chain.sort_unstable();
+            if let Some(f) = visible_free {
+                chain.push(f);
+            }
+            return DesktopZOrderAnalysis {
+                live_owner,
+                last_topmost: None,
+                last_visible_app: None,
+                is_compliant: false,
+                chain,
+            };
+        }
+    };
+
+    for _ in 0..4096 {
+        let raw = cur.0 as isize;
+        if raw == live_owner || (progman_visible != 0 && raw == progman_visible) {
+            saw_owner = true;
+            break;
+        }
+        let is_ours = expected_set.contains(&raw) || visible_free == Some(raw);
+        if is_ours {
+            above_owner_raws.push(raw);
+        } else if unsafe { IsWindowVisible(cur).as_bool() } && !unsafe { IsIconic(cur).as_bool() }
+        {
+            let ex = unsafe { GetWindowLongPtrW(cur, GWL_EXSTYLE) } as u32;
+            if (ex & WS_EX_TOPMOST.0) != 0 {
+                last_topmost = Some(cur);
+            } else if !unsafe { is_desktop_shell_class(cur) } && !unsafe { is_window_cloaked(cur) }
+            {
+                let mut rc = RECT::default();
+                if unsafe { GetWindowRect(cur, &mut rc) }.is_ok()
+                    && (rc.right - rc.left) > 1
+                    && (rc.bottom - rc.top) > 1
+                {
+                    last_visible_app = Some(cur);
+                    app_hwnds.insert(raw);
+                    above_owner_raws.push(raw);
+                }
+            }
+        }
+        cur = match unsafe { GetWindow(cur, GW_HWNDNEXT) } {
+            Ok(next) if !next.is_invalid() => next,
+            _ => break,
+        };
+    }
+
+    let (is_compliant, chain) = evaluate_z_chain_plan(
+        &above_owner_raws,
+        &app_hwnds,
+        &expected_fences,
+        visible_free,
+        saw_owner,
+    );
+
+    DesktopZOrderAnalysis {
+        live_owner,
+        last_topmost,
+        last_visible_app,
+        is_compliant,
+        chain,
+    }
+}
+
+unsafe fn are_desktop_windows_in_layer() -> bool {
+    let live_owner = unsafe { resolve_live_owner(0) };
+    if live_owner == 0 {
+        return true;
+    }
+    unsafe { analyze_desktop_z_order(live_owner) }.is_compliant
+}
+
+struct InFlightReorderGuard;
+
+impl InFlightReorderGuard {
+    fn enter() -> Self {
+        SELF_Z_REORDER_IN_FLIGHT.store(true, std::sync::atomic::Ordering::Release);
+        Self
+    }
+}
+
+impl Drop for InFlightReorderGuard {
+    fn drop(&mut self) {
+        REASSERTING_HWND.store(0, std::sync::atomic::Ordering::Release);
+        SELF_Z_REORDER_IN_FLIGHT.store(false, std::sync::atomic::Ordering::Release);
+    }
+}
+
+struct ReassertingHwndGuard;
+
+impl ReassertingHwndGuard {
+    fn enter(raw: isize) -> Self {
+        REASSERTING_HWND.store(raw, std::sync::atomic::Ordering::Release);
+        Self
+    }
+}
+
+impl Drop for ReassertingHwndGuard {
+    fn drop(&mut self) {
+        REASSERTING_HWND.store(0, std::sync::atomic::Ordering::Release);
+    }
+}
+
+/// Synchronously verifies and, only if out of layer order, restores the full desktop Z-order
+/// chain (`visible app windows > [Fence_1..k] > FreeDesktop > WorkerW/Progman`) in a single pass.
+pub fn reassert_desktop_z_order_sync() {
+    Z_REASSERT_QUEUED.store(false, std::sync::atomic::Ordering::Release);
+    if is_in_size_move() {
+        DEFERRED_Z_AFTER_SIZEMOVE.store(true, std::sync::atomic::Ordering::Release);
+        return;
+    }
+
+    let _serial_guard = lock_unpoisoned(Z_REASSERT_LOCK.get_or_init(|| Mutex::new(())));
+    let _in_flight = InFlightReorderGuard::enter();
+
+    let live_owner = unsafe { resolve_live_owner(0) };
+    if live_owner == 0 {
+        return;
+    }
+
+    let analysis = unsafe { analyze_desktop_z_order(live_owner) };
+    if analysis.is_compliant || analysis.chain.is_empty() {
+        return;
+    }
+
+    for &raw in &analysis.chain {
+        let h = HWND(raw as *mut _);
+        if !unsafe { IsWindow(Some(h)).as_bool() } {
+            continue;
+        }
+        let cur_owner = unsafe { GetWindowLongPtrW(h, GWLP_HWNDPARENT) };
+        if cur_owner != analysis.live_owner {
+            unsafe { SetWindowLongPtrW(h, GWLP_HWNDPARENT, analysis.live_owner) };
+        }
+        if let Some(e) = lock_unpoisoned(orig_procs()).get_mut(&raw) {
+            e.owner_hwnd = analysis.live_owner;
+            e.pending_z = false;
+        }
+    }
+
+    let mut prev = analysis
+        .last_visible_app
+        .or(analysis.last_topmost)
+        .unwrap_or(HWND_TOP);
+    for &raw in &analysis.chain {
+        let w = HWND(raw as *mut _);
+        if !unsafe { IsWindow(Some(w)).as_bool() } {
+            continue;
+        }
+        let _hwnd_guard = ReassertingHwndGuard::enter(raw);
+        let _ = unsafe {
+            SetWindowPos(
+                w,
+                Some(prev),
+                0,
+                0,
+                0,
+                0,
+                SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE | SWP_NOSENDCHANGING,
+            )
+        };
+        prev = w;
+    }
+}
+
+/// Walks top-down from `GetTopWindow(None)` down to `owner_hwnd` (or visible `Progman`) and
+/// returns the `hwndInsertAfter` anchor preserving strict layering:
 /// `visible app windows > DeskLite bucket fences > FreeDesktop canvas > WorkerW/Progman`.
 unsafe fn find_desktop_layer_anchor(
     self_hwnd: HWND,
@@ -478,7 +768,7 @@ unsafe fn find_desktop_layer_anchor(
     if live_owner == 0 {
         return HWND_BOTTOM;
     }
-    let owner = HWND(live_owner as *mut _);
+    let progman_visible = unsafe { visible_progman_hwnd() };
     let mut cur = match unsafe { GetTopWindow(None) } {
         Ok(top) if !top.is_invalid() => top,
         _ => return HWND_BOTTOM,
@@ -492,11 +782,11 @@ unsafe fn find_desktop_layer_anchor(
     let mut last_visible_app: Option<HWND> = None;
     let mut last_bucket_fence: Option<HWND> = None;
 
-    for _ in 0..2048 {
-        if cur == owner {
+    for _ in 0..4096 {
+        let raw = cur.0 as isize;
+        if raw == live_owner || (progman_visible != 0 && raw == progman_visible) {
             break;
         }
-        let raw = cur.0 as isize;
         let is_ours = cur == self_hwnd
             || fence_hwnds.contains(&raw)
             || (free_raw != 0 && raw == free_raw);
@@ -549,7 +839,7 @@ unsafe fn is_strictly_in_desktop_layer(
     if live_owner == 0 {
         return true;
     }
-    let owner = HWND(live_owner as *mut _);
+    let progman_visible = unsafe { visible_progman_hwnd() };
     let free_raw = free_desktop_hwnd();
     let self_raw = hwnd.0 as isize;
     let is_free = free_raw != 0 && self_raw == free_raw;
@@ -559,18 +849,18 @@ unsafe fn is_strictly_in_desktop_layer(
     let mut cur = hwnd;
     let mut saw_owner = false;
     let mut saw_free_below = false;
-    for _ in 0..2048 {
+    for _ in 0..4096 {
         let Ok(next) = (unsafe { GetWindow(cur, GW_HWNDNEXT) }) else {
             return false;
         };
         if next.is_invalid() {
             return false;
         }
-        if next == owner {
+        let next_raw = next.0 as isize;
+        if next_raw == live_owner || (progman_visible != 0 && next_raw == progman_visible) {
             saw_owner = true;
             break;
         }
-        let next_raw = next.0 as isize;
         if free_raw != 0 && next_raw == free_raw {
             saw_free_below = true;
         }
@@ -624,27 +914,6 @@ unsafe extern "system" fn desktop_z_win_event_proc(
     _event_thread: u32,
     _event_time: u32,
 ) {
-    if event == EVENT_OBJECT_REORDER {
-        if hwnd.is_invalid() {
-            return;
-        }
-        let is_desktop_root = hwnd == unsafe { GetDesktopWindow() };
-        if !is_desktop_root && !unsafe { is_desktop_shell_class(hwnd) } {
-            return;
-        }
-        if is_in_size_move() {
-            DEFERRED_Z_AFTER_SIZEMOVE.store(true, std::sync::atomic::Ordering::Release);
-            return;
-        }
-        let now = mono_ms();
-        let last = LAST_SELF_Z_MS.load(std::sync::atomic::Ordering::Acquire);
-        if is_desktop_root && now.saturating_sub(last) < 60 {
-            return;
-        }
-    } else if is_in_size_move() {
-        DEFERRED_Z_AFTER_SIZEMOVE.store(true, std::sync::atomic::Ordering::Release);
-        return;
-    }
     if event == EVENT_SYSTEM_FOREGROUND && !hwnd.is_invalid() {
         let raw = hwnd.0 as isize;
         let is_ours = is_free_desktop_hwnd(raw)
@@ -664,6 +933,35 @@ unsafe extern "system" fn desktop_z_win_event_proc(
                 }
             }
         }
+        if SELF_Z_REORDER_IN_FLIGHT.load(std::sync::atomic::Ordering::Acquire) {
+            return;
+        }
+        if is_in_size_move() {
+            DEFERRED_Z_AFTER_SIZEMOVE.store(true, std::sync::atomic::Ordering::Release);
+            return;
+        }
+        if is_ours && unsafe { are_desktop_windows_in_layer() } {
+            return;
+        }
+        post_reassert_all_fences_z();
+        return;
+    }
+
+    if SELF_Z_REORDER_IN_FLIGHT.load(std::sync::atomic::Ordering::Acquire) {
+        return;
+    }
+    if event == EVENT_OBJECT_REORDER {
+        if hwnd.is_invalid() {
+            return;
+        }
+        let is_desktop_root = hwnd == unsafe { GetDesktopWindow() };
+        if !is_desktop_root && !unsafe { is_desktop_shell_class(hwnd) } {
+            return;
+        }
+    }
+    if is_in_size_move() {
+        DEFERRED_Z_AFTER_SIZEMOVE.store(true, std::sync::atomic::Ordering::Release);
+        return;
     }
     post_reassert_all_fences_z();
 }
@@ -698,13 +996,41 @@ pub fn install_desktop_z_win_event_hooks() -> DesktopZHookGuard {
     DesktopZHookGuard(hooks)
 }
 
-/// Asynchronously asks all attached DeskLite fence windows to verify their Z-order
-/// right above `WorkerW`/`Progman` and below all visible app windows (safe from background threads).
+/// Asynchronously requests a desktop Z-order verification/reassertion pass. When
+/// `set_z_reassert_notify_target` has been configured, multiple triggers coalesce into a single
+/// helper-window message so `[Fence_1..k, FreeDesktop]` reorder atomically in one sequence.
 pub fn post_reassert_all_fences_z() {
     if is_in_size_move() {
         DEFERRED_Z_AFTER_SIZEMOVE.store(true, std::sync::atomic::Ordering::Release);
         return;
     }
+    let notify_hwnd = Z_REASSERT_NOTIFY_HWND.load(std::sync::atomic::Ordering::Acquire);
+    let notify_msg = Z_REASSERT_NOTIFY_MSG.load(std::sync::atomic::Ordering::Acquire);
+    if notify_hwnd != 0 && notify_msg != 0 {
+        if Z_REASSERT_QUEUED
+            .compare_exchange(
+                false,
+                true,
+                std::sync::atomic::Ordering::AcqRel,
+                std::sync::atomic::Ordering::Acquire,
+            )
+            .is_ok()
+        {
+            let ok = unsafe {
+                PostMessageW(
+                    Some(HWND(notify_hwnd as *mut _)),
+                    notify_msg,
+                    WPARAM(0),
+                    LPARAM(0),
+                )
+            };
+            if ok.is_err() {
+                Z_REASSERT_QUEUED.store(false, std::sync::atomic::Ordering::Release);
+            }
+        }
+        return;
+    }
+
     let hwnds: Vec<isize> = {
         let mut map = lock_unpoisoned(orig_procs());
         let mut out = Vec::with_capacity(map.len());
@@ -962,41 +1288,15 @@ unsafe extern "system" fn bottom_subclass_proc(
             DEFERRED_Z_AFTER_SIZEMOVE.store(true, std::sync::atomic::Ordering::Release);
             return LRESULT(0);
         }
-        let live_owner = unsafe { resolve_live_owner(owner_hwnd) };
-        if live_owner != 0 {
-            if live_owner != owner_hwnd {
-                unsafe { SetWindowLongPtrW(hwnd, GWLP_HWNDPARENT, live_owner) };
-                if let Some(e) = lock_unpoisoned(orig_procs()).get_mut(&(hwnd.0 as isize)) {
-                    e.owner_hwnd = live_owner;
-                }
-            }
-            let fence_hwnds = snapshot_fence_hwnd_set();
-            let ok = unsafe { is_strictly_in_desktop_layer(hwnd, live_owner, &fence_hwnds) };
-            if !ok {
-                let anchor = unsafe { find_desktop_layer_anchor(hwnd, live_owner, &fence_hwnds) };
-                if anchor != hwnd {
-                    LAST_SELF_Z_MS.store(mono_ms(), std::sync::atomic::Ordering::Release);
-                    let _ = unsafe {
-                        SetWindowPos(
-                            hwnd,
-                            Some(anchor),
-                            0,
-                            0,
-                            0,
-                            0,
-                            SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE,
-                        )
-                    };
-                    LAST_SELF_Z_MS.store(mono_ms(), std::sync::atomic::Ordering::Release);
-                }
-            }
-        }
+        reassert_desktop_z_order_sync();
         return LRESULT(0);
     }
 
     if msg == WM_WINDOWPOSCHANGING {
         let wp = unsafe { &mut *(lparam.0 as *mut WINDOWPOS) };
-        if (wp.flags & SWP_NOZORDER).0 == 0 && owner_hwnd != 0 {
+        if REASSERTING_HWND.load(std::sync::atomic::Ordering::Acquire) == (hwnd.0 as isize) {
+            // Coordinated Z-order pass is positioning this window explicitly.
+        } else if (wp.flags & SWP_NOZORDER).0 == 0 && owner_hwnd != 0 {
             if is_in_size_move() {
                 wp.flags |= SWP_NOZORDER;
                 DEFERRED_Z_AFTER_SIZEMOVE.store(true, std::sync::atomic::Ordering::Release);
@@ -1006,21 +1306,12 @@ unsafe extern "system" fn bottom_subclass_proc(
                     if let Some(e) = lock_unpoisoned(orig_procs()).get_mut(&(hwnd.0 as isize)) {
                         e.owner_hwnd = live_owner;
                     }
-                    unsafe {
-                        let _ = PostMessageW(
-                            Some(hwnd),
-                            WM_APP_ENSURE_DESKTOP_Z,
-                            WPARAM(0),
-                            LPARAM(0),
-                        );
-                    }
+                    post_reassert_all_fences_z();
                 }
                 let fence_hwnds = snapshot_fence_hwnd_set();
                 let already_ok =
                     unsafe { is_strictly_in_desktop_layer(hwnd, live_owner, &fence_hwnds) };
-                if already_ok
-                    && (wp.hwndInsertAfter.0.is_null() || wp.hwndInsertAfter == HWND_BOTTOM)
-                {
+                if already_ok {
                     wp.flags |= SWP_NOZORDER;
                 } else {
                     let anchor =
@@ -1028,6 +1319,7 @@ unsafe extern "system" fn bottom_subclass_proc(
                     if anchor != hwnd {
                         wp.hwndInsertAfter = anchor;
                     }
+                    post_reassert_all_fences_z();
                 }
             }
         }
@@ -1183,7 +1475,7 @@ unsafe fn apply_glass_dwm_chrome(hwnd: HWND, ex_extra: u32) {
             size_of::<BOOL>() as u32,
         );
 
-        let backdrop = DWMSBT_TRANSIENTWINDOW;
+        let backdrop = DWMSBT_NONE;
         let _ = DwmSetWindowAttribute(
             hwnd,
             DWMWA_SYSTEMBACKDROP_TYPE,
@@ -1201,11 +1493,23 @@ unsafe fn apply_glass_dwm_chrome(hwnd: HWND, ex_extra: u32) {
     }
 }
 
+unsafe fn exclude_from_aero_peek(hwnd: HWND) {
+    let excluded: BOOL = true.into();
+    let _ = unsafe {
+        DwmSetWindowAttribute(
+            hwnd,
+            DWMWA_EXCLUDED_FROM_PEEK,
+            (&raw const excluded).cast(),
+            size_of::<BOOL>() as u32,
+        )
+    };
+}
+
 /// Configures a DeskLite fence `HWND`:
 /// - Strips `WS_CAPTION | WS_SYSMENU` so DWM never draws phantom `[x]` close glows.
 /// - Strips `WS_EX_APPWINDOW` and adds `WS_EX_TOOLWINDOW` so fences never clutter `Alt+Tab`.
-/// - Disables DWM border & transition animations (`DWMWA_COLOR_NONE`, `DWMWA_TRANSITIONS_FORCEDISABLED`)
-///   so focus switches never flash a white border and `Win+D` stays flicker-free.
+/// - Disables DWM border & transition animations (`DWMWA_COLOR_NONE`, `DWMWA_TRANSITIONS_FORCEDISABLED`),
+///   keeps `DWMSBT_NONE` so focus switches never flash acrylic, and enables `DWMWA_EXCLUDED_FROM_PEEK`.
 /// - Attaches desktop owner (`WorkerW` / `Progman`) and subclasses Z-order to stay below all
 ///   visible app windows yet strictly above `FreeDesktop` and `WorkerW`.
 pub fn attach_desktop_owner_and_rounded_corners(raw_hwnd: isize) {
@@ -1220,6 +1524,7 @@ pub fn attach_desktop_owner_and_rounded_corners(raw_hwnd: isize) {
         }
 
         apply_glass_dwm_chrome(hwnd, 0);
+        exclude_from_aero_peek(hwnd);
 
         {
             let mut map = lock_unpoisoned(orig_procs());
@@ -1265,6 +1570,7 @@ pub fn attach_free_desktop_canvas(raw_hwnd: isize) {
         }
 
         apply_transparent_canvas_chrome(hwnd, 0);
+        exclude_from_aero_peek(hwnd);
 
         {
             let mut map = lock_unpoisoned(orig_procs());
@@ -1390,5 +1696,39 @@ pub fn style_floating_inspector_window(raw_hwnd: isize) {
             0,
             SWP_NOMOVE | SWP_NOSIZE | SWP_NOZORDER | SWP_NOACTIVATE | SWP_FRAMECHANGED,
         );
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn evaluate_z_chain_plan_accepts_compliant_desktop_layer() {
+        let apps: HashSet<isize> = [10, 11].into_iter().collect();
+        let fences = [101, 102];
+        let (ok, chain) = evaluate_z_chain_plan(&[10, 11, 102, 101, 200], &apps, &fences, Some(200), true);
+        assert!(ok);
+        assert_eq!(chain, vec![102, 101, 200]);
+    }
+
+    #[test]
+    fn evaluate_z_chain_plan_detects_dropped_fence_and_misplaced_free_or_app() {
+        let apps: HashSet<isize> = [10, 11].into_iter().collect();
+        let fences = [101, 102, 103];
+
+        // FreeDesktop above fence 101, and fence 103 missing (dropped below WorkerW).
+        let (ok, chain) = evaluate_z_chain_plan(&[10, 200, 101, 102], &apps, &fences, Some(200), true);
+        assert!(!ok);
+        assert_eq!(chain, vec![101, 102, 103, 200]);
+
+        // Visible app window slipped below a fence.
+        let (ok2, chain2) = evaluate_z_chain_plan(&[10, 101, 11, 102, 103, 200], &apps, &fences, Some(200), true);
+        assert!(!ok2);
+        assert_eq!(chain2, vec![101, 102, 103, 200]);
+
+        // Owner never reached in scan.
+        let (ok3, _) = evaluate_z_chain_plan(&[10, 101, 102, 103, 200], &apps, &fences, Some(200), false);
+        assert!(!ok3);
     }
 }
