@@ -23,7 +23,7 @@ use windows::Win32::UI::Input::KeyboardAndMouse::{
     VK_MENU, VK_PROCESSKEY, VK_SHIFT,
 };
 use windows::Win32::UI::WindowsAndMessaging::{
-    AllowSetForegroundWindow, CBT_CREATEWNDW, CallNextHookEx, CallWindowProcW,
+    AllowSetForegroundWindow, CBT_CREATEWNDW, CWPSTRUCT, CallNextHookEx, CallWindowProcW,
     EVENT_OBJECT_REORDER, EVENT_SYSTEM_FOREGROUND, EVENT_SYSTEM_MINIMIZEEND,
     EVENT_SYSTEM_MINIMIZESTART, FindWindowW, GW_HWNDNEXT, GWL_EXSTYLE, GWL_STYLE, GWLP_HWNDPARENT,
     GWLP_WNDPROC, GetClassNameW, GetCursorPos, GetDesktopWindow, GetForegroundWindow, GetTopWindow,
@@ -32,14 +32,15 @@ use windows::Win32::UI::WindowsAndMessaging::{
     IDC_ARROW, IsIconic, IsWindow, IsWindowVisible, LoadCursorW, PostMessageW, SC_MAXIMIZE,
     SC_MINIMIZE, SC_RESTORE, STYLESTRUCT, SW_HIDE, SWP_FRAMECHANGED, SWP_NOACTIVATE, SWP_NOMOVE,
     SWP_NOSENDCHANGING, SWP_NOSIZE, SWP_NOZORDER, SetCursor, SetForegroundWindow,
-    SetWindowLongPtrW, SetWindowPos, SetWindowsHookExW, ShowWindow, UnhookWindowsHookEx, WH_CBT,
-    WINDOWPOS, WINEVENT_OUTOFCONTEXT, WINEVENT_SKIPOWNPROCESS, WM_APP, WM_CANCELMODE,
-    WM_CAPTURECHANGED, WM_ENTERSIZEMOVE, WM_ERASEBKGND, WM_EXITSIZEMOVE, WM_KEYDOWN,
-    WM_LBUTTONDOWN, WM_MOVING, WM_NCACTIVATE, WM_NCCALCSIZE, WM_NCDESTROY, WM_NCHITTEST, WM_NCPAINT,
-    WM_RBUTTONDOWN, WM_SETCURSOR, WM_SIZING, WM_STYLECHANGING, WM_SYSCOMMAND,
-    WM_WINDOWPOSCHANGING, WNDPROC, WS_BORDER, WS_CAPTION, WS_CHILD, WS_DLGFRAME, WS_EX_APPWINDOW,
-    WS_EX_CLIENTEDGE, WS_EX_DLGMODALFRAME, WS_EX_TOOLWINDOW, WS_EX_TOPMOST, WS_EX_WINDOWEDGE,
-    WS_MAXIMIZE, WS_MAXIMIZEBOX, WS_MINIMIZE, WS_MINIMIZEBOX, WS_POPUP, WS_SYSMENU,
+    SetWindowLongPtrW, SetWindowPos, SetWindowsHookExW, ShowWindow, UnhookWindowsHookEx,
+    WH_CALLWNDPROC, WH_CBT, WINDOWPOS, WINEVENT_OUTOFCONTEXT, WINEVENT_SKIPOWNPROCESS, WM_APP,
+    WM_CANCELMODE, WM_CAPTURECHANGED, WM_CREATE, WM_ENTERSIZEMOVE, WM_ERASEBKGND, WM_EXITSIZEMOVE,
+    WM_KEYDOWN, WM_LBUTTONDOWN, WM_MOVING, WM_NCACTIVATE, WM_NCCALCSIZE, WM_NCDESTROY,
+    WM_NCHITTEST, WM_NCPAINT, WM_RBUTTONDOWN, WM_SETCURSOR, WM_SHOWWINDOW, WM_SIZING,
+    WM_STYLECHANGING, WM_SYSCOMMAND, WM_WINDOWPOSCHANGING, WNDPROC, WS_BORDER, WS_CAPTION, WS_CHILD,
+    WS_DLGFRAME, WS_EX_APPWINDOW, WS_EX_CLIENTEDGE, WS_EX_DLGMODALFRAME, WS_EX_TOOLWINDOW,
+    WS_EX_TOPMOST, WS_EX_WINDOWEDGE, WS_MAXIMIZE, WS_MAXIMIZEBOX, WS_MINIMIZE, WS_MINIMIZEBOX,
+    WS_POPUP, WS_SYSMENU,
 };
 use windows::core::{BOOL, HSTRING, PCSTR, w};
 
@@ -425,6 +426,12 @@ pub fn all_bucket_fence_hwnds() -> Vec<isize> {
         .collect()
 }
 
+static PENDING_CLOAK_HWNDS: OnceLock<Mutex<HashSet<isize>>> = OnceLock::new();
+
+fn pending_cloak_hwnds() -> &'static Mutex<HashSet<isize>> {
+    PENDING_CLOAK_HWNDS.get_or_init(|| Mutex::new(HashSet::new()))
+}
+
 unsafe fn set_window_cloaked_hwnd(hwnd: HWND, cloaked: bool) {
     let val: BOOL = cloaked.into();
     let _ = unsafe {
@@ -441,6 +448,11 @@ unsafe fn set_window_cloaked_hwnd(hwnd: HWND, cloaked: bool) {
 pub fn set_window_cloaked(raw_hwnd: isize, cloaked: bool) {
     if raw_hwnd == 0 {
         return;
+    }
+    if cloaked {
+        lock_unpoisoned(pending_cloak_hwnds()).insert(raw_hwnd);
+    } else {
+        lock_unpoisoned(pending_cloak_hwnds()).remove(&raw_hwnd);
     }
     let hwnd = HWND(raw_hwnd as *mut _);
     if unsafe { IsWindow(Some(hwnd)).as_bool() } {
@@ -462,7 +474,7 @@ pub fn post_uncloak_after_swap(raw_hwnd: isize) {
     }
 }
 
-pub struct UiThreadCloakGuard(HHOOK);
+pub struct UiThreadCloakGuard(HHOOK, HHOOK);
 
 impl Drop for UiThreadCloakGuard {
     fn drop(&mut self) {
@@ -471,36 +483,53 @@ impl Drop for UiThreadCloakGuard {
                 let _ = UnhookWindowsHookEx(self.0);
             }
         }
+        if !self.1.is_invalid() {
+            unsafe {
+                let _ = UnhookWindowsHookEx(self.1);
+            }
+        }
     }
+}
+
+unsafe fn title_ptr_matches_desklite(ptr: *const u16) -> bool {
+    if ptr.is_null() || (ptr as usize) <= 0xFFFF {
+        return false;
+    }
+    for (idx, &want) in b"DeskLite".iter().enumerate() {
+        let ch = unsafe { *ptr.add(idx) };
+        if ch != u16::from(want) {
+            return false;
+        }
+    }
+    true
 }
 
 unsafe extern "system" fn ui_cloak_cbt_proc(code: i32, wparam: WPARAM, lparam: LPARAM) -> LRESULT {
     if code == HCBT_CREATEWND as i32 && wparam.0 != 0 && lparam.0 != 0 {
         let cbt = unsafe { &*(lparam.0 as *const CBT_CREATEWNDW) };
         if !cbt.lpcs.is_null() {
-            let cs = unsafe { &*cbt.lpcs };
-            let ptr = cs.lpszName.0;
-            if ((cs.style as u32) & WS_CHILD.0) == 0 && !ptr.is_null() && (ptr as usize) > 0xFFFF {
-                let mut matches_prefix = true;
-                for (idx, &want) in b"DeskLite".iter().enumerate() {
-                    let ch = unsafe { *ptr.add(idx) };
-                    if ch != u16::from(want) {
-                        matches_prefix = false;
-                        break;
-                    }
-                }
-                if matches_prefix {
-                    let hwnd = HWND(wparam.0 as *mut _);
-                    unsafe {
-                        set_window_cloaked_hwnd(hwnd, true);
-                        let no_trans: BOOL = true.into();
-                        let _ = DwmSetWindowAttribute(
-                            hwnd,
-                            DWMWA_TRANSITIONS_FORCEDISABLED,
-                            (&raw const no_trans).cast(),
-                            size_of::<BOOL>() as u32,
-                        );
-                    }
+            let cs = unsafe { &mut *cbt.lpcs };
+            if ((cs.style as u32) & WS_CHILD.0) == 0
+                && unsafe { title_ptr_matches_desklite(cs.lpszName.0) }
+            {
+                // Override winit's initial CW_USEDEFAULT placement before CreateWindowExW ever
+                // maps the surface so zero frames can appear in the center of the screen.
+                cs.x = -32000;
+                cs.y = -32000;
+                cs.cx = 1;
+                cs.cy = 1;
+                cs.dwExStyle.0 = (cs.dwExStyle.0 & !WS_EX_APPWINDOW.0) | WS_EX_TOOLWINDOW.0;
+                lock_unpoisoned(pending_cloak_hwnds()).insert(wparam.0 as isize);
+                let hwnd = HWND(wparam.0 as *mut _);
+                unsafe {
+                    set_window_cloaked_hwnd(hwnd, true);
+                    let no_trans: BOOL = true.into();
+                    let _ = DwmSetWindowAttribute(
+                        hwnd,
+                        DWMWA_TRANSITIONS_FORCEDISABLED,
+                        (&raw const no_trans).cast(),
+                        size_of::<BOOL>() as u32,
+                    );
                 }
             }
         }
@@ -508,13 +537,42 @@ unsafe extern "system" fn ui_cloak_cbt_proc(code: i32, wparam: WPARAM, lparam: L
     unsafe { CallNextHookEx(None, code, wparam, lparam) }
 }
 
-/// Installs a thread-local `WH_CBT` hook that cloaks every new `DeskLite*` top-level `HWND`
-/// synchronously on creation so Windows never composites an unpainted white frame before WGL swaps.
+unsafe extern "system" fn ui_cloak_callwnd_proc(
+    code: i32,
+    wparam: WPARAM,
+    lparam: LPARAM,
+) -> LRESULT {
+    if code >= 0 && lparam.0 != 0 {
+        let cwp = unsafe { &*(lparam.0 as *const CWPSTRUCT) };
+        if cwp.message == WM_CREATE || (cwp.message == WM_SHOWWINDOW && cwp.wParam.0 != 0) {
+            let raw = cwp.hwnd.0 as isize;
+            if lock_unpoisoned(pending_cloak_hwnds()).contains(&raw) {
+                unsafe {
+                    set_window_cloaked_hwnd(cwp.hwnd, true);
+                    let no_trans: BOOL = true.into();
+                    let _ = DwmSetWindowAttribute(
+                        cwp.hwnd,
+                        DWMWA_TRANSITIONS_FORCEDISABLED,
+                        (&raw const no_trans).cast(),
+                        size_of::<BOOL>() as u32,
+                    );
+                }
+            }
+        }
+    }
+    unsafe { CallNextHookEx(None, code, wparam, lparam) }
+}
+
+/// Installs thread-local `WH_CBT` + `WH_CALLWNDPROC` hooks on the main UI thread so every
+/// `DeskLite*` top-level `HWND` starts offscreen (`-32000, -32000, 1x1`) and stays DWM-cloaked
+/// through `WM_CREATE` / `WM_SHOWWINDOW` until the first on-screen `SwapBuffers` finishes.
 pub fn install_ui_thread_cloak_hook() -> UiThreadCloakGuard {
     let tid = unsafe { GetCurrentThreadId() };
-    let hook = unsafe { SetWindowsHookExW(WH_CBT, Some(ui_cloak_cbt_proc), None, tid) }
+    let cbt = unsafe { SetWindowsHookExW(WH_CBT, Some(ui_cloak_cbt_proc), None, tid) }
         .unwrap_or_default();
-    UiThreadCloakGuard(hook)
+    let cwp = unsafe { SetWindowsHookExW(WH_CALLWNDPROC, Some(ui_cloak_callwnd_proc), None, tid) }
+        .unwrap_or_default();
+    UiThreadCloakGuard(cbt, cwp)
 }
 
 /// Immediately hides all visible DeskLite bucket fences and inspector windows before
@@ -1252,6 +1310,7 @@ unsafe extern "system" fn bottom_subclass_proc(
     }
     if msg == WM_APP_UNCLOAK {
         if !is_free_desktop_hwnd(hwnd.0 as isize) && unsafe { IsWindowVisible(hwnd).as_bool() } {
+            lock_unpoisoned(pending_cloak_hwnds()).remove(&(hwnd.0 as isize));
             unsafe { set_window_cloaked_hwnd(hwnd, false) };
         }
         return LRESULT(0);
@@ -1454,6 +1513,7 @@ unsafe extern "system" fn bottom_subclass_proc(
         }
         lock_unpoisoned(locked_hwnds()).remove(&raw);
         lock_unpoisoned(pending_hotkeys()).retain(|(h, _)| *h != raw);
+        lock_unpoisoned(pending_cloak_hwnds()).remove(&raw);
         lock_unpoisoned(orig_procs()).remove(&raw);
     }
     if let Some(sub) = entry {
@@ -1728,6 +1788,7 @@ unsafe extern "system" fn inspector_subclass_proc(
     }
     if msg == WM_APP_UNCLOAK {
         if unsafe { IsWindowVisible(hwnd).as_bool() } {
+            lock_unpoisoned(pending_cloak_hwnds()).remove(&(hwnd.0 as isize));
             unsafe { set_window_cloaked_hwnd(hwnd, false) };
         }
         return LRESULT(0);
@@ -1762,6 +1823,7 @@ unsafe extern "system" fn inspector_subclass_proc(
     }
     if msg == WM_NCDESTROY {
         let raw = hwnd.0 as isize;
+        lock_unpoisoned(pending_cloak_hwnds()).remove(&raw);
         let _ = INSPECTOR_HWND.compare_exchange(
             raw,
             0,

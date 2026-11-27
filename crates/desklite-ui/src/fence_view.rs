@@ -1869,12 +1869,6 @@ pub fn render_fence_viewport(
         && my_hwnd != 0
     {
         if step > 0 {
-            lock_unpoisoned(shared)
-                .pending_reveal_fences
-                .insert(fence_id, step - 1);
-            ctx.request_repaint();
-        } else {
-            lock_unpoisoned(shared).pending_reveal_fences.remove(&fence_id);
             let target_h = if spec.collapsed {
                 (COLLAPSED_HEIGHT * ppp).round() as i32
             } else {
@@ -1887,6 +1881,12 @@ pub fn render_fence_viewport(
                 spec.rect.width().max(MIN_FENCE_WIDTH),
                 target_h,
             );
+            lock_unpoisoned(shared)
+                .pending_reveal_fences
+                .insert(fence_id, step - 1);
+            ctx.request_repaint();
+        } else {
+            lock_unpoisoned(shared).pending_reveal_fences.remove(&fence_id);
             desklite_win32::post_reassert_all_fences_z();
             desklite_win32::post_uncloak_after_swap(my_hwnd);
             ctx.request_repaint_of(ViewportId::ROOT);
