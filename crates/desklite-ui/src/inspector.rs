@@ -257,7 +257,7 @@ pub fn render_inspector_viewport(
     }
 
     let target_id = insp.target_fence_id;
-    let (target_spec_opt, target_hwnd) = {
+    let (target_spec_opt, target_hwnd, override_count) = {
         let guard = lock_unpoisoned(shared);
         (
             guard
@@ -267,6 +267,12 @@ pub fn render_inspector_viewport(
                 .find(|f| f.id == target_id)
                 .cloned(),
             guard.attached_hwnds.get(&target_id).copied().unwrap_or(0),
+            guard
+                .config
+                .fences
+                .iter()
+                .filter(|f| f.layout_override.as_ref().is_some_and(|o| !o.is_empty()))
+                .count(),
         )
     };
     let Some(spec) = target_spec_opt else {
@@ -524,48 +530,37 @@ pub fn render_inspector_viewport(
                                 labeled_row(ui, "位置 / 尺寸", |ui| {
                                     ui.add_enabled_ui(!locked, |ui| {
                                         ui.spacing_mut().item_spacing.x = 6.0;
-                                        if ui
-                                            .add(
-                                                egui::DragValue::new(&mut rx)
-                                                    .speed(2.0)
-                                                    .prefix("X "),
-                                            )
-                                            .changed()
-                                        {
-                                            rect_changed = true;
-                                        }
-                                        if ui
-                                            .add(
-                                                egui::DragValue::new(&mut ry)
-                                                    .speed(2.0)
-                                                    .prefix("Y "),
-                                            )
-                                            .changed()
-                                        {
-                                            rect_changed = true;
-                                        }
-                                        if ui
-                                            .add(
-                                                egui::DragValue::new(&mut rw)
-                                                    .range(MIN_FENCE_WIDTH..=3840)
-                                                    .speed(2.0)
-                                                    .prefix("宽 "),
-                                            )
-                                            .changed()
-                                        {
-                                            rect_changed = true;
-                                        }
-                                        if ui
-                                            .add(
-                                                egui::DragValue::new(&mut rh)
-                                                    .range(MIN_FENCE_HEIGHT..=2160)
-                                                    .speed(2.0)
-                                                    .prefix("高 "),
-                                            )
-                                            .changed()
-                                        {
-                                            rect_changed = true;
-                                        }
+                                        let mut add_coord_drag = |dv: egui::DragValue<'_>| {
+                                            let resp = ui.add(dv);
+                                            if resp.hovered() && !resp.dragged() {
+                                                ui.ctx().set_cursor_icon(egui::CursorIcon::Default);
+                                            }
+                                            if resp.changed() {
+                                                rect_changed = true;
+                                            }
+                                        };
+                                        add_coord_drag(
+                                            egui::DragValue::new(&mut rx)
+                                                .speed(2.0)
+                                                .prefix("X "),
+                                        );
+                                        add_coord_drag(
+                                            egui::DragValue::new(&mut ry)
+                                                .speed(2.0)
+                                                .prefix("Y "),
+                                        );
+                                        add_coord_drag(
+                                            egui::DragValue::new(&mut rw)
+                                                .range(MIN_FENCE_WIDTH..=3840)
+                                                .speed(2.0)
+                                                .prefix("宽 "),
+                                        );
+                                        add_coord_drag(
+                                            egui::DragValue::new(&mut rh)
+                                                .range(MIN_FENCE_HEIGHT..=2160)
+                                                .speed(2.0)
+                                                .prefix("高 "),
+                                        );
                                     });
                                 });
 
@@ -658,6 +653,7 @@ pub fn render_inspector_viewport(
                             let mut hide_all = hide_all_snap;
                             let mut prefs_changed = false;
                             let mut hide_all_changed = false;
+                            let mut sync_all_to_global = false;
 
                             inspector_card(ui, "全局默认排版与桌面设置", |ui| {
                                 ui.spacing_mut().item_spacing.y = 7.0;
@@ -694,6 +690,20 @@ pub fn render_inspector_viewport(
                                         hide_all_changed = true;
                                     }
                                 });
+                                if override_count > 0 {
+                                    ui.horizontal_wrapped(|ui| {
+                                        ui.label(
+                                            egui::RichText::new(format!(
+                                                "已有 {override_count} 个格子启用单格独立排版（不随全局变化）"
+                                            ))
+                                            .size(11.0)
+                                            .color(Color32::from_rgb(245, 194, 107)),
+                                        );
+                                        if ui.small_button("同步到全部格子").clicked() {
+                                            sync_all_to_global = true;
+                                        }
+                                    });
+                                }
                             });
 
                             if single_reset {
@@ -715,6 +725,7 @@ pub fn render_inspector_viewport(
                                 || single_changed
                                 || prefs_changed
                                 || hide_all_changed
+                                || sync_all_to_global
                             {
                                 let mut guard = lock_unpoisoned(shared);
                                 let old_baseline = guard
@@ -770,25 +781,26 @@ pub fn render_inspector_viewport(
                                             set_hwnd_locked(target_hwnd, locked);
                                         }
                                     }
-                                    if single_changed {
+                                    if single_changed && !sync_all_to_global {
                                         f.layout_override = if ov.is_empty() { None } else { Some(ov) };
+                                    }
+                                }
+                                if sync_all_to_global {
+                                    for f in &mut guard.config.fences {
+                                        f.layout_override = None;
                                     }
                                 }
                                 if let Some(act) = push_rename_undo {
                                     guard.push_undo(act);
                                 }
                                 if prefs_changed {
-                                    let old_free_cell = guard.free_desktop_cell_size();
                                     guard.config.preferences.icon_cell_w = g_cell_w;
                                     guard.config.preferences.icon_cell_h = g_cell_h;
                                     guard.config.preferences.list_row_h = g_row_h;
                                     guard.config.preferences.list_icon_px = g_list_icon;
                                     guard.config.preferences.snap_threshold_px = snap_px;
                                     let new_free_cell = guard.free_desktop_cell_size();
-                                    guard.rescale_free_icons_for_cell_size(
-                                        old_free_cell,
-                                        new_free_cell,
-                                    );
+                                    guard.clamp_free_icons_for_cell_size(new_free_cell);
                                 }
                                 if hide_all_changed {
                                     guard.config.hide_all_fences = hide_all;
@@ -798,7 +810,7 @@ pub fn render_inspector_viewport(
                                     guard.mark_free_desktop_dirty(Some(&ctx));
                                 }
                             }
-                            if prefs_changed || hide_all_changed {
+                            if prefs_changed || hide_all_changed || sync_all_to_global {
                                 request_repaint_all_fences(shared, &ctx);
                                 ctx.request_repaint_of(ViewportId::ROOT);
                             } else if name_changed

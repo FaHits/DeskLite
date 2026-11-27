@@ -468,6 +468,23 @@ impl SharedFenceState {
         )
     }
 
+    /// Keeps each free desktop icon anchored in place when global cell size changes,
+    /// clamping only if the new cell rectangle would extend past its monitor work area.
+    pub fn clamp_free_icons_for_cell_size(&mut self, cell: (i32, i32)) {
+        let monitors = self.topology.monitors().to_vec();
+        if monitors.is_empty() {
+            return;
+        }
+        let Some(free) = self.config.active_free_icons_mut() else {
+            return;
+        };
+        for icon in free.iter_mut() {
+            if let Ok((clamped, _)) = clamp_point_to_monitors(icon.pos, cell, &monitors) {
+                icon.pos = clamped;
+            }
+        }
+    }
+
     /// Smoothly rescales existing `free_icons` positions when global cell dimensions change,
     /// clamping to monitors and nudging any colliding cells apart.
     pub fn rescale_free_icons_for_cell_size(&mut self, old_cell: (i32, i32), new_cell: (i32, i32)) {

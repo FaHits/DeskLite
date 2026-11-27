@@ -1,6 +1,6 @@
 # DeskLite 技术 Bug 统计与根因复盘全录
 
-> 覆盖范围：`E:\Ai_Agent\DeskLite` 从初始化提交 `5424ebf` 至当前工作分支 `feat/route-b-desktop-takeover` 共计 **46 项**典型故障与架构级缺陷修复（含前置立项阶段逆向确认的原版 DeskGo 核心错位根因）。
+> 覆盖范围：`E:\Ai_Agent\DeskLite` 从初始化提交 `5424ebf` 至当前工作分支 `feat/route-b-desktop-takeover` 共计 **47 项**典型故障与架构级缺陷修复（含前置立项阶段逆向确认的原版 DeskGo 核心错位根因）。
 
 ---
 
@@ -59,6 +59,7 @@
   - [#44 `FreeDesktop` 自绘桌面图标顶置对齐/毛坯感、失焦不清选、悬停缩放光标残留与缺热键](#bug-44)
   - [#45 `FreeDesktop` 左键单击、空白点击与框选被 `ReleaseCapture()` 同步 `WM_CAPTURECHANGED` 静默吞掉](#bug-45)
   - [#46 `FreeDesktop` 键盘焦点与热键断链、DPI 格距不统一、D2D 渲染粗糙、`vsync` 回归及跨格粘贴/撤销补漏](#bug-46)
+  - [#47 全局排版联动抽搐/不动、`FreeDesktop` 坐标按比例漂移、参数框悬浮拉伸光标与拖拽预览悬于光标下方](#bug-47)
 - [5. 跨 Bug 提炼的四条核心工程经验](#sec-takeaways)
 
 ---
@@ -68,10 +69,10 @@
 | 技术域 | 包含 Bug 编号 | 核心共性机制 |
 | :--- | :--- | :--- |
 | **A. Win32 窗体样式 / DWM / Z-Order** | `#01` `#03` `#04` `#09` `#14` `#15` `#16` `#23` `#29` `#33` `#39` `#43` | `WorkerW`/`Progman` 归属、`WM_WINDOWPOSCHANGING`、原生 `WM_STYLECHANGING` / `WM_NCCALCSIZE`、`TaskbarCreated` |
-| **B. 图形渲染 / WGL / Direct2D / 帧率** | `#01` `#04` `#12` `#19` `#22` `#23` `#36` `#38` `#39` `#40` `#43` `#44` `#46` | `eframe` 多 Viewport WGL `make_not_current` 崩溃与 `SwapInterval::Wait(1)` 串联阻塞、`UpdateLayeredWindow` Premultiplied Alpha |
+| **B. 图形渲染 / WGL / Direct2D / 帧率** | `#01` `#04` `#12` `#19` `#22` `#23` `#36` `#38` `#39` `#40` `#43` `#44` `#46` `#47` | `eframe` 多 Viewport WGL `make_not_current` 崩溃与 `SwapInterval::Wait(1)` 串联阻塞、`UpdateLayeredWindow` Premultiplied Alpha |
 | **C. Win32 Shell / 桌面图标接管 / 监听** | `#08` `#10` `#13` `#18` `#28` `#32` `#33` `#46` | Win11 `SysListView32` `LVS_OWNERDATA` 陷阱、`SHChangeNotify` 级联重载 → 整体隐藏 `SHELLDLL_DefView`、`ReadDirectoryChangesW` |
-| **D. OLE / COM 拖放 / 剪贴板 / 热键 / UI 交互** | `#03` `#05` `#06` `#07` `#17` `#19` `#20` `#21` `#31` `#37` `#41` `#42` `#44` `#45` `#46` | 跨 STA 套间 COM `SendMessage` 死锁、OLE `DoDragDrop` 两阶段分流、`WM_KEYDOWN` + `MAPVK_VSC_TO_VK_EX`、全局唯一焦点域 |
-| **E. 持久化 / 多屏拓扑 / 并发与容错** | `#02` `#11` `#24` `#25` `#26` `#27` `#30` `#32` `#34` `#35` `#46` | 单一归属模型（`FenceRole`）、CCD `TopologyKey`、原子写序号临时文件、切屏稳态期保护（Settling Guard） |
+| **D. OLE / COM 拖放 / 剪贴板 / 热键 / UI 交互** | `#03` `#05` `#06` `#07` `#17` `#19` `#20` `#21` `#31` `#37` `#41` `#42` `#44` `#45` `#46` `#47` | 跨 STA 套间 COM `SendMessage` 死锁、OLE `DoDragDrop` 两阶段分流、`WM_KEYDOWN` + `MAPVK_VSC_TO_VK_EX`、全局唯一焦点域 |
+| **E. 持久化 / 多屏拓扑 / 并发与容错** | `#02` `#11` `#24` `#25` `#26` `#27` `#30` `#32` `#34` `#35` `#46` `#47` | 单一归属模型（`FenceRole`）、CCD `TopologyKey`、原子写序号临时文件、切屏稳态期保护（Settling Guard） |
 
 ---
 
@@ -478,6 +479,22 @@ DeskLite 在 M1/M2 起即在 `desklite-core`（`TopologyKey`、`clamp.rs`、`sto
   - 新增 `SharedFenceState::free_desktop_cell_size()` 与 `rescale_free_icons_for_cell_size()` 统一物理像素尺寸与实时缩放联动，恢复 `native_options.glow_options.vsync = false`；
   - `free_desktop_wnd.rs` 实现 `downsample_pbgra_hq`、磨砂钴蓝选框与双层文字阴影、暗色圆角无边框行内重命名、`draw_toast_pill`（1200ms 定时自动消隐）及 `icon_epoch` 缓存失效重载；
   - 将 `drain_events_and_commands` 迁入 `eframe::App::logic()`，同时补全 `actions.rs`/`undo.rs` 跨格粘贴与撤销归位闭环（`cut_paths` 统一 `normalize_path_key`）。
+
+<a id="bug-47"></a>
+### #47 全局排版联动抽搐/不动、`FreeDesktop` 坐标按比例漂移、参数框悬浮拉伸光标与拖拽预览悬于光标下方
+- **提交 / 模块**：`feat/route-b-desktop-takeover` · [drag_ghost.rs](file:///E:/Ai_Agent/DeskLite/crates/desklite-win32/src/drag_ghost.rs)、[drag_out.rs](file:///E:/Ai_Agent/DeskLite/crates/desklite-win32/src/drag_out.rs)、[state.rs](file:///E:/Ai_Agent/DeskLite/crates/desklite-ui/src/state.rs)、[fence_view.rs](file:///E:/Ai_Agent/DeskLite/crates/desklite-ui/src/fence_view.rs)、[inspector.rs](file:///E:/Ai_Agent/DeskLite/crates/desklite-ui/src/inspector.rs)
+- **现象**：
+  1. 在参数设置面板拖动全局格宽/格高时，部分启用过单格独立排版的格子不跟随变化且界面无提示与一键同步入口；普通非聚焦格子偶尔抽搐或动一半停住；同时拉动全局格宽会导致 `FreeDesktop` 桌面图标沿 X/Y 轴整体偏移乱跑；
+  2. 参数面板“位置 / 尺寸”四个 `DragValue` 框在鼠标普通悬停时全显示左右拉伸光标；
+  3. 无论从格子还是自由桌面拖出文件，预览浮窗（及外部 OLE 缩略图）都偏在鼠标光标下方，而非 Windows 标准的悬浮于光标正上方。
+- **技术根因**：
+  1. `inspector.rs` 缺少 `layout_override` 计数提示与一键清空同步；`fence_view.rs` 使用依赖连续多帧重绘的 `0.14s` `ctx.animate_value_with_time` 插值格距，非聚焦格子仅收到单次 `request_repaint_all_fences` 时动画停在中途；`inspector.rs` 调格距时调用 `rescale_free_icons_for_cell_size` 按 `(new_cw/old_cw, new_ch/old_ch)` 改写自由图标原始坐标；
+  2. `egui::DragValue` 默认悬停设置 `CursorIcon::ResizeHorizontal`；
+  3. Phase 1 `DragGhost::show`/`move_to` 定位在 `(pt.x + 16, pt.y + 16)`、Phase 2 `SHDRAGIMAGE.ptOffset` 仅居中在 `(SH_DRAG_SIZE / 2, SH_DRAG_SIZE / 2)`。
+- **修复方案**：
+  - `state.rs` 新增 `clamp_free_icons_for_cell_size`（保持桌面图标 `(x, y)` 锚点不动，仅在超出工作区右/下边界时内收夹紧）；`fence_view.rs` 移除格距 `animate_value_with_time` 动画直用目标尺寸；`inspector.rs` 在全局卡片统计 `override_count` 并提供提示与“同步到全部格子”一键清空按钮（`single_reset` 同步触发 `request_repaint_fence`）；
+  - `inspector.rs` 统一封装 `rx`/`ry`/`rw`/`rh` 四个 `DragValue`，悬停且非拖拽时（`resp.hovered() && !resp.dragged()`）重置为 `egui::CursorIcon::Default`；
+  - `drag_ghost.rs` 新增 `ghost_window_origin(cursor_x, cursor_y)` 返回 `(cursor_x - GHOST_SIZE / 2, cursor_y - (GHOST_SIZE as f32 * 0.86).round() as i32)`，`drag_out.rs` 在 Phase 1 与 Phase 2 `SHDRAGIMAGE.ptOffset` 均对齐 `y = 0.86 * size` 使预览图居中悬浮于光标上方。
 
 ---
 

@@ -529,27 +529,7 @@ pub fn render_fence_viewport(
         return out;
     };
 
-    let (target_cw, target_ch, target_rh, target_li) = (cell_w, cell_h, list_row_h, list_icon_px);
-    let cell_w = ctx.animate_value_with_time(
-        ui.make_persistent_id(("anim_cw", fence_id)),
-        target_cw,
-        0.14,
-    );
-    let cell_h = ctx.animate_value_with_time(
-        ui.make_persistent_id(("anim_ch", fence_id)),
-        target_ch,
-        0.14,
-    );
-    let list_row_h = ctx.animate_value_with_time(
-        ui.make_persistent_id(("anim_rh", fence_id)),
-        target_rh,
-        0.14,
-    );
-    let list_icon_px = ctx.animate_value_with_time(
-        ui.make_persistent_id(("anim_li", fence_id)),
-        target_li,
-        0.14,
-    );
+    let _ = &ctx;
 
     let want_toggle = lock_unpoisoned(shared)
         .pending_toggle_collapse
@@ -3047,14 +3027,16 @@ mod tests {
                 DesktopIconPos {
                     id: dir.join("second.txt").to_string_lossy().into_owned(),
                     display_name: "second.txt".into(),
-                    pos: Point { x: 104, y: 20 },
+                    pos: Point { x: 1830, y: 20 },
                 },
             ];
-            let old_cell = (84, 96);
             let new_cell = g.free_desktop_cell_size();
-            g.rescale_free_icons_for_cell_size(old_cell, new_cell);
+            g.clamp_free_icons_for_cell_size(new_cell);
             let icons = g.config.active_free_icons();
-            assert!((icons[1].pos.x - icons[0].pos.x).abs() >= new_cell.0);
+            // Interior icon anchor must not drift along X/Y when global cell size changes.
+            assert_eq!(icons[0].pos, Point { x: 20, y: 20 });
+            // Edge-overflow icon clamps cleanly back inside primary monitor work_area.
+            assert!(icons[1].pos.x + new_cell.0 <= 1920);
             g.mark_free_desktop_dirty(None);
             assert!(g.pending_repaint_free_desktop);
 

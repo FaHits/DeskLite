@@ -46,7 +46,7 @@ use windows::Win32::UI::WindowsAndMessaging::{
 use windows::core::{BOOL, HRESULT, Ref, Result as WinResult, implement, w};
 
 use crate::desktop_listview::probe_desktop_window_tree;
-use crate::drag_ghost::{DragGhost, render_drag_preview_dib};
+use crate::drag_ghost::{DragGhost, ghost_window_origin, render_drag_preview_dib};
 use crate::window_attach::set_file_drag_active;
 use crate::{Win32Error, win_err};
 
@@ -612,7 +612,7 @@ unsafe fn initialize_drag_source_helper(paths: &[String], data_obj: &IDataObject
         },
         ptOffset: POINT {
             x: SH_DRAG_SIZE / 2,
-            y: SH_DRAG_SIZE / 2,
+            y: (SH_DRAG_SIZE as f32 * 0.86).round() as i32,
         },
         hbmpDragImage: hbmp,
         crColorKey: COLORREF(0x00FF_00FF),
@@ -656,7 +656,8 @@ pub fn start_file_drag_out_async(
                 // cause a cross-apartment COM SendMessage deadlock -> Application Hang).
                 let mut init_pt = POINT::default();
                 let mut ghost = if GetCursorPos(&mut init_pt).is_ok() {
-                    DragGhost::show(&req.paths, init_pt.x + 16, init_pt.y + 16)
+                    let (gx, gy) = ghost_window_origin(init_pt.x, init_pt.y);
+                    DragGhost::show(&req.paths, gx, gy)
                 } else {
                     None
                 };
@@ -672,7 +673,8 @@ pub fn start_file_drag_out_async(
                     let mut pt = POINT::default();
                     let has_pt = GetCursorPos(&mut pt).is_ok();
                     if has_pt && let Some(ref g) = ghost {
-                        g.move_to(pt.x + 16, pt.y + 16);
+                        let (gx, gy) = ghost_window_origin(pt.x, pt.y);
+                        g.move_to(gx, gy);
                     }
                     let hit = if has_pt { WindowFromPoint(pt) } else { HWND::default() };
                     let root = if !hit.is_invalid() {

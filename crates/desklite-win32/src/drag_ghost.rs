@@ -36,6 +36,15 @@ use crate::icons::extract_file_icon_pbgra;
 const GHOST_SIZE: i32 = 104;
 static GHOST_CLASS_REG: OnceLock<bool> = OnceLock::new();
 
+/// Computes the top-left screen origin for `DragGhost` so the rounded preview plate sits
+/// horizontally centered and above the cursor tip (matching Explorer's drag preview).
+pub(crate) fn ghost_window_origin(cursor_x: i32, cursor_y: i32) -> (i32, i32) {
+    (
+        cursor_x - GHOST_SIZE / 2,
+        cursor_y - (GHOST_SIZE as f32 * 0.86).round() as i32,
+    )
+}
+
 unsafe extern "system" fn ghost_wnd_proc(
     hwnd: HWND,
     msg: u32,
@@ -448,5 +457,18 @@ impl Drop for DragGhost {
             }
             self.hwnd = HWND::default();
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn ghost_window_origin_centers_horizontally_and_hovers_above_cursor() {
+        let (x, y) = ghost_window_origin(1000, 500);
+        assert_eq!(x, 1000 - GHOST_SIZE / 2);
+        assert_eq!(y, 500 - (GHOST_SIZE as f32 * 0.86).round() as i32);
+        assert!(y + GHOST_SIZE > 500 && y < 500);
     }
 }
