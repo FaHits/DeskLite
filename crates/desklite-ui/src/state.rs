@@ -59,6 +59,13 @@ pub enum FenceCommand {
         screen_x: i32,
         screen_y: i32,
     },
+    ShowFenceItemMenu {
+        fence_id: i32,
+        paths: Vec<String>,
+        is_bucket: bool,
+        screen_x: i32,
+        screen_y: i32,
+    },
     FreeDesktopMenuAction(FreeDesktopMenuCommand),
 }
 
@@ -112,6 +119,20 @@ pub enum FreeIconMenuCommand {
     CopyPaths,
     Rename,
     MoveToFence(i32),
+    Trash,
+    Properties,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum FenceItemMenuCommand {
+    Open,
+    OpenAsAdmin,
+    RevealInExplorer,
+    Copy { cut: bool },
+    CopyPaths,
+    Rename,
+    MoveToFence(i32),
+    RemoveFromFence,
     Trash,
     Properties,
 }

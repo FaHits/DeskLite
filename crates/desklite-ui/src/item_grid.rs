@@ -1,10 +1,9 @@
 use std::collections::HashSet;
-use std::path::Path;
 use std::sync::{Arc, Mutex};
 
 use desklite_core::{FenceItem, normalize_path_key};
 use desklite_win32::{
-    copy_text_to_clipboard, focus_window_now, is_ctrl_key_down, is_directly_on_desktop,
+    copy_text_to_clipboard, cursor_screen_pos, focus_window_now, is_ctrl_key_down,
     read_clipboard_text,
 };
 use egui::{
@@ -16,7 +15,7 @@ use crate::state::{FenceUiOutput, SharedFenceState, UndoAction, lock_unpoisoned}
 
 pub enum ItemUiAction {
     Select { idx: usize, ctrl: bool, shift: bool },
-    ContextSelect(usize),
+    OpenContextMenu { idx: usize, screen_x: i32, screen_y: i32 },
     Launch(String),
     LaunchAsAdmin(String),
     LaunchSelected,
@@ -41,11 +40,11 @@ pub fn handle_item_interactions(
     my_hwnd: isize,
     idx: usize,
     item: &FenceItem,
-    is_selected: bool,
-    selected_count: usize,
+    _is_selected: bool,
+    _selected_count: usize,
     is_bucket: bool,
     out_action: &mut Option<ItemUiAction>,
-) -> Option<egui::Id> {
+) {
     let focused_now = resp.ctx.input(|i| i.focused);
     if resp.clicked() {
         if !focused_now {
@@ -62,9 +61,15 @@ pub fn handle_item_interactions(
         if !focused_now {
             focus_window_now(my_hwnd);
         }
-        if !is_selected {
-            *out_action = Some(ItemUiAction::ContextSelect(idx));
-        }
+        let (screen_x, screen_y) = cursor_screen_pos().unwrap_or_else(|| {
+            let p = resp.interact_pointer_pos().unwrap_or(resp.rect.center());
+            (p.x.round() as i32, p.y.round() as i32)
+        });
+        *out_action = Some(ItemUiAction::OpenContextMenu {
+            idx,
+            screen_x,
+            screen_y,
+        });
     }
     if resp.double_clicked() {
         *out_action = Some(ItemUiAction::Launch(item.path.clone()));
@@ -79,103 +84,6 @@ pub fn handle_item_interactions(
             *out_action = Some(ItemUiAction::StartDragOut { idx, ctrl, shift });
         }
     }
-
-    let multi = is_selected && selected_count > 1;
-    let copy_lbl = if multi {
-        format!("复制 ({selected_count} 项) (C)  Ctrl+C")
-    } else {
-        "复制 (C)  Ctrl+C".to_string()
-    };
-    let cut_lbl = if multi {
-        format!("剪切 ({selected_count} 项) (T)  Ctrl+X")
-    } else {
-        "剪切 (T)  Ctrl+X".to_string()
-    };
-    let remove_lbl = if multi {
-        format!("移出格子 ({selected_count} 项) (E)")
-    } else if is_directly_on_desktop(Path::new(&item.path)) {
-        "移出格子（放回桌面）(E)".to_string()
-    } else {
-        "从格子移除 (E)".to_string()
-    };
-    let is_exec = Path::new(&item.path)
-        .extension()
-        .and_then(|e| e.to_str())
-        .is_some_and(|e| {
-            matches!(
-                e.to_ascii_lowercase().as_str(),
-                "exe" | "lnk" | "bat" | "cmd" | "msi"
-            )
-        });
-    resp.context_menu(|ui| {
-        let (k_o, k_a, k_i, k_t, k_c, k_l, k_m, k_e, k_d, k_r) = ui.input(|i| {
-            let nm = !i.modifiers.any();
-            (
-                nm && i.key_pressed(Key::O),
-                nm && i.key_pressed(Key::A),
-                nm && i.key_pressed(Key::I),
-                nm && i.key_pressed(Key::T),
-                nm && i.key_pressed(Key::C),
-                nm && i.key_pressed(Key::L),
-                nm && i.key_pressed(Key::M),
-                nm && i.key_pressed(Key::E),
-                nm && i.key_pressed(Key::D),
-                nm && i.key_pressed(Key::R),
-            )
-        });
-        if ui.button("打开 (O)  Enter").clicked() || k_o {
-            if multi {
-                *out_action = Some(ItemUiAction::LaunchSelected);
-            } else {
-                *out_action = Some(ItemUiAction::Launch(item.path.clone()));
-            }
-            ui.close();
-        }
-        if !multi && is_exec && (ui.button("以管理员身份运行 (A)").clicked() || k_a) {
-            *out_action = Some(ItemUiAction::LaunchAsAdmin(item.path.clone()));
-            ui.close();
-        }
-        if ui.button("打开所在位置 (I)").clicked() || k_i {
-            *out_action = Some(ItemUiAction::Reveal(item.path.clone()));
-            ui.close();
-        }
-        ui.separator();
-        if ui.button(cut_lbl).clicked() || k_t {
-            *out_action = Some(ItemUiAction::CopySelected { cut: true });
-            ui.close();
-        }
-        if ui.button(copy_lbl).clicked() || k_c {
-            *out_action = Some(ItemUiAction::CopySelected { cut: false });
-            ui.close();
-        }
-        if ui.button("复制路径 (L)  Ctrl+Shift+C").clicked() || k_l {
-            *out_action = Some(ItemUiAction::CopyPaths);
-            ui.close();
-        }
-        if !multi && (ui.button("重命名 (M)  F2").clicked() || k_m) {
-            *out_action = Some(ItemUiAction::BeginRename(idx));
-            ui.close();
-        }
-        ui.separator();
-        if is_bucket && (ui.button(remove_lbl).clicked() || k_e) {
-            *out_action = Some(ItemUiAction::RemoveSelected);
-            ui.close();
-        }
-        let trash_lbl = if multi {
-            format!("删除到回收站 ({selected_count} 项) (D)")
-        } else {
-            "删除到回收站 (D)".to_string()
-        };
-        if ui.button(trash_lbl).clicked() || k_d {
-            *out_action = Some(ItemUiAction::TrashSelected);
-            ui.close();
-        }
-        if !multi && (ui.button("属性 (R)  Alt+Enter").clicked() || k_r) {
-            *out_action = Some(ItemUiAction::ShowProperties(item.path.clone()));
-            ui.close();
-        }
-    })
-    .map(|_| egui::Popup::default_response_id(resp))
 }
 
 pub fn compute_reorder_target(

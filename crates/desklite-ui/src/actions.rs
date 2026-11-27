@@ -22,8 +22,9 @@ use crate::inspector::open_param_editor_for_fence;
 use crate::item_grid::ItemUiAction;
 use crate::state::{
     AsyncDragSession, COLLAPSED_HEIGHT, CollapseAnimState, CollapsedMenuCommand, DragSourceState,
-    FenceCommand, FenceUiOutput, ItemRenamePrompt, RenamePrompt, ReorderDragState,
-    SelectionScope, SharedFenceState, UndoAction, duplicate_fence_with_style, lock_unpoisoned,
+    FenceCommand, FenceItemMenuCommand, FenceUiOutput, ItemRenamePrompt, RenamePrompt,
+    ReorderDragState, SelectionScope, SharedFenceState, UndoAction, duplicate_fence_with_style,
+    lock_unpoisoned,
 };
 use crate::undo::execute_undo;
 
@@ -453,14 +454,52 @@ pub fn execute_item_action(
                 guard.selection_anchor.insert(fence_id, idx);
             }
         }
-        ItemUiAction::ContextSelect(idx) => {
+        ItemUiAction::OpenContextMenu {
+            idx,
+            screen_x,
+            screen_y,
+        } => {
             let mut guard = lock_unpoisoned(shared);
             guard.clear_all_selections_except(Some(SelectionScope::Fence(fence_id)));
-            let set = guard.selected_items.entry(fence_id).or_default();
-            if !set.contains(&idx) {
-                set.clear();
-                set.insert(idx);
-                guard.selection_anchor.insert(fence_id, idx);
+            let sorted: Vec<usize> = {
+                let mut inserted = false;
+                let mut list: Vec<usize> = {
+                    let set = guard.selected_items.entry(fence_id).or_default();
+                    if !set.contains(&idx) {
+                        set.clear();
+                        set.insert(idx);
+                        inserted = true;
+                    }
+                    set.iter().copied().collect()
+                };
+                if inserted {
+                    guard.selection_anchor.insert(fence_id, idx);
+                }
+                list.sort_unstable();
+                list
+            };
+            let paths: Vec<String> = sorted
+                .into_iter()
+                .filter_map(|i| spec.items.get(i).map(|it| it.path.clone()))
+                .collect();
+            if !paths.is_empty() {
+                let is_bucket = guard
+                    .config
+                    .fences
+                    .iter()
+                    .find(|f| f.id == fence_id)
+                    .is_some_and(|f| f.is_desktop_bucket(&guard.desktop_dirs));
+                allow_foreground_self();
+                guard.push_command(
+                    ctx,
+                    FenceCommand::ShowFenceItemMenu {
+                        fence_id,
+                        paths,
+                        is_bucket,
+                        screen_x,
+                        screen_y,
+                    },
+                );
             }
         }
         ItemUiAction::Launch(path) => {
@@ -702,6 +741,243 @@ pub fn execute_item_action(
             start_async_drag_from_paths(Some(fence_id), drag_paths, shared);
         }
     }
+}
+
+pub fn apply_fence_item_menu_command(
+    fence_id: i32,
+    paths: &[String],
+    cmd: FenceItemMenuCommand,
+    shared: &Arc<Mutex<SharedFenceState>>,
+    ctx: &egui::Context,
+) -> bool {
+    if paths.is_empty() {
+        return false;
+    }
+    let mut needs_immediate_save = false;
+    match cmd {
+        FenceItemMenuCommand::Open => {
+            for p in paths.iter().take(8) {
+                if let Err(e) = launch_item(p) {
+                    let mut guard = lock_unpoisoned(shared);
+                    guard
+                        .toast_msg
+                        .insert(fence_id, (format!("打开失败: {e}"), Instant::now()));
+                    guard.request_repaint_fence(ctx, fence_id);
+                    break;
+                }
+            }
+        }
+        FenceItemMenuCommand::OpenAsAdmin => {
+            if let Some(first) = paths.first()
+                && let Err(e) = launch_as_admin(first)
+            {
+                let mut guard = lock_unpoisoned(shared);
+                guard
+                    .toast_msg
+                    .insert(fence_id, (format!("提权运行失败: {e}"), Instant::now()));
+                guard.request_repaint_fence(ctx, fence_id);
+            }
+        }
+        FenceItemMenuCommand::RevealInExplorer => {
+            if let Some(first) = paths.first() {
+                let _ = reveal_in_explorer(first);
+            }
+        }
+        FenceItemMenuCommand::Copy { cut } => {
+            let hwnd = {
+                let guard = lock_unpoisoned(shared);
+                guard
+                    .attached_hwnds
+                    .get(&fence_id)
+                    .copied()
+                    .unwrap_or(guard.free_desktop_hwnd)
+            };
+            if set_clipboard_files_for_window(hwnd, paths, cut).is_ok() {
+                let mut guard = lock_unpoisoned(shared);
+                guard.cut_paths.clear();
+                if cut {
+                    for p in paths {
+                        guard.cut_paths.insert(normalize_path_key(p));
+                    }
+                }
+                let verb = if cut { "已剪切" } else { "已复制" };
+                guard.toast_msg.insert(
+                    fence_id,
+                    (format!("{verb} {} 项", paths.len()), Instant::now()),
+                );
+                guard.request_repaint_fence(ctx, fence_id);
+                guard.mark_free_desktop_dirty(Some(ctx));
+            } else {
+                let mut guard = lock_unpoisoned(shared);
+                guard
+                    .toast_msg
+                    .insert(fence_id, ("剪贴板被占用，请重试".to_string(), Instant::now()));
+                guard.request_repaint_fence(ctx, fence_id);
+            }
+        }
+        FenceItemMenuCommand::CopyPaths => {
+            if copy_text_to_clipboard(&paths.join("\r\n")).is_ok() {
+                let mut guard = lock_unpoisoned(shared);
+                guard
+                    .toast_msg
+                    .insert(fence_id, ("已复制路径".to_string(), Instant::now()));
+                guard.request_repaint_fence(ctx, fence_id);
+            }
+        }
+        FenceItemMenuCommand::Rename => {
+            if let Some(first) = paths.first() {
+                let target_key = normalize_path_key(first);
+                let mut guard = lock_unpoisoned(shared);
+                if let Some(f) = guard.config.fences.iter().find(|f| f.id == fence_id)
+                    && let Some((idx, it)) = f
+                        .items
+                        .iter()
+                        .enumerate()
+                        .find(|(_, it)| normalize_path_key(&it.path) == target_key)
+                {
+                    let file_name = Path::new(&it.path)
+                        .file_name()
+                        .map(|s| s.to_string_lossy().into_owned())
+                        .unwrap_or_else(|| it.display_name.clone());
+                    guard.item_rename_prompt = Some(ItemRenamePrompt {
+                        fence_id,
+                        item_idx: idx,
+                        original_path: it.path.clone(),
+                        draft: file_name,
+                        needs_focus: true,
+                    });
+                    guard.request_repaint_fence(ctx, fence_id);
+                }
+            }
+        }
+        FenceItemMenuCommand::RemoveFromFence => {
+            let path_keys: HashSet<String> = paths.iter().map(|p| normalize_path_key(p)).collect();
+            let mut guard = lock_unpoisoned(shared);
+            let desktop_dirs = guard.desktop_dirs.clone();
+            let mut removed_paths = Vec::new();
+            let mut removed_items = Vec::new();
+            if let Some(f) = guard.config.fence_mut(fence_id)
+                && f.is_desktop_bucket(&desktop_dirs)
+            {
+                let mut kept = Vec::with_capacity(f.items.len());
+                for it in f.items.drain(..) {
+                    if path_keys.contains(&normalize_path_key(&it.path)) {
+                        removed_paths.push(it.path.clone());
+                        removed_items.push(it);
+                    } else {
+                        kept.push(it);
+                    }
+                }
+                for (i, it) in kept.iter_mut().enumerate() {
+                    it.order = i as i32;
+                }
+                f.items = kept;
+                guard.selected_items.remove(&fence_id);
+                guard.selection_anchor.remove(&fence_id);
+                if !removed_items.is_empty() {
+                    guard.place_released_icons_on_free_desktop(&removed_paths, None);
+                    guard.push_undo(UndoAction::RemoveItems {
+                        fence_id,
+                        items: removed_items,
+                    });
+                    guard.refresh_all_unfiled_from_disk_if_present();
+                    guard.dirty_layout = true;
+                    guard.bump_free_icon_epoch();
+                    guard.request_repaint_fence(ctx, fence_id);
+                    guard.mark_free_desktop_dirty(Some(ctx));
+                    needs_immediate_save = true;
+                }
+            }
+        }
+        FenceItemMenuCommand::MoveToFence(target_fid) => {
+            let path_keys: HashSet<String> = paths.iter().map(|p| normalize_path_key(p)).collect();
+            let mut guard = lock_unpoisoned(shared);
+            let desktop_dirs = guard.desktop_dirs.clone();
+            let valid = fence_id != target_fid
+                && guard.config.fences.iter().any(|f| {
+                    f.id == fence_id && f.effective_role(&desktop_dirs) == FenceRole::DesktopBucket
+                })
+                && guard.config.fences.iter().any(|f| {
+                    f.id == target_fid
+                        && f.effective_role(&desktop_dirs) == FenceRole::DesktopBucket
+                });
+            if valid {
+                let mut moved_items = Vec::new();
+                if let Some(src) = guard.config.fence_mut(fence_id) {
+                    let mut kept = Vec::with_capacity(src.items.len());
+                    for it in src.items.drain(..) {
+                        if path_keys.contains(&normalize_path_key(&it.path)) {
+                            moved_items.push(it);
+                        } else {
+                            kept.push(it);
+                        }
+                    }
+                    for (i, it) in kept.iter_mut().enumerate() {
+                        it.order = i as i32;
+                    }
+                    src.items = kept;
+                }
+                if !moved_items.is_empty() {
+                    if let Some(dst) = guard.config.fence_mut(target_fid) {
+                        let base = dst.items.len() as i32;
+                        for (i, mut it) in moved_items.iter().cloned().enumerate() {
+                            it.order = base + i as i32;
+                            dst.items.push(it);
+                        }
+                    }
+                    guard.selected_items.remove(&fence_id);
+                    guard.selection_anchor.remove(&fence_id);
+                    guard.push_undo(UndoAction::MoveBetweenBuckets {
+                        src_fence_id: fence_id,
+                        dst_fence_id: target_fid,
+                        items: moved_items,
+                    });
+                    guard.refresh_all_unfiled_from_disk_if_present();
+                    guard.dirty_layout = true;
+                    guard.request_repaint_fence(ctx, fence_id);
+                    guard.request_repaint_fence(ctx, target_fid);
+                    needs_immediate_save = true;
+                }
+            }
+        }
+        FenceItemMenuCommand::Trash => match trash_files(paths) {
+            Ok(true) => {
+                let mut guard = lock_unpoisoned(shared);
+                let desktop_dirs = guard.desktop_dirs.clone();
+                for p in paths {
+                    guard.invalidate_icon_texture(p);
+                    let _ = guard.config.remove_desktop_path_everywhere(p, &desktop_dirs);
+                }
+                if let Some(f) = guard.config.fence_mut(fence_id)
+                    && let Some(dir) = f.external_portal_dir(&desktop_dirs)
+                {
+                    f.items = scan_portal_directory(Path::new(&dir));
+                }
+                guard.refresh_all_unfiled_from_disk_if_present();
+                guard.selected_items.remove(&fence_id);
+                guard.selection_anchor.remove(&fence_id);
+                guard.dirty_layout = true;
+                guard.bump_free_icon_epoch();
+                guard.request_repaint_fence(ctx, fence_id);
+                guard.mark_free_desktop_dirty(Some(ctx));
+                needs_immediate_save = true;
+            }
+            Ok(false) => {}
+            Err(e) => {
+                let mut guard = lock_unpoisoned(shared);
+                guard
+                    .toast_msg
+                    .insert(fence_id, (format!("删除失败: {e}"), Instant::now()));
+                guard.request_repaint_fence(ctx, fence_id);
+            }
+        },
+        FenceItemMenuCommand::Properties => {
+            if let Some(first) = paths.first() {
+                let _ = show_file_properties(first);
+            }
+        }
+    }
+    needs_immediate_save
 }
 
 pub fn handle_paste_action(

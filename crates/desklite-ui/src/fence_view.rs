@@ -30,20 +30,20 @@ use crate::item_grid::{
 };
 use crate::snap::snap_move_rect;
 use crate::state::{
-    MarqueeState, PopupOwnerState, RESIZE_EDGE, TitleDragState, UndoAction, ViewModeAnimState,
+    MarqueeState, RESIZE_EDGE, TitleDragState, UndoAction, ViewModeAnimState,
     flush_pending_repaints, lock_unpoisoned, resolve_fence_layout,
 };
 
 // Re-export public API for backward compatibility with desklite-app and tests.
-pub use crate::actions::apply_collapsed_menu_command;
+pub use crate::actions::{apply_collapsed_menu_command, apply_fence_item_menu_command};
 pub use crate::free_desktop_view::{
     FreeDesktopDispatchResult, apply_free_desktop_menu_command, apply_free_icon_menu_command,
     build_free_desktop_snapshot, handle_free_desktop_event,
 };
 pub use crate::inspector::render_inspector_viewport;
 pub use crate::state::{
-    COLLAPSED_HEIGHT, CollapsedMenuCommand, FREE_DESKTOP_TITLE, FenceCommand, FenceUiOutput,
-    FreeDesktopMenuCommand, FreeIconMenuCommand, INSPECTOR_HEIGHT, INSPECTOR_TITLE,
+    COLLAPSED_HEIGHT, CollapsedMenuCommand, FREE_DESKTOP_TITLE, FenceCommand, FenceItemMenuCommand,
+    FenceUiOutput, FreeDesktopMenuCommand, FreeIconMenuCommand, INSPECTOR_HEIGHT, INSPECTOR_TITLE,
     INSPECTOR_WIDTH, InspectorState, RenamePrompt, SelectionScope, SharedFenceState,
     apply_param_editor_rect, collect_managed_desktop_paths,
     collect_managed_desktop_paths_for_dirs, configure_egui_theme, duplicate_fence_with_style,
@@ -1431,7 +1431,6 @@ pub fn render_fence_viewport(
             }
 
             let mut item_action: Option<ItemUiAction> = None;
-            let mut opened_item_popup: Option<egui::Id> = None;
             let mut item_rects: Vec<(usize, egui::Rect)> = Vec::with_capacity(spec.items.len());
             let viewport_clip_rect = ui.available_rect_before_wrap();
             let blank_hit_rect = viewport_clip_rect.expand2(Vec2::new(8.0, 0.0));
@@ -1527,8 +1526,8 @@ pub fn render_fence_viewport(
                                     row_resp.scroll_to_me(None);
                                 }
                                 item_rects.push((idx, row_resp.rect));
-                                if !is_renaming_item
-                                    && let Some(pid) = handle_item_interactions(
+                                if !is_renaming_item {
+                                    handle_item_interactions(
                                         &row_resp,
                                         my_hwnd,
                                         idx,
@@ -1537,9 +1536,7 @@ pub fn render_fence_viewport(
                                         sel_count,
                                         is_bucket,
                                         &mut item_action,
-                                    )
-                                {
-                                    opened_item_popup = Some(pid);
+                                    );
                                 }
                             }
                         }
@@ -1603,8 +1600,8 @@ pub fn render_fence_viewport(
                                                 tile_resp.scroll_to_me(None);
                                             }
                                             item_rects.push((idx, tile_resp.rect));
-                                            if !is_renaming_item
-                                                && let Some(pid) = handle_item_interactions(
+                                            if !is_renaming_item {
+                                                handle_item_interactions(
                                                     &tile_resp,
                                                     my_hwnd,
                                                     idx,
@@ -1613,9 +1610,7 @@ pub fn render_fence_viewport(
                                                     sel_count,
                                                     is_bucket,
                                                     &mut item_action,
-                                                )
-                                            {
-                                                opened_item_popup = Some(pid);
+                                                );
                                             }
                                             if (idx + 1) % cols == 0 {
                                                 ui.end_row();
@@ -1773,21 +1768,12 @@ pub fn render_fence_viewport(
                 }
             }
 
-            if let Some(pid) = opened_item_popup {
-                lock_unpoisoned(shared).popup_owners.insert(
-                    fence_id,
-                    PopupOwnerState {
-                        popup_id: pid,
-                        saw_focused: focused_now,
-                    },
-                );
-            }
-
             let marquee_active = lock_unpoisoned(shared).marquee_drag.contains_key(&fence_id);
             let reorder_active = lock_unpoisoned(shared).item_reorder.contains_key(&fence_id);
             let has_input_focus =
                 focused_now || (my_hwnd != 0 && foreground_window_handle() == my_hwnd);
-            if let Some(ItemUiAction::Select { .. } | ItemUiAction::ContextSelect(_)) = item_action
+            if let Some(ItemUiAction::Select { .. } | ItemUiAction::OpenContextMenu { .. }) =
+                item_action
             {
                 let sel_act = item_action.take().unwrap();
                 execute_item_action(

@@ -17,9 +17,10 @@ use desklite_core::{
 };
 use desklite_legacy::{LegacyOptions, legacy_to_native, load_legacy_dir};
 use desklite_ui::fence_view::{
-    CollapsedMenuCommand, FenceCommand, FreeDesktopMenuCommand, FreeIconMenuCommand, RenamePrompt,
-    apply_collapsed_menu_command, apply_free_desktop_menu_command, apply_free_icon_menu_command,
-    format_fence_title,
+    CollapsedMenuCommand, FenceCommand, FenceItemMenuCommand, FreeDesktopMenuCommand,
+    FreeIconMenuCommand, RenamePrompt, apply_collapsed_menu_command,
+    apply_fence_item_menu_command, apply_free_desktop_menu_command,
+    apply_free_icon_menu_command, format_fence_title,
 };
 use desklite_ui::state::lock_unpoisoned;
 use desklite_ui::{
@@ -28,17 +29,19 @@ use desklite_ui::{
     install_chinese_fonts, pending_free_rename, render_fence_viewport, render_inspector_viewport,
 };
 use desklite_win32::{
-    FolderWatcher, FreeDesktopController, FreeDesktopEvent, IconCache, TrayIcon,
-    WM_APP_PORTAL_DIRTY, WM_APP_TRAY, all_desktop_dirs, clipboard_has_files,
-    enable_dark_popup_menus, enable_per_monitor_dpi_v2, focus_window_now,
-    hide_all_fences_immediately, install_desktop_z_win_event_hooks, install_ui_thread_cloak_hook,
-    is_desktop_dir_path, is_display_wake_power_broadcast, is_vault_path, launch_item,
-    migrate_vault_item_to_desktop, pick_folder_dialog, post_reassert_all_fences_z,
+    ActiveShellMenuGuard, CUSTOM_MENU_CMD_BASE, CustomMenuItem, FolderWatcher,
+    FreeDesktopController, FreeDesktopEvent, HybridMenuOutcome, IconCache, TrayIcon,
+    WM_APP_PORTAL_DIRTY, WM_APP_TRAY, all_desktop_dirs, attach_desktop_background_submenu,
+    clipboard_has_files, enable_dark_popup_menus, enable_per_monitor_dpi_v2, focus_window_now,
+    handle_active_shell_menu_msg, hide_all_fences_immediately, install_desktop_z_win_event_hooks,
+    install_ui_thread_cloak_hook, invoke_shell_context_command, is_desktop_dir_path,
+    is_directly_on_desktop, is_display_wake_power_broadcast, is_shell_menu_cmd_id, is_vault_path,
+    launch_item, migrate_vault_item_to_desktop, pick_folder_dialog, post_reassert_all_fences_z,
     probe_display_topology, reassert_desktop_z_order_sync,
     register_power_and_session_notifications, restore_all_desktop_icons, scan_portal_directory,
     set_external_foreground_notify_target, set_shell_desktop_icons_visible, set_window_cloaked,
-    set_window_rect_no_z, set_z_reassert_notify_target, strip_alt_tab_from_host,
-    unregister_power_and_session_notifications,
+    set_window_rect_no_z, set_z_reassert_notify_target, show_hybrid_shell_items_menu,
+    strip_alt_tab_from_host, unregister_power_and_session_notifications,
 };
 use egui::{Pos2, Vec2, ViewportBuilder, ViewportCommand, ViewportId, WindowLevel};
 use raw_window_handle::{HasWindowHandle, RawWindowHandle};
@@ -90,6 +93,7 @@ const WM_APP_FREE_DESKTOP_EVENT: u32 = WM_APP + 28;
 const WM_APP_REFRESH_FREE_DESKTOP: u32 = WM_APP + 29;
 const WM_APP_EXTERNAL_FOREGROUND: u32 = WM_APP + 30;
 const WM_APP_REASSERT_DESKTOP_Z: u32 = WM_APP + 31;
+const WM_APP_SHOW_FENCE_ITEM_MENU: u32 = WM_APP + 32;
 
 const TRAY_CMD_NEW_BLANK: u32 = 1001;
 const TRAY_CMD_NEW_PORTAL: u32 = 1003;
@@ -122,30 +126,31 @@ const FENCE_CMD_UNDO: u32 = 2019;
 const FENCE_CMD_SELECT_ALL: u32 = 2020;
 const FENCE_CMD_REFRESH_PORTAL: u32 = 2021;
 
-const FREE_CMD_NEW_BLANK: u32 = 3001;
-const FREE_CMD_NEW_PORTAL: u32 = 3003;
-const FREE_CMD_TOGGLE_HIDE_ALL: u32 = 3004;
-const FREE_CMD_ARRANGE_NAME: u32 = 3005;
-const FREE_CMD_ARRANGE_KIND: u32 = 3006;
-const FREE_CMD_ARRANGE_MODIFIED: u32 = 3007;
-const FREE_CMD_REFRESH_DESKTOP: u32 = 3008;
-const FREE_CMD_REALIGN: u32 = 3009;
-const FREE_CMD_PASTE: u32 = 3010;
-const FREE_CMD_UNDO: u32 = 3011;
-const FREE_CMD_OPEN_DESKTOP_DIR: u32 = 3012;
-const FREE_CMD_OPEN_CONFIG_DIR: u32 = 3013;
-const FREE_CMD_EXIT: u32 = 3014;
+const FREE_CMD_NEW_BLANK: u32 = CUSTOM_MENU_CMD_BASE + 0x101;
+const FREE_CMD_NEW_PORTAL: u32 = CUSTOM_MENU_CMD_BASE + 0x102;
+const FREE_CMD_TOGGLE_HIDE_ALL: u32 = CUSTOM_MENU_CMD_BASE + 0x103;
+const FREE_CMD_ARRANGE_NAME: u32 = CUSTOM_MENU_CMD_BASE + 0x104;
+const FREE_CMD_ARRANGE_KIND: u32 = CUSTOM_MENU_CMD_BASE + 0x105;
+const FREE_CMD_ARRANGE_MODIFIED: u32 = CUSTOM_MENU_CMD_BASE + 0x106;
+const FREE_CMD_REFRESH_DESKTOP: u32 = CUSTOM_MENU_CMD_BASE + 0x107;
+const FREE_CMD_REALIGN: u32 = CUSTOM_MENU_CMD_BASE + 0x108;
+const FREE_CMD_PASTE: u32 = CUSTOM_MENU_CMD_BASE + 0x109;
+const FREE_CMD_UNDO: u32 = CUSTOM_MENU_CMD_BASE + 0x10A;
+const FREE_CMD_OPEN_DESKTOP_DIR: u32 = CUSTOM_MENU_CMD_BASE + 0x10B;
+const FREE_CMD_OPEN_CONFIG_DIR: u32 = CUSTOM_MENU_CMD_BASE + 0x10C;
+const FREE_CMD_EXIT: u32 = CUSTOM_MENU_CMD_BASE + 0x10D;
 
-const FREE_ICON_CMD_OPEN: u32 = 4001;
-const FREE_ICON_CMD_OPEN_ADMIN: u32 = 4002;
-const FREE_ICON_CMD_REVEAL: u32 = 4003;
-const FREE_ICON_CMD_COPY: u32 = 4004;
-const FREE_ICON_CMD_CUT: u32 = 4005;
-const FREE_ICON_CMD_COPY_PATHS: u32 = 4006;
-const FREE_ICON_CMD_RENAME: u32 = 4007;
-const FREE_ICON_CMD_TRASH: u32 = 4008;
-const FREE_ICON_CMD_PROPERTIES: u32 = 4009;
-const FREE_ICON_CMD_MOVE_BASE: u32 = 4100;
+const FREE_ICON_CMD_OPEN: u32 = CUSTOM_MENU_CMD_BASE + 0x201;
+const FREE_ICON_CMD_OPEN_ADMIN: u32 = CUSTOM_MENU_CMD_BASE + 0x202;
+const FREE_ICON_CMD_REVEAL: u32 = CUSTOM_MENU_CMD_BASE + 0x203;
+const FREE_ICON_CMD_COPY: u32 = CUSTOM_MENU_CMD_BASE + 0x204;
+const FREE_ICON_CMD_CUT: u32 = CUSTOM_MENU_CMD_BASE + 0x205;
+const FREE_ICON_CMD_COPY_PATHS: u32 = CUSTOM_MENU_CMD_BASE + 0x206;
+const FREE_ICON_CMD_RENAME: u32 = CUSTOM_MENU_CMD_BASE + 0x207;
+const FREE_ICON_CMD_TRASH: u32 = CUSTOM_MENU_CMD_BASE + 0x208;
+const FREE_ICON_CMD_PROPERTIES: u32 = CUSTOM_MENU_CMD_BASE + 0x209;
+const ITEM_CMD_REMOVE_FROM_FENCE: u32 = CUSTOM_MENU_CMD_BASE + 0x20A;
+const FREE_ICON_CMD_MOVE_BASE: u32 = CUSTOM_MENU_CMD_BASE + 0x300;
 
 struct SingleInstanceGuard(HANDLE);
 impl Drop for SingleInstanceGuard {
@@ -509,11 +514,18 @@ enum BgEvent {
     FenceMenuCommand(i32, CollapsedMenuCommand),
     FreeDesktopMenuCmd(FreeDesktopMenuCommand),
     FreeIconMenuCmd(Vec<String>, FreeIconMenuCommand),
+    FenceItemMenuCmd(i32, Vec<String>, FenceItemMenuCommand),
+    ShellPostRefresh {
+        fence_id: Option<i32>,
+        deleted_paths: Vec<String>,
+    },
     ExternalForeground,
     FlushAndExit,
 }
 
 static TASKBAR_CREATED_MSG: AtomicU32 = AtomicU32::new(0);
+
+type FenceItemMenuReq = Option<(i32, Vec<String>, bool)>;
 
 struct HelperState {
     hwnd: HWND,
@@ -521,6 +533,7 @@ struct HelperState {
     shared: Arc<Mutex<SharedFenceState>>,
     free_desktop_ctrl: Arc<Mutex<Option<FreeDesktopController>>>,
     free_icon_menu_paths: Arc<Mutex<Vec<String>>>,
+    fence_item_menu_req: Arc<Mutex<FenceItemMenuReq>>,
     tx: Sender<BgEvent>,
     egui_ctx: egui::Context,
     tray: Option<TrayIcon>,
@@ -966,13 +979,20 @@ impl HelperState {
     }
 
     fn show_free_desktop_menu(&self, x: i32, y: i32) {
-        let (hide_all, has_undo) = {
+        let (hide_all, has_undo, free_hwnd) = {
             let guard = lock_unpoisoned(&self.shared);
-            (guard.config.hide_all_fences, !guard.undo_stack.is_empty())
+            (
+                guard.config.hide_all_fences,
+                !guard.undo_stack.is_empty(),
+                guard.free_desktop_hwnd,
+            )
         };
         let Ok(menu) = (unsafe { CreatePopupMenu() }) else {
             return;
         };
+        let mut ignored_menus = HashSet::new();
+        ignored_menus.insert(menu.0 as isize);
+
         unsafe {
             let _ = AppendMenuW(menu, MF_STRING, FREE_CMD_NEW_BLANK as usize, w!("新建空白格子"));
             let _ = AppendMenuW(
@@ -1012,6 +1032,7 @@ impl HelperState {
                     FREE_CMD_ARRANGE_MODIFIED as usize,
                     w!("按修改时间排列"),
                 );
+                ignored_menus.insert(arrange.0 as isize);
                 let _ = AppendMenuW(menu, MF_POPUP, arrange.0 as usize, w!("排列自由图标"));
             }
             let _ = AppendMenuW(
@@ -1046,6 +1067,18 @@ impl HelperState {
                 FREE_CMD_OPEN_CONFIG_DIR as usize,
                 w!("打开配置目录"),
             );
+        }
+
+        let owner_hwnd = if free_hwnd != 0 {
+            HWND(free_hwnd as *mut _)
+        } else {
+            self.hwnd
+        };
+        let bg_shell_cm =
+            attach_desktop_background_submenu(menu, "系统桌面菜单 (新建 / 显示 / 个性化)", owner_hwnd)
+                .map(|(cm, _)| cm);
+
+        unsafe {
             let _ = AppendMenuW(menu, MF_SEPARATOR, 0, None);
             let _ = AppendMenuW(
                 menu,
@@ -1057,6 +1090,9 @@ impl HelperState {
 
         let cmd = {
             let _popup_guard = MenuPopupActiveGuard::enter(&self.shared);
+            let _shell_guard = bg_shell_cm
+                .as_ref()
+                .map(|cm| ActiveShellMenuGuard::install(cm, ignored_menus));
             unsafe {
                 let _ = SetForegroundWindow(self.hwnd);
                 TrackPopupMenuEx(
@@ -1074,6 +1110,15 @@ impl HelperState {
         }
 
         let raw_cmd = cmd.0 as u32;
+        if let Some(cm) = bg_shell_cm
+            && is_shell_menu_cmd_id(raw_cmd)
+        {
+            if invoke_shell_context_command(&cm, owner_hwnd, raw_cmd - 1, x, y).is_ok() {
+                let _ = self.tx.send(BgEvent::DesktopDirty);
+                self.egui_ctx.request_repaint_of(ViewportId::ROOT);
+            }
+            return;
+        }
         match raw_cmd {
             FREE_CMD_NEW_BLANK => {
                 let _ = self
@@ -1166,143 +1211,369 @@ impl HelperState {
         }
     }
 
+    fn bucket_targets_excluding(&self, exclude_fence_id: Option<i32>) -> Vec<(i32, String)> {
+        let guard = lock_unpoisoned(&self.shared);
+        let desktop_dirs = &guard.desktop_dirs;
+        guard
+            .config
+            .fences
+            .iter()
+            .filter(|f| Some(f.id) != exclude_fence_id && f.is_desktop_bucket(desktop_dirs))
+            .map(|f| (f.id, format_fence_title(f)))
+            .collect()
+    }
+
+    fn build_item_fallback_menu(
+        paths: &[String],
+        bucket_targets: &[(i32, String)],
+        remove_label: Option<&str>,
+    ) -> Vec<CustomMenuItem> {
+        let single = paths.len() == 1;
+        let mut items = Vec::new();
+        items.push(CustomMenuItem::Action {
+            id: FREE_ICON_CMD_OPEN,
+            label: "打开\tEnter".to_string(),
+        });
+        if single {
+            items.push(CustomMenuItem::Action {
+                id: FREE_ICON_CMD_OPEN_ADMIN,
+                label: "以管理员身份运行".to_string(),
+            });
+            items.push(CustomMenuItem::Action {
+                id: FREE_ICON_CMD_REVEAL,
+                label: "在资源管理器中显示".to_string(),
+            });
+        }
+        if !bucket_targets.is_empty() {
+            items.push(CustomMenuItem::Submenu {
+                label: if remove_label.is_some() {
+                    "移动到其他格子".to_string()
+                } else {
+                    "移动到格子".to_string()
+                },
+                items: bucket_targets
+                    .iter()
+                    .enumerate()
+                    .map(|(idx, (_, title))| (FREE_ICON_CMD_MOVE_BASE + idx as u32, title.clone()))
+                    .collect(),
+            });
+        }
+        if let Some(rm_lbl) = remove_label {
+            items.push(CustomMenuItem::Action {
+                id: ITEM_CMD_REMOVE_FROM_FENCE,
+                label: rm_lbl.to_string(),
+            });
+        }
+        items.push(CustomMenuItem::Action {
+            id: FREE_ICON_CMD_COPY,
+            label: "复制\tCtrl+C".to_string(),
+        });
+        items.push(CustomMenuItem::Action {
+            id: FREE_ICON_CMD_CUT,
+            label: "剪切\tCtrl+X".to_string(),
+        });
+        items.push(CustomMenuItem::Action {
+            id: FREE_ICON_CMD_COPY_PATHS,
+            label: "复制路径\tCtrl+Shift+C".to_string(),
+        });
+        if single {
+            items.push(CustomMenuItem::Action {
+                id: FREE_ICON_CMD_RENAME,
+                label: "重命名\tF2".to_string(),
+            });
+        }
+        items.push(CustomMenuItem::Action {
+            id: FREE_ICON_CMD_TRASH,
+            label: "删除到回收站\tDel".to_string(),
+        });
+        if single {
+            items.push(CustomMenuItem::Action {
+                id: FREE_ICON_CMD_PROPERTIES,
+                label: "属性\tAlt+Enter".to_string(),
+            });
+        }
+        items
+    }
+
+    fn track_popup_menu(
+        &self,
+        menu: windows::Win32::UI::WindowsAndMessaging::HMENU,
+        x: i32,
+        y: i32,
+    ) -> u32 {
+        let _popup_guard = MenuPopupActiveGuard::enter(&self.shared);
+        let cmd = unsafe {
+            let _ = SetForegroundWindow(self.hwnd);
+            TrackPopupMenuEx(
+                menu,
+                (TPM_LEFTALIGN | TPM_TOPALIGN | TPM_RETURNCMD).0,
+                x,
+                y,
+                self.hwnd,
+                None,
+            )
+        };
+        cmd.0 as u32
+    }
+
     fn show_free_icon_menu(&self, paths: Vec<String>, x: i32, y: i32) {
         if paths.is_empty() {
             return;
         }
-        let single = paths.len() == 1;
-        let bucket_targets: Vec<(i32, String)> = {
-            let guard = lock_unpoisoned(&self.shared);
-            let desktop_dirs = &guard.desktop_dirs;
-            guard
-                .config
-                .fences
-                .iter()
-                .filter(|f| f.is_desktop_bucket(desktop_dirs))
-                .map(|f| (f.id, format_fence_title(f)))
-                .collect()
+        let bucket_targets = self.bucket_targets_excluding(None);
+        let mut top_custom = Vec::new();
+        if !bucket_targets.is_empty() {
+            top_custom.push(CustomMenuItem::Submenu {
+                label: "移动到格子".to_string(),
+                items: bucket_targets
+                    .iter()
+                    .enumerate()
+                    .map(|(idx, (_, title))| (FREE_ICON_CMD_MOVE_BASE + idx as u32, title.clone()))
+                    .collect(),
+            });
+        }
+        let fallback = Self::build_item_fallback_menu(&paths, &bucket_targets, None);
+        let free_hwnd = lock_unpoisoned(&self.shared).free_desktop_hwnd;
+        let invoke_hwnd = if free_hwnd != 0 {
+            HWND(free_hwnd as *mut _)
+        } else {
+            self.hwnd
         };
 
-        let Ok(menu) = (unsafe { CreatePopupMenu() }) else {
-            return;
-        };
-        unsafe {
-            let _ = AppendMenuW(menu, MF_STRING, FREE_ICON_CMD_OPEN as usize, w!("打开\tEnter"));
-            if single {
-                let _ = AppendMenuW(
-                    menu,
-                    MF_STRING,
-                    FREE_ICON_CMD_OPEN_ADMIN as usize,
-                    w!("以管理员身份运行"),
-                );
-                let _ = AppendMenuW(
-                    menu,
-                    MF_STRING,
-                    FREE_ICON_CMD_REVEAL as usize,
-                    w!("在资源管理器中显示"),
-                );
-            }
-            if !bucket_targets.is_empty()
-                && let Ok(sub) = CreatePopupMenu()
-            {
-                for (idx, (_, title)) in bucket_targets.iter().enumerate() {
-                    let wtitle = HSTRING::from(title.as_str());
-                    let _ = AppendMenuW(
-                        sub,
-                        MF_STRING,
-                        (FREE_ICON_CMD_MOVE_BASE as usize) + idx,
-                        &wtitle,
-                    );
-                }
-                let _ = AppendMenuW(menu, MF_SEPARATOR, 0, None);
-                let _ = AppendMenuW(menu, MF_POPUP, sub.0 as usize, w!("移动到格子"));
-            }
-            let _ = AppendMenuW(menu, MF_SEPARATOR, 0, None);
-            let _ = AppendMenuW(menu, MF_STRING, FREE_ICON_CMD_COPY as usize, w!("复制\tCtrl+C"));
-            let _ = AppendMenuW(menu, MF_STRING, FREE_ICON_CMD_CUT as usize, w!("剪切\tCtrl+X"));
-            let _ = AppendMenuW(
-                menu,
-                MF_STRING,
-                FREE_ICON_CMD_COPY_PATHS as usize,
-                w!("复制路径\tCtrl+Shift+C"),
-            );
-            if single {
-                let _ = AppendMenuW(
-                    menu,
-                    MF_STRING,
-                    FREE_ICON_CMD_RENAME as usize,
-                    w!("重命名\tF2"),
-                );
-            }
-            let _ = AppendMenuW(
-                menu,
-                MF_STRING,
-                FREE_ICON_CMD_TRASH as usize,
-                w!("删除到回收站\tDel"),
-            );
-            if single {
-                let _ = AppendMenuW(menu, MF_SEPARATOR, 0, None);
-                let _ = AppendMenuW(
-                    menu,
-                    MF_STRING,
-                    FREE_ICON_CMD_PROPERTIES as usize,
-                    w!("属性\tAlt+Enter"),
-                );
-            }
-        }
-
-        let cmd = {
-            let _popup_guard = MenuPopupActiveGuard::enter(&self.shared);
-            unsafe {
-                let _ = SetForegroundWindow(self.hwnd);
-                TrackPopupMenuEx(
-                    menu,
-                    (TPM_LEFTALIGN | TPM_TOPALIGN | TPM_RETURNCMD).0,
-                    x,
-                    y,
-                    self.hwnd,
-                    None,
-                )
-            }
-        };
-        unsafe {
-            let _ = DestroyMenu(menu);
-        }
-
-        let raw_cmd = cmd.0 as u32;
-        let action = match raw_cmd {
-            FREE_ICON_CMD_OPEN => Some(FreeIconMenuCommand::Open),
-            FREE_ICON_CMD_OPEN_ADMIN => Some(FreeIconMenuCommand::OpenAsAdmin),
-            FREE_ICON_CMD_REVEAL => Some(FreeIconMenuCommand::RevealInExplorer),
-            FREE_ICON_CMD_COPY => Some(FreeIconMenuCommand::Copy { cut: false }),
-            FREE_ICON_CMD_CUT => Some(FreeIconMenuCommand::Copy { cut: true }),
-            FREE_ICON_CMD_COPY_PATHS => Some(FreeIconMenuCommand::CopyPaths),
-            FREE_ICON_CMD_RENAME => Some(FreeIconMenuCommand::Rename),
-            FREE_ICON_CMD_TRASH => Some(FreeIconMenuCommand::Trash),
-            FREE_ICON_CMD_PROPERTIES => Some(FreeIconMenuCommand::Properties),
-            n if n >= FREE_ICON_CMD_MOVE_BASE => {
-                let idx = (n - FREE_ICON_CMD_MOVE_BASE) as usize;
-                bucket_targets
-                    .get(idx)
-                    .map(|(fid, _)| FreeIconMenuCommand::MoveToFence(*fid))
-            }
-            _ => None,
-        };
-        if let Some(action) = action {
-            let _ = self.tx.send(BgEvent::FreeIconMenuCmd(paths, action));
-            self.egui_ctx.request_repaint_of(ViewportId::ROOT);
-        }
-        let keep_external_focus = matches!(
-            raw_cmd,
-            FREE_ICON_CMD_OPEN
-                | FREE_ICON_CMD_OPEN_ADMIN
-                | FREE_ICON_CMD_REVEAL
-                | FREE_ICON_CMD_RENAME
-                | FREE_ICON_CMD_PROPERTIES
+        let outcome = show_hybrid_shell_items_menu(
+            invoke_hwnd,
+            &paths,
+            x,
+            y,
+            &top_custom,
+            &fallback,
+            |menu| self.track_popup_menu(menu, x, y),
         );
-        if !keep_external_focus {
-            let free_hwnd = lock_unpoisoned(&self.shared).free_desktop_hwnd;
-            focus_window_now(free_hwnd);
+
+        match outcome {
+            HybridMenuOutcome::Cancelled => {
+                focus_window_now(free_hwnd);
+            }
+            HybridMenuOutcome::Custom(raw_cmd) => {
+                let action = match raw_cmd {
+                    FREE_ICON_CMD_OPEN => Some(FreeIconMenuCommand::Open),
+                    FREE_ICON_CMD_OPEN_ADMIN => Some(FreeIconMenuCommand::OpenAsAdmin),
+                    FREE_ICON_CMD_REVEAL => Some(FreeIconMenuCommand::RevealInExplorer),
+                    FREE_ICON_CMD_COPY => Some(FreeIconMenuCommand::Copy { cut: false }),
+                    FREE_ICON_CMD_CUT => Some(FreeIconMenuCommand::Copy { cut: true }),
+                    FREE_ICON_CMD_COPY_PATHS => Some(FreeIconMenuCommand::CopyPaths),
+                    FREE_ICON_CMD_RENAME => Some(FreeIconMenuCommand::Rename),
+                    FREE_ICON_CMD_TRASH => Some(FreeIconMenuCommand::Trash),
+                    FREE_ICON_CMD_PROPERTIES => Some(FreeIconMenuCommand::Properties),
+                    n if n >= FREE_ICON_CMD_MOVE_BASE => {
+                        let idx = (n - FREE_ICON_CMD_MOVE_BASE) as usize;
+                        bucket_targets
+                            .get(idx)
+                            .map(|(fid, _)| FreeIconMenuCommand::MoveToFence(*fid))
+                    }
+                    _ => None,
+                };
+                if let Some(action) = action {
+                    let _ = self.tx.send(BgEvent::FreeIconMenuCmd(paths, action));
+                    self.egui_ctx.request_repaint_of(ViewportId::ROOT);
+                }
+                let keep_external_focus = matches!(
+                    raw_cmd,
+                    FREE_ICON_CMD_OPEN
+                        | FREE_ICON_CMD_OPEN_ADMIN
+                        | FREE_ICON_CMD_REVEAL
+                        | FREE_ICON_CMD_RENAME
+                        | FREE_ICON_CMD_PROPERTIES
+                );
+                if !keep_external_focus {
+                    focus_window_now(free_hwnd);
+                }
+            }
+            HybridMenuOutcome::InterceptedRename => {
+                let _ = self
+                    .tx
+                    .send(BgEvent::FreeIconMenuCmd(paths, FreeIconMenuCommand::Rename));
+                self.egui_ctx.request_repaint_of(ViewportId::ROOT);
+            }
+            HybridMenuOutcome::InterceptedCopy { cut } => {
+                let _ = self
+                    .tx
+                    .send(BgEvent::FreeIconMenuCmd(paths, FreeIconMenuCommand::Copy { cut }));
+                self.egui_ctx.request_repaint_of(ViewportId::ROOT);
+                focus_window_now(free_hwnd);
+            }
+            HybridMenuOutcome::ShellInvoked { verb } => {
+                if verb.as_deref() != Some("open") {
+                    let deleted_paths = if verb.as_deref() == Some("delete") {
+                        paths
+                    } else {
+                        Vec::new()
+                    };
+                    let _ = self.tx.send(BgEvent::ShellPostRefresh {
+                        fence_id: None,
+                        deleted_paths,
+                    });
+                    self.egui_ctx.request_repaint_of(ViewportId::ROOT);
+                }
+            }
+            HybridMenuOutcome::ShellFailed { error } => {
+                let mut guard = lock_unpoisoned(&self.shared);
+                guard.free_toast = Some((format!("系统菜单执行失败: {error}"), Instant::now()));
+                guard.mark_free_desktop_dirty(Some(&self.egui_ctx));
+            }
+        }
+    }
+
+    fn show_fence_item_menu(
+        &self,
+        fence_id: i32,
+        paths: Vec<String>,
+        is_bucket: bool,
+        x: i32,
+        y: i32,
+    ) {
+        if paths.is_empty() {
+            return;
+        }
+        let bucket_targets = if is_bucket {
+            self.bucket_targets_excluding(Some(fence_id))
+        } else {
+            Vec::new()
+        };
+        let remove_label = if !is_bucket {
+            None
+        } else if paths.len() > 1 {
+            Some(format!("移出格子 ({} 项)", paths.len()))
+        } else if is_directly_on_desktop(Path::new(&paths[0])) {
+            Some("移出格子（放回桌面）".to_string())
+        } else {
+            Some("从格子移除".to_string())
+        };
+
+        let mut top_custom = Vec::new();
+        if !bucket_targets.is_empty() {
+            top_custom.push(CustomMenuItem::Submenu {
+                label: "移动到其他格子".to_string(),
+                items: bucket_targets
+                    .iter()
+                    .enumerate()
+                    .map(|(idx, (_, title))| (FREE_ICON_CMD_MOVE_BASE + idx as u32, title.clone()))
+                    .collect(),
+            });
+        }
+        if let Some(rm) = &remove_label {
+            top_custom.push(CustomMenuItem::Action {
+                id: ITEM_CMD_REMOVE_FROM_FENCE,
+                label: rm.clone(),
+            });
+        }
+        let fallback =
+            Self::build_item_fallback_menu(&paths, &bucket_targets, remove_label.as_deref());
+
+        let fence_hwnd = {
+            let guard = lock_unpoisoned(&self.shared);
+            guard
+                .attached_hwnds
+                .get(&fence_id)
+                .copied()
+                .unwrap_or(guard.free_desktop_hwnd)
+        };
+        let invoke_hwnd = if fence_hwnd != 0 {
+            HWND(fence_hwnd as *mut _)
+        } else {
+            self.hwnd
+        };
+
+        let outcome = show_hybrid_shell_items_menu(
+            invoke_hwnd,
+            &paths,
+            x,
+            y,
+            &top_custom,
+            &fallback,
+            |menu| self.track_popup_menu(menu, x, y),
+        );
+
+        match outcome {
+            HybridMenuOutcome::Cancelled => {
+                focus_window_now(fence_hwnd);
+            }
+            HybridMenuOutcome::Custom(raw_cmd) => {
+                let action = match raw_cmd {
+                    FREE_ICON_CMD_OPEN => Some(FenceItemMenuCommand::Open),
+                    FREE_ICON_CMD_OPEN_ADMIN => Some(FenceItemMenuCommand::OpenAsAdmin),
+                    FREE_ICON_CMD_REVEAL => Some(FenceItemMenuCommand::RevealInExplorer),
+                    FREE_ICON_CMD_COPY => Some(FenceItemMenuCommand::Copy { cut: false }),
+                    FREE_ICON_CMD_CUT => Some(FenceItemMenuCommand::Copy { cut: true }),
+                    FREE_ICON_CMD_COPY_PATHS => Some(FenceItemMenuCommand::CopyPaths),
+                    FREE_ICON_CMD_RENAME => Some(FenceItemMenuCommand::Rename),
+                    ITEM_CMD_REMOVE_FROM_FENCE => Some(FenceItemMenuCommand::RemoveFromFence),
+                    FREE_ICON_CMD_TRASH => Some(FenceItemMenuCommand::Trash),
+                    FREE_ICON_CMD_PROPERTIES => Some(FenceItemMenuCommand::Properties),
+                    n if n >= FREE_ICON_CMD_MOVE_BASE => {
+                        let idx = (n - FREE_ICON_CMD_MOVE_BASE) as usize;
+                        bucket_targets
+                            .get(idx)
+                            .map(|(fid, _)| FenceItemMenuCommand::MoveToFence(*fid))
+                    }
+                    _ => None,
+                };
+                if let Some(action) = action {
+                    let _ = self
+                        .tx
+                        .send(BgEvent::FenceItemMenuCmd(fence_id, paths, action));
+                    self.egui_ctx.request_repaint_of(ViewportId::ROOT);
+                }
+                let keep_external_focus = matches!(
+                    raw_cmd,
+                    FREE_ICON_CMD_OPEN
+                        | FREE_ICON_CMD_OPEN_ADMIN
+                        | FREE_ICON_CMD_REVEAL
+                        | FREE_ICON_CMD_PROPERTIES
+                );
+                if !keep_external_focus {
+                    focus_window_now(fence_hwnd);
+                }
+            }
+            HybridMenuOutcome::InterceptedRename => {
+                let _ = self.tx.send(BgEvent::FenceItemMenuCmd(
+                    fence_id,
+                    paths,
+                    FenceItemMenuCommand::Rename,
+                ));
+                self.egui_ctx.request_repaint_of(ViewportId::ROOT);
+                focus_window_now(fence_hwnd);
+            }
+            HybridMenuOutcome::InterceptedCopy { cut } => {
+                let _ = self.tx.send(BgEvent::FenceItemMenuCmd(
+                    fence_id,
+                    paths,
+                    FenceItemMenuCommand::Copy { cut },
+                ));
+                self.egui_ctx.request_repaint_of(ViewportId::ROOT);
+                focus_window_now(fence_hwnd);
+            }
+            HybridMenuOutcome::ShellInvoked { verb } => {
+                if verb.as_deref() != Some("open") {
+                    let deleted_paths = if verb.as_deref() == Some("delete") {
+                        paths
+                    } else {
+                        Vec::new()
+                    };
+                    let _ = self.tx.send(BgEvent::ShellPostRefresh {
+                        fence_id: Some(fence_id),
+                        deleted_paths,
+                    });
+                    self.egui_ctx.request_repaint_of(ViewportId::ROOT);
+                }
+            }
+            HybridMenuOutcome::ShellFailed { error } => {
+                let mut guard = lock_unpoisoned(&self.shared);
+                guard
+                    .toast_msg
+                    .insert(fence_id, (format!("系统菜单执行失败: {error}"), Instant::now()));
+                guard.request_repaint_fence(&self.egui_ctx, fence_id);
+            }
         }
     }
 }
@@ -1332,6 +1603,10 @@ unsafe extern "system" fn helper_wnd_proc(
         return unsafe { DefWindowProcW(hwnd, msg, wparam, lparam) };
     }
     let st = unsafe { &mut *ptr };
+
+    if let Some(res) = handle_active_shell_menu_msg(hwnd, msg, wparam, lparam) {
+        return res;
+    }
 
     match msg {
         WM_APP_SYNC_WATCHERS => {
@@ -1430,6 +1705,16 @@ unsafe extern "system" fn helper_wnd_proc(
             let y = ((lparam.0 >> 16) & 0xFFFF) as i16 as i32;
             let paths = std::mem::take(&mut *lock_unpoisoned(&st.free_icon_menu_paths));
             st.show_free_icon_menu(paths, x, y);
+            LRESULT(0)
+        }
+        WM_APP_SHOW_FENCE_ITEM_MENU => {
+            let x = (lparam.0 & 0xFFFF) as i16 as i32;
+            let y = ((lparam.0 >> 16) & 0xFFFF) as i16 as i32;
+            if let Some((fid, paths, is_bucket)) =
+                lock_unpoisoned(&st.fence_item_menu_req).take()
+            {
+                st.show_fence_item_menu(fid, paths, is_bucket, x, y);
+            }
             LRESULT(0)
         }
         WM_APP_TRAY => {
@@ -1549,6 +1834,7 @@ fn spawn_win32_helper(
     shared: Arc<Mutex<SharedFenceState>>,
     free_desktop_ctrl: Arc<Mutex<Option<FreeDesktopController>>>,
     free_icon_menu_paths: Arc<Mutex<Vec<String>>>,
+    fence_item_menu_req: Arc<Mutex<FenceItemMenuReq>>,
     tx: Sender<BgEvent>,
     egui_ctx: egui::Context,
 ) -> isize {
@@ -1596,6 +1882,7 @@ fn spawn_win32_helper(
             shared,
             free_desktop_ctrl,
             free_icon_menu_paths,
+            fence_item_menu_req,
             tx,
             egui_ctx,
             tray: TrayIcon::new(hwnd, 1, "DeskLite 桌面整理").ok(),
@@ -1642,6 +1929,7 @@ struct DeskLiteEguiApp {
     free_desktop_ctrl: FreeDesktopController,
     free_desktop_rx: Receiver<FreeDesktopEvent>,
     free_icon_menu_paths: Arc<Mutex<Vec<String>>>,
+    fence_item_menu_req: Arc<Mutex<FenceItemMenuReq>>,
     rx: Receiver<BgEvent>,
     tx: Sender<BgEvent>,
     helper_hwnd: isize,
@@ -1986,6 +2274,62 @@ impl DeskLiteEguiApp {
                     }
                     needs_free_snapshot = true;
                 }
+                BgEvent::FenceItemMenuCmd(fid, paths, action) => {
+                    if apply_fence_item_menu_command(fid, &paths, action, &self.shared, ctx) {
+                        needs_save = true;
+                    }
+                    needs_free_snapshot = true;
+                }
+                BgEvent::ShellPostRefresh {
+                    fence_id,
+                    deleted_paths,
+                } => {
+                    if !deleted_paths.is_empty() {
+                        let mut guard = lock_unpoisoned(&self.shared);
+                        let desktop_dirs = guard.desktop_dirs.clone();
+                        let mut any_removed = false;
+                        for p in &deleted_paths {
+                            if !Path::new(p).exists() {
+                                guard.invalidate_icon_texture(p);
+                                if guard.config.remove_desktop_path_everywhere(p, &desktop_dirs) {
+                                    any_removed = true;
+                                }
+                                guard.free_selected_paths.remove(&normalize_path_key(p));
+                            }
+                        }
+                        if any_removed {
+                            guard.refresh_all_unfiled_from_disk_if_present();
+                            guard.dirty_layout = true;
+                            needs_save = true;
+                        }
+                    }
+                    if let Some(fid) = fence_id {
+                        let ext_dir = {
+                            let guard = lock_unpoisoned(&self.shared);
+                            guard
+                                .config
+                                .fences
+                                .iter()
+                                .find(|f| f.id == fid)
+                                .and_then(|f| f.external_portal_dir(&guard.desktop_dirs))
+                        };
+                        if let Some(dir) = ext_dir {
+                            let items = scan_portal_directory(Path::new(&dir));
+                            let mut guard = lock_unpoisoned(&self.shared);
+                            if let Some(f) = guard.config.fence_mut(fid) {
+                                f.items = items;
+                            }
+                            guard.request_repaint_fence(ctx, fid);
+                        } else {
+                            let guard = lock_unpoisoned(&self.shared);
+                            guard.request_repaint_fence(ctx, fid);
+                        }
+                    }
+                    if self.refresh_desktop_views() {
+                        needs_save = true;
+                    }
+                    needs_free_snapshot = true;
+                }
                 BgEvent::ExternalForeground => {
                     let cleared = {
                         let mut guard = lock_unpoisoned(&self.shared);
@@ -2136,6 +2480,23 @@ impl DeskLiteEguiApp {
                         | ((screen_x as i16 as u16) as usize);
                     self.post_helper(
                         WM_APP_SHOW_FREE_ICON_MENU,
+                        WPARAM(0),
+                        LPARAM(packed as isize),
+                    );
+                }
+                FenceCommand::ShowFenceItemMenu {
+                    fence_id,
+                    paths,
+                    is_bucket,
+                    screen_x,
+                    screen_y,
+                } => {
+                    *lock_unpoisoned(&self.fence_item_menu_req) =
+                        Some((fence_id, paths, is_bucket));
+                    let packed = (((screen_y as i16 as u16) as usize) << 16)
+                        | ((screen_x as i16 as u16) as usize);
+                    self.post_helper(
+                        WM_APP_SHOW_FENCE_ITEM_MENU,
                         WPARAM(0),
                         LPARAM(packed as isize),
                     );
@@ -2409,6 +2770,7 @@ fn main() {
 
     let free_desktop_ctrl_slot = Arc::new(Mutex::new(None));
     let free_icon_menu_paths = Arc::new(Mutex::new(Vec::new()));
+    let fence_item_menu_req = Arc::new(Mutex::new(None));
     let (tx, rx) = mpsc::channel();
 
     let mut native_options = eframe::NativeOptions {
@@ -2435,6 +2797,7 @@ fn main() {
                 Arc::clone(&shared),
                 Arc::clone(&free_desktop_ctrl_slot),
                 Arc::clone(&free_icon_menu_paths),
+                Arc::clone(&fence_item_menu_req),
                 tx.clone(),
                 cc.egui_ctx.clone(),
             );
@@ -2485,6 +2848,7 @@ fn main() {
                 free_desktop_ctrl,
                 free_desktop_rx,
                 free_icon_menu_paths,
+                fence_item_menu_req,
                 rx,
                 tx,
                 helper_hwnd,

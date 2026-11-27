@@ -8,6 +8,7 @@ pub mod fence_poc;
 pub mod folder_watch;
 pub mod free_desktop_wnd;
 pub mod icons;
+pub mod shell_menu;
 pub mod shell_ops;
 pub mod tray;
 pub mod window_attach;
@@ -66,6 +67,14 @@ pub use free_desktop_wnd::{
     FreeDesktopRenderItem, FreeDesktopSnapshot,
 };
 pub use icons::{DecodedIcon, IconCache, extract_file_icon_pbgra};
+pub use shell_menu::{
+    ActiveShellMenuGuard, CUSTOM_MENU_CMD_BASE, CustomMenuItem, HybridMenuOutcome,
+    SHELL_MENU_CMD_FIRST, SHELL_MENU_CMD_LAST, ShellVerbInterception, append_custom_items,
+    append_menu_separator, attach_desktop_background_submenu, classify_shell_verb,
+    handle_active_shell_menu_msg, invoke_shell_context_command, is_shell_menu_cmd_id,
+    paths_share_same_shell_parent,
+    show_hybrid_shell_items_menu,
+};
 pub use shell_ops::{
     all_desktop_dirs, delete_files_permanently, is_desktop_dir_path, is_directly_on_desktop,
     is_vault_path, launch_as_admin, launch_item, migrate_vault_item_to_desktop, move_path_in_place,
