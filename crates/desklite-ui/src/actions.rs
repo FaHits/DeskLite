@@ -21,9 +21,9 @@ use egui::{Key, Vec2, ViewportCommand};
 use crate::inspector::open_param_editor_for_fence;
 use crate::item_grid::ItemUiAction;
 use crate::state::{
-    AsyncDragSession, COLLAPSED_HEIGHT, CollapsedMenuCommand, DragSourceState, FenceCommand,
-    FenceUiOutput, ItemRenamePrompt, RenamePrompt, ReorderDragState, SelectionScope,
-    SharedFenceState, UndoAction, duplicate_fence_with_style, lock_unpoisoned,
+    AsyncDragSession, COLLAPSED_HEIGHT, CollapseAnimState, CollapsedMenuCommand, DragSourceState,
+    FenceCommand, FenceUiOutput, ItemRenamePrompt, RenamePrompt, ReorderDragState,
+    SelectionScope, SharedFenceState, UndoAction, duplicate_fence_with_style, lock_unpoisoned,
 };
 use crate::undo::execute_undo;
 
@@ -1064,6 +1064,11 @@ pub fn commit_item_rename(
     }
 }
 
+pub fn ease_out_cubic(t: f32) -> f32 {
+    let u = 1.0 - t.clamp(0.0, 1.0);
+    1.0 - u * u * u
+}
+
 pub fn toggle_collapse(
     fence_id: i32,
     spec: &FenceSpec,
@@ -1073,18 +1078,52 @@ pub fn toggle_collapse(
 ) {
     let new_collapsed = !spec.collapsed;
     let ppp = ctx.pixels_per_point().max(0.5);
-    let target_h = if new_collapsed {
-        COLLAPSED_HEIGHT
+    let collapsed_phys_h = (COLLAPSED_HEIGHT * ppp).round() as i32;
+    let expanded_phys_h = spec.rect.height().max(MIN_FENCE_HEIGHT);
+    let to_phys_h = if new_collapsed {
+        collapsed_phys_h
     } else {
-        (spec.rect.height().max(MIN_FENCE_HEIGHT) as f32) / ppp
+        expanded_phys_h
     };
     let target_w = (spec.rect.width().max(MIN_FENCE_WIDTH) as f32) / ppp;
-    ctx.send_viewport_cmd(ViewportCommand::InnerSize(Vec2::new(target_w, target_h)));
-    ctx.request_repaint();
+    let target_h = (to_phys_h as f32) / ppp;
+
     let mut guard = lock_unpoisoned(shared);
+    let my_hwnd = guard.attached_hwnds.get(&fence_id).copied().unwrap_or(0);
+    let from_phys_h = if let Some(prev_anim) = guard.collapse_anims.get(&fence_id) {
+        let raw_t = prev_anim.started_at.elapsed().as_secs_f32()
+            / (prev_anim.duration_ms.max(1) as f32 / 1000.0);
+        let eased = ease_out_cubic(raw_t);
+        (prev_anim.from_phys_h as f32 + (prev_anim.to_phys_h - prev_anim.from_phys_h) as f32 * eased)
+            .round() as i32
+    } else if my_hwnd != 0
+        && let Some((_, t, _, b)) = desklite_win32::window_outer_rect(my_hwnd)
+    {
+        (b - t).max(collapsed_phys_h)
+    } else if spec.collapsed {
+        collapsed_phys_h
+    } else {
+        expanded_phys_h
+    };
+
+    if my_hwnd != 0 {
+        guard.collapse_anims.insert(
+            fence_id,
+            CollapseAnimState {
+                started_at: Instant::now(),
+                duration_ms: 155,
+                from_phys_h,
+                to_phys_h,
+                target_collapsed: new_collapsed,
+            },
+        );
+    } else {
+        ctx.send_viewport_cmd(ViewportCommand::InnerSize(Vec2::new(target_w, target_h)));
+    }
+    ctx.request_repaint();
     guard
         .pending_collapse_until
-        .insert(fence_id, Instant::now() + Duration::from_millis(600));
+        .insert(fence_id, Instant::now() + Duration::from_millis(650));
     if let Some(f) = guard.config.fence_mut(fence_id) {
         f.collapsed = new_collapsed;
         guard.dirty_layout = true;

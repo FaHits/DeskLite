@@ -266,6 +266,15 @@ pub struct TitleDragState {
     pub height: i32,
 }
 
+#[derive(Debug, Clone, Copy)]
+pub struct CollapseAnimState {
+    pub started_at: Instant,
+    pub duration_ms: u64,
+    pub from_phys_h: i32,
+    pub to_phys_h: i32,
+    pub target_collapsed: bool,
+}
+
 pub struct SharedFenceState {
     pub config: NativeLayoutConfig,
     pub topology: DisplayTopology,
@@ -302,6 +311,7 @@ pub struct SharedFenceState {
     pub title_drag: Option<TitleDragState>,
     pub pending_toggle_collapse: HashSet<i32>,
     pub pending_collapse_until: HashMap<i32, Instant>,
+    pub collapse_anims: HashMap<i32, CollapseAnimState>,
     pub topology_settling_until: Option<Instant>,
     pub undo_stack: Vec<UndoAction>,
     pub cut_paths: HashSet<String>,
@@ -370,6 +380,7 @@ impl SharedFenceState {
             title_drag: None,
             pending_toggle_collapse: HashSet::new(),
             pending_collapse_until: HashMap::new(),
+            collapse_anims: HashMap::new(),
             topology_settling_until: None,
             undo_stack: Vec::new(),
             cut_paths: HashSet::new(),
@@ -821,6 +832,7 @@ impl SharedFenceState {
         self.popup_owners.retain(|id, _| active_ids.contains(id));
         self.pending_toggle_collapse.retain(|id| active_ids.contains(id));
         self.pending_collapse_until.retain(|id, _| active_ids.contains(id));
+        self.collapse_anims.retain(|id, _| active_ids.contains(id));
         if self
             .item_rename_prompt
             .as_ref()

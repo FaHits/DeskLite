@@ -20,8 +20,8 @@ use egui::{
 };
 
 use crate::actions::{
-    dispatch_win32_hotkey, execute_item_action, handle_keyboard_shortcuts, open_fence_menu,
-    start_async_drag_from_paths, toggle_collapse,
+    dispatch_win32_hotkey, ease_out_cubic, execute_item_action, handle_keyboard_shortcuts,
+    open_fence_menu, start_async_drag_from_paths, toggle_collapse,
 };
 use crate::item_grid::{
     ItemUiAction, apply_reorder_items, compute_reorder_target, draw_header_icon_btn,
@@ -686,8 +686,57 @@ pub fn render_fence_viewport(
             .get(&fence_id)
             .copied()
     };
+    let collapse_anim_opt = {
+        lock_unpoisoned(shared)
+            .collapse_anims
+            .get(&fence_id)
+            .copied()
+    };
+    let (is_collapse_animating, open_factor) = if let Some(anim) = collapse_anim_opt {
+        let raw_t = anim.started_at.elapsed().as_secs_f32()
+            / (anim.duration_ms.max(1) as f32 / 1000.0);
+        let eased = ease_out_cubic(raw_t);
+        let cur_anim_h = (anim.from_phys_h as f32
+            + (anim.to_phys_h - anim.from_phys_h) as f32 * eased)
+            .round() as i32;
+        let open_factor = if anim.target_collapsed {
+            (1.0 - eased).clamp(0.0, 1.0)
+        } else {
+            eased.clamp(0.0, 1.0)
+        };
+        let (pos_l, pos_t, cur_w) = live_phys_rect
+            .map(|r| (r.left, r.top, r.width().max(MIN_FENCE_WIDTH)))
+            .unwrap_or((
+                spec.rect.left,
+                spec.rect.top,
+                spec.rect.width().max(MIN_FENCE_WIDTH),
+            ));
+        if my_hwnd != 0 && reveal_step.is_none() {
+            let apply_h = if raw_t >= 1.0 {
+                anim.to_phys_h.max(1)
+            } else {
+                cur_anim_h.max(1)
+            };
+            desklite_win32::set_window_rect_no_z(my_hwnd, pos_l, pos_t, cur_w, apply_h);
+        }
+        if raw_t >= 1.0 {
+            lock_unpoisoned(shared).collapse_anims.remove(&fence_id);
+            ctx.send_viewport_cmd(ViewportCommand::InnerSize(Vec2::new(
+                cur_w as f32 / ppp,
+                anim.to_phys_h as f32 / ppp,
+            )));
+            (false, if spec.collapsed { 0.0 } else { 1.0 })
+        } else {
+            ctx.request_repaint();
+            (true, open_factor)
+        }
+    } else {
+        (false, if spec.collapsed { 0.0 } else { 1.0 })
+    };
+
     if let Some(cur_phys) = live_phys_rect
         && reveal_step.is_none()
+        && !is_collapse_animating
         && !topology_settling
         && !any_pointer_down
         && !desklite_win32::is_in_size_move()
@@ -811,7 +860,7 @@ pub fn render_fence_viewport(
             || !guard.marquee_drag.is_empty()
             || guard.title_drag.is_some()
     };
-    let resize_dir = if spec.locked || drag_suppresses_resize {
+    let resize_dir = if spec.locked || drag_suppresses_resize || is_collapse_animating {
         None
     } else {
         ctx.input(|i| i.pointer.hover_pos())
@@ -855,7 +904,8 @@ pub fn render_fence_viewport(
         )
         .round()
         .clamp(40.0, 245.0) as u8;
-    let title_alpha = (bg_alpha as f32 + 45.0).min(235.0) as u8;
+    let title_alpha = (bg_alpha as f32 + 40.0 - 6.0 * open_factor).min(235.0) as u8;
+    let bar_bottom_r = ((1.0 - open_factor) * 8.0).round() as u8;
     let panel_frame = Frame::new()
         .fill(Color32::from_rgba_unmultiplied(22, 24, 30, bg_alpha))
         .stroke(border_stroke)
@@ -868,8 +918,8 @@ pub fn render_fence_viewport(
             .corner_radius(CornerRadius {
                 nw: 8,
                 ne: 8,
-                sw: if spec.collapsed { 8 } else { 0 },
-                se: if spec.collapsed { 8 } else { 0 },
+                sw: bar_bottom_r,
+                se: bar_bottom_r,
             })
             .inner_margin(Margin {
                 left: 10,
@@ -945,25 +995,16 @@ pub fn render_fence_viewport(
                     |painter, r, fg| {
                         let c = r.center();
                         let stroke = Stroke::new(1.6, fg);
-                        if collapsed {
-                            painter.line_segment(
-                                [Pos2::new(c.x - 2.0, c.y - 4.0), Pos2::new(c.x + 2.5, c.y)],
-                                stroke,
-                            );
-                            painter.line_segment(
-                                [Pos2::new(c.x + 2.5, c.y), Pos2::new(c.x - 2.0, c.y + 4.0)],
-                                stroke,
-                            );
-                        } else {
-                            painter.line_segment(
-                                [Pos2::new(c.x - 4.0, c.y - 2.0), Pos2::new(c.x, c.y + 2.5)],
-                                stroke,
-                            );
-                            painter.line_segment(
-                                [Pos2::new(c.x, c.y + 2.5), Pos2::new(c.x + 4.0, c.y - 2.0)],
-                                stroke,
-                            );
-                        }
+                        let angle = open_factor * std::f32::consts::FRAC_PI_2;
+                        let (sin_a, cos_a) = angle.sin_cos();
+                        let rot = |dx: f32, dy: f32| {
+                            Pos2::new(c.x + dx * cos_a - dy * sin_a, c.y + dx * sin_a + dy * cos_a)
+                        };
+                        let p0 = rot(-2.0, -4.0);
+                        let p1 = rot(2.5, 0.0);
+                        let p2 = rot(-2.0, 4.0);
+                        painter.line_segment([p0, p1], stroke);
+                        painter.line_segment([p1, p2], stroke);
                     },
                 )
                 .clicked()
@@ -1198,7 +1239,7 @@ pub fn render_fence_viewport(
             });
         });
 
-        if spec.collapsed {
+        if spec.collapsed && open_factor <= 0.01 {
             if my_hwnd != 0 {
                 let _ = take_win32_hotkeys(my_hwnd);
             }
@@ -1206,14 +1247,18 @@ pub fn render_fence_viewport(
         }
 
         let top_div_y = ui.cursor().top();
+        let div_alpha = (16.0 * open_factor).round().clamp(0.0, 255.0) as u8;
         ui.painter().hline(
             ui.max_rect().x_range(),
             top_div_y,
-            Stroke::new(1.0, Color32::from_rgba_unmultiplied(255, 255, 255, 16)),
+            Stroke::new(1.0, Color32::from_rgba_unmultiplied(255, 255, 255, div_alpha)),
         );
 
         let body_frame = Frame::new().inner_margin(Margin::symmetric(8, 0));
         body_frame.show(ui, |ui| {
+            if open_factor < 0.999 {
+                ui.set_opacity(open_factor.powf(0.85).clamp(0.0, 1.0));
+            }
             if hovering_files {
                 ui.add_space(8.0);
                 if is_external_portal {
@@ -1732,7 +1777,7 @@ pub fn render_fence_viewport(
                 .get(&fence_id)
                 .cloned()
                 .unwrap_or_default();
-            if can_handle_hotkeys && item_action.is_none() && has_input_focus {
+            if !spec.collapsed && can_handle_hotkeys && item_action.is_none() && has_input_focus {
                 handle_keyboard_shortcuts(
                     fence_id,
                     &spec,
@@ -2124,6 +2169,39 @@ mod tests {
         let g = lock_unpoisoned(&shared);
         assert!(!g.config.fences[0].collapsed);
         assert_eq!(g.config.fences[0].rect.height(), 360);
+    }
+
+    #[test]
+    fn drawer_collapse_anim_eases_and_preserves_targets() {
+        assert!((ease_out_cubic(0.0) - 0.0).abs() < 1e-6);
+        assert!((ease_out_cubic(0.5) - 0.875).abs() < 1e-6);
+        assert!((ease_out_cubic(1.0) - 1.0).abs() < 1e-6);
+
+        let fence = FenceSpec {
+            id: 110,
+            name: "Anim".to_string(),
+            kind: FenceKind::IconGrid,
+            rect: Rect::new(100, 100, 420, 460),
+            collapsed: true,
+            locked: false,
+            role: Some(FenceRole::DesktopBucket),
+            portal_dir: None,
+            backdrop_alpha: 115,
+            layout_override: None,
+            items: Vec::new(),
+        };
+        let shared = test_shared(vec![fence.clone()]);
+        lock_unpoisoned(&shared).attached_hwnds.insert(110, 0x1234_isize);
+        let ctx = egui::Context::default();
+        let mut out = FenceUiOutput::default();
+        toggle_collapse(110, &fence, &shared, &ctx, &mut out);
+
+        let guard = lock_unpoisoned(&shared);
+        let anim = guard.collapse_anims.get(&110).expect("animation queued");
+        assert!(!anim.target_collapsed);
+        assert_eq!(anim.from_phys_h, COLLAPSED_HEIGHT.round() as i32);
+        assert_eq!(anim.to_phys_h, 360);
+        assert!(!guard.config.fences[0].collapsed);
     }
 
     #[test]
