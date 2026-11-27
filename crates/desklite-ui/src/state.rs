@@ -10,9 +10,9 @@ use desklite_core::{
     clamp_rect_to_monitors, normalize_path_key,
 };
 use desklite_win32::{
-    DragTargetOutcome, FreeDesktopRenderItem, FreeDesktopSnapshot, IconCache, all_desktop_dirs,
-    foreground_window_handle, inspector_hwnd, invalidate_window_no_erase, is_ctrl_key_down,
-    is_directly_on_desktop, is_file_drag_active, is_popup_menu_hwnd,
+    AutostartStatus, DragTargetOutcome, FreeDesktopRenderItem, FreeDesktopSnapshot, IconCache,
+    all_desktop_dirs, foreground_window_handle, inspector_hwnd, invalidate_window_no_erase,
+    is_ctrl_key_down, is_directly_on_desktop, is_file_drag_active, is_popup_menu_hwnd,
     paste_files_to_directory_detailed, post_window_message, resolve_dropped_item,
     scan_portal_directory, set_window_rect_no_z, trash_files, user_desktop_dir,
 };
@@ -330,6 +330,9 @@ pub struct SharedFenceState {
     pub free_rename_prompt: Option<FreeItemRenamePrompt>,
     pub inspector: Option<InspectorState>,
     pub inspector_spawned: bool,
+    pub autostart_status: Option<AutostartStatus>,
+    pub autostart_busy: bool,
+    pub autostart_feedback: Option<(String, bool, Instant)>,
     pub selected_items: HashMap<i32, HashSet<usize>>,
     pub selection_anchor: HashMap<i32, usize>,
     pub marquee_drag: HashMap<i32, MarqueeState>,
@@ -401,6 +404,9 @@ impl SharedFenceState {
             free_rename_prompt: None,
             inspector: None,
             inspector_spawned: false,
+            autostart_status: None,
+            autostart_busy: false,
+            autostart_feedback: None,
             selected_items: HashMap::new(),
             selection_anchor: HashMap::new(),
             marquee_drag: HashMap::new(),

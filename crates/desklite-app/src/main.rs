@@ -26,7 +26,8 @@ use desklite_ui::state::lock_unpoisoned;
 use desklite_ui::{
     COLLAPSED_HEIGHT, INSPECTOR_HEIGHT, INSPECTOR_TITLE, INSPECTOR_WIDTH, SharedFenceState,
     build_free_desktop_snapshot, configure_egui_theme, handle_free_desktop_event,
-    install_chinese_fonts, pending_free_rename, render_fence_viewport, render_inspector_viewport,
+    install_chinese_fonts, open_param_editor_for_default, pending_free_rename,
+    render_fence_viewport, render_inspector_viewport,
 };
 use desklite_win32::{
     ActiveShellMenuGuard, CUSTOM_MENU_CMD_BASE, CustomMenuItem, FolderWatcher,
@@ -34,12 +35,12 @@ use desklite_win32::{
     WM_APP_PORTAL_DIRTY, WM_APP_TRAY, all_desktop_dirs, append_lazy_desktop_background_submenu,
     clipboard_has_files, clear_prefetched_shell_menu, enable_dark_popup_menus,
     enable_per_monitor_dpi_v2, focus_window_now, force_foreground_for_popup,
-    foreground_window_handle, handle_active_shell_menu_msg, hide_all_fences_immediately,
-    install_desktop_z_win_event_hooks, install_ui_thread_cloak_hook, invoke_shell_context_command,
-    is_desktop_dir_path, is_directly_on_desktop, is_display_wake_power_broadcast,
-    is_shell_menu_cmd_id, is_vault_path, launch_item, migrate_vault_item_to_desktop,
-    pick_folder_dialog, post_reassert_all_fences_z, prefetch_shell_items_menu,
-    probe_display_topology, reassert_desktop_z_order_sync,
+    foreground_window_handle, handle_active_shell_menu_msg, handle_autostart_cli_args,
+    hide_all_fences_immediately, install_desktop_z_win_event_hooks, install_ui_thread_cloak_hook,
+    invoke_shell_context_command, is_desktop_dir_path, is_directly_on_desktop,
+    is_display_wake_power_broadcast, is_shell_menu_cmd_id, is_vault_path, launch_item,
+    migrate_vault_item_to_desktop, pick_folder_dialog, post_reassert_all_fences_z,
+    prefetch_shell_items_menu, probe_display_topology, reassert_desktop_z_order_sync,
     register_power_and_session_notifications, restore_all_desktop_icons, scan_portal_directory,
     set_external_foreground_notify_target, set_shell_desktop_icons_visible, set_window_cloaked,
     set_window_rect_no_z, set_z_reassert_notify_target, show_hybrid_shell_items_menu,
@@ -105,6 +106,7 @@ const WM_APP_FAST_FREE_MENU: u32 = WM_APP + 33;
 const WM_APP_PREFETCH_SHELL_MENU: u32 = WM_APP + 34;
 
 const TRAY_CMD_NEW_BLANK: u32 = 1001;
+const TRAY_CMD_OPEN_SETTINGS: u32 = 1002;
 const TRAY_CMD_NEW_PORTAL: u32 = 1003;
 const TRAY_CMD_TOGGLE_HIDE_ALL: u32 = 1004;
 const TRAY_CMD_ARRANGE_NAME: u32 = 1005;
@@ -148,6 +150,7 @@ const FREE_CMD_UNDO: u32 = CUSTOM_MENU_CMD_BASE + 0x10A;
 const FREE_CMD_OPEN_DESKTOP_DIR: u32 = CUSTOM_MENU_CMD_BASE + 0x10B;
 const FREE_CMD_OPEN_CONFIG_DIR: u32 = CUSTOM_MENU_CMD_BASE + 0x10C;
 const FREE_CMD_EXIT: u32 = CUSTOM_MENU_CMD_BASE + 0x10D;
+const FREE_CMD_OPEN_SETTINGS: u32 = CUSTOM_MENU_CMD_BASE + 0x10E;
 
 const FREE_ICON_CMD_OPEN: u32 = CUSTOM_MENU_CMD_BASE + 0x201;
 const FREE_ICON_CMD_OPEN_ADMIN: u32 = CUSTOM_MENU_CMD_BASE + 0x202;
@@ -518,6 +521,7 @@ enum BgEvent {
     TrayNewBlank,
     TrayNewPortal(String),
     TrayRealign,
+    TrayOpenSettings,
     ToggleHideAllFences,
     BindPortalResult(i32, String),
     FenceMenuCommand(i32, CollapsedMenuCommand),
@@ -722,6 +726,12 @@ impl HelperState {
             let _ = AppendMenuW(
                 menu,
                 MF_STRING,
+                TRAY_CMD_OPEN_SETTINGS as usize,
+                w!("参数与开机启动设置..."),
+            );
+            let _ = AppendMenuW(
+                menu,
+                MF_STRING,
                 TRAY_CMD_OPEN_CONFIG_DIR as usize,
                 w!("打开配置目录"),
             );
@@ -786,6 +796,10 @@ impl HelperState {
             }
             TRAY_CMD_REALIGN => {
                 let _ = self.tx.send(BgEvent::TrayRealign);
+                self.egui_ctx.request_repaint_of(ViewportId::ROOT);
+            }
+            TRAY_CMD_OPEN_SETTINGS => {
+                let _ = self.tx.send(BgEvent::TrayOpenSettings);
                 self.egui_ctx.request_repaint_of(ViewportId::ROOT);
             }
             TRAY_CMD_OPEN_CONFIG_DIR => {
@@ -1076,6 +1090,12 @@ impl HelperState {
             let _ = AppendMenuW(
                 menu,
                 MF_STRING,
+                FREE_CMD_OPEN_SETTINGS as usize,
+                w!("参数与开机启动设置..."),
+            );
+            let _ = AppendMenuW(
+                menu,
+                MF_STRING,
                 FREE_CMD_OPEN_CONFIG_DIR as usize,
                 w!("打开配置目录"),
             );
@@ -1201,6 +1221,10 @@ impl HelperState {
                 ));
                 self.egui_ctx.request_repaint_of(ViewportId::ROOT);
             }
+            FREE_CMD_OPEN_SETTINGS => {
+                let _ = self.tx.send(BgEvent::TrayOpenSettings);
+                self.egui_ctx.request_repaint_of(ViewportId::ROOT);
+            }
             FREE_CMD_OPEN_CONFIG_DIR => {
                 if let Some(dir) = self.layout_path.parent() {
                     open_dir_in_explorer(dir);
@@ -1219,6 +1243,7 @@ impl HelperState {
             0 | FREE_CMD_NEW_BLANK
                 | FREE_CMD_NEW_PORTAL
                 | FREE_CMD_OPEN_DESKTOP_DIR
+                | FREE_CMD_OPEN_SETTINGS
                 | FREE_CMD_OPEN_CONFIG_DIR
                 | FREE_CMD_EXIT
         );
@@ -1881,6 +1906,9 @@ unsafe extern "system" fn helper_wnd_proc(
         WM_TIMER if wparam.0 == SHELL_VERIFY_TIMER_1 || wparam.0 == SHELL_VERIFY_TIMER_2 => {
             let _ = unsafe { KillTimer(Some(hwnd), wparam.0) };
             if !st.shutting_down {
+                if st.tray.is_none() {
+                    st.tray = TrayIcon::new(hwnd, 1, "DeskLite 桌面整理").ok();
+                }
                 let _ = set_shell_desktop_icons_visible(false);
                 post_reassert_all_fences_z();
             }
@@ -2368,6 +2396,9 @@ impl DeskLiteEguiApp {
                         self.apply_topology_update(topo, true, ctx);
                         needs_save = true;
                     }
+                }
+                BgEvent::TrayOpenSettings => {
+                    open_param_editor_for_default(&self.shared, ctx);
                 }
                 BgEvent::ToggleHideAllFences => {
                     self.toggle_hide_all_fences(ctx);
@@ -2882,6 +2913,10 @@ impl eframe::App for DeskLiteEguiApp {
 }
 
 fn main() {
+    let cli_args: Vec<String> = std::env::args().collect();
+    if let Some(code) = handle_autostart_cli_args(&cli_args) {
+        std::process::exit(code);
+    }
     let Some(_guard) = acquire_single_instance() else {
         return;
     };

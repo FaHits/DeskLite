@@ -18,5 +18,6 @@ pub use fence_view::{
     handle_free_desktop_event, render_fence_viewport, render_inspector_viewport,
 };
 pub use free_desktop_view::{free_icon_screen_rect, handle_free_desktop_drop, pending_free_rename};
+pub use inspector::open_param_editor_for_default;
 pub use fonts::install_chinese_fonts;
 pub use snap::snap_move_rect;

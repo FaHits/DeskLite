@@ -2,8 +2,8 @@
 1 24 "desklite.manifest"
 
 1 VERSIONINFO
- FILEVERSION 0,1,0,0
- PRODUCTVERSION 0,1,0,0
+ FILEVERSION 0,1,1,0
+ PRODUCTVERSION 0,1,1,0
  FILEFLAGSMASK 0x3fL
  FILEFLAGS 0x0L
  FILEOS 0x40004L
@@ -16,12 +16,12 @@ BEGIN
         BEGIN
             VALUE "CompanyName", "FaHits"
             VALUE "FileDescription", "DeskLite Windows 11 Desktop Organizer"
-            VALUE "FileVersion", "0.1.0.0"
+            VALUE "FileVersion", "0.1.1.0"
             VALUE "InternalName", "desklite-app.exe"
             VALUE "LegalCopyright", "MIT License"
             VALUE "OriginalFilename", "desklite-app.exe"
             VALUE "ProductName", "DeskLite"
-            VALUE "ProductVersion", "0.1.0"
+            VALUE "ProductVersion", "0.1.1"
         END
     END
     BLOCK "VarFileInfo"

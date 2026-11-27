@@ -1,3 +1,4 @@
+pub mod autostart;
 pub mod desktop_listview;
 pub mod display;
 pub mod dpi;
@@ -39,6 +40,10 @@ pub(crate) fn win_err(op: &'static str, source: windows::core::Error) -> Win32Er
     Win32Error::Win { op, source }
 }
 
+pub use autostart::{
+    AutostartMode, AutostartSetOutcome, AutostartStatus, handle_autostart_cli_args,
+    query_autostart_status, set_autostart_mode,
+};
 pub use desktop_listview::{
     DesktopIconInfo, DesktopListView, find_desktop_listview, hide_desktop_icons_for_paths,
     hide_desktop_icons_for_paths_async, hide_desktop_icons_for_paths_delayed,
