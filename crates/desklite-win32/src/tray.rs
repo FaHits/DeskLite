@@ -1,8 +1,10 @@
 use windows::Win32::Foundation::HWND;
+use windows::Win32::System::LibraryLoader::GetModuleHandleW;
 use windows::Win32::UI::Shell::{
     NIF_ICON, NIF_MESSAGE, NIF_TIP, NIM_ADD, NIM_DELETE, NOTIFYICONDATAW, Shell_NotifyIconW,
 };
 use windows::Win32::UI::WindowsAndMessaging::{IDI_APPLICATION, LoadIconW, WM_APP};
+use windows::core::PCWSTR;
 
 use crate::{Win32Error, win_err};
 
@@ -15,8 +17,14 @@ pub struct TrayIcon {
 
 impl TrayIcon {
     pub fn new(hwnd: HWND, id: u32, tooltip: &str) -> Result<Self, Win32Error> {
-        let icon = unsafe { LoadIconW(None, IDI_APPLICATION) }
-            .map_err(|e| win_err("LoadIconW", e))?;
+        let embedded = unsafe { GetModuleHandleW(None) }.ok().and_then(|hmod| unsafe {
+            LoadIconW(Some(hmod.into()), PCWSTR(std::ptr::without_provenance(1))).ok()
+        });
+        let icon = match embedded {
+            Some(h) => h,
+            None => unsafe { LoadIconW(None, IDI_APPLICATION) }
+                .map_err(|e| win_err("LoadIconW", e))?,
+        };
         let mut nid = NOTIFYICONDATAW {
             cbSize: std::mem::size_of::<NOTIFYICONDATAW>() as u32,
             hWnd: hwnd,
