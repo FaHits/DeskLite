@@ -1,18 +1,18 @@
 use std::collections::HashSet;
 use std::path::Path;
 use std::sync::{Arc, Mutex};
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 use desklite_core::{
     DesktopIconPos, FenceItem, FenceRole, ItemKind, Point, Rect, clamp_point_to_monitors,
     normalize_path_key,
 };
 use desklite_win32::{
-    FreeDesktopEvent, FreeDesktopHotkey, FreeDesktopSnapshot, clipboard_has_files,
-    copy_text_to_clipboard, cursor_screen_pos, is_directly_on_desktop, launch_as_admin,
-    launch_item, paste_files_to_directory_detailed, read_clipboard_files, rename_file_in_place,
-    resolve_dropped_item, reveal_in_explorer, set_clipboard_files_for_window, show_file_properties,
-    trash_files, user_desktop_dir,
+    FreeDesktopEvent, FreeDesktopHotkey, FreeDesktopNavKey, FreeDesktopSnapshot,
+    clipboard_has_files, copy_text_to_clipboard, cursor_screen_pos, delete_files_permanently,
+    is_directly_on_desktop, launch_as_admin, launch_item, paste_files_to_directory_detailed,
+    read_clipboard_files, rename_file_in_place, resolve_dropped_item, reveal_in_explorer,
+    set_clipboard_files_for_window, show_file_properties, trash_files, user_desktop_dir,
 };
 use egui::ViewportId;
 
@@ -56,10 +56,7 @@ fn rects_intersect(a: Rect, b: Rect) -> bool {
 }
 
 fn free_icon_cell_size(state: &SharedFenceState) -> (i32, i32) {
-    (
-        state.config.preferences.icon_cell_w.clamp(48, 180),
-        state.config.preferences.icon_cell_h.clamp(56, 200),
-    )
+    state.free_desktop_cell_size()
 }
 
 pub fn free_icon_screen_rect(state: &SharedFenceState, path: &str) -> Option<Rect> {
@@ -215,7 +212,7 @@ fn handle_free_desktop_drop_core(
             });
         }
         guard.dirty_layout = true;
-        guard.pending_repaint_free_desktop = true;
+        guard.bump_free_icon_epoch();
     }
     let fids = affected_fences.into_iter().map(|(fid, _)| fid).collect();
     (true, fids)
@@ -326,6 +323,7 @@ fn paste_to_free_desktop(
         for (fid, _) in &affected {
             guard.request_repaint_fence(ctx, *fid);
         }
+        guard.bump_free_icon_epoch();
         guard.mark_free_desktop_dirty(Some(ctx));
     }
     out.needs_immediate_save = true;
@@ -373,7 +371,7 @@ fn commit_free_item_rename_core(
             });
             guard.free_rename_prompt = None;
             guard.dirty_layout = true;
-            guard.pending_repaint_free_desktop = true;
+            guard.bump_free_icon_epoch();
             true
         }
         Err(e) => {
@@ -425,11 +423,16 @@ pub fn handle_free_desktop_event(
                 if !guard.free_selected_paths.remove(&key) {
                     guard.free_selected_paths.insert(key.clone());
                 }
-                guard.free_selection_anchor = Some(key);
+                guard.free_selection_anchor = Some(key.clone());
+                guard.free_focus_path = Some(key);
             } else {
                 guard.free_selected_paths.clear();
                 guard.free_selected_paths.insert(key.clone());
-                guard.free_selection_anchor = Some(key);
+                guard.free_selection_anchor = Some(key.clone());
+                guard.free_focus_path = Some(key);
+            }
+            if shift {
+                guard.free_focus_path = Some(normalize_path_key(&path));
             }
             res.needs_snapshot_refresh = true;
         }
@@ -501,7 +504,8 @@ pub fn handle_free_desktop_event(
             if !guard.free_selected_paths.contains(&key) {
                 guard.free_selected_paths.clear();
                 guard.free_selected_paths.insert(key.clone());
-                guard.free_selection_anchor = Some(key);
+                guard.free_selection_anchor = Some(key.clone());
+                guard.free_focus_path = Some(key);
                 res.needs_snapshot_refresh = true;
             }
             let mut paths: Vec<String> = guard
@@ -581,6 +585,7 @@ pub fn handle_free_desktop_event(
             {
                 guard.free_selected_paths.clear();
                 guard.free_selection_anchor = None;
+                guard.free_focus_path = None;
                 res.needs_snapshot_refresh = true;
             }
         }
@@ -613,6 +618,168 @@ fn collect_ordered_free_selected_paths(guard: &SharedFenceState) -> Vec<String> 
         .collect()
 }
 
+fn navigate_free_desktop_icons(
+    guard: &mut SharedFenceState,
+    key: FreeDesktopNavKey,
+    shift: bool,
+) -> bool {
+    let icons = guard.config.active_free_icons().to_vec();
+    if icons.is_empty() {
+        return false;
+    }
+    let (_, ch) = guard.free_desktop_cell_size();
+    let row_band = (ch / 2).max(1);
+    let mut ordered_indices: Vec<usize> = (0..icons.len()).collect();
+    ordered_indices.sort_by_key(|&idx| {
+        let pos = icons[idx].pos;
+        (pos.y.div_euclid(row_band), pos.x, pos.y)
+    });
+
+    let cur_key_opt = guard
+        .free_focus_path
+        .clone()
+        .or_else(|| guard.free_selection_anchor.clone())
+        .or_else(|| {
+            ordered_indices
+                .iter()
+                .map(|&i| normalize_path_key(&icons[i].id))
+                .find(|k| guard.free_selected_paths.contains(k))
+        });
+
+    let cur_idx_opt = cur_key_opt
+        .as_ref()
+        .and_then(|ck| icons.iter().position(|ic| normalize_path_key(&ic.id) == *ck));
+
+    let prev_selected = guard.free_selected_paths.clone();
+    let prev_focus = guard.free_focus_path.clone();
+
+    let Some(cur_idx) = cur_idx_opt else {
+        let pick_idx = match key {
+            FreeDesktopNavKey::End => *ordered_indices.last().unwrap(),
+            _ => ordered_indices[0],
+        };
+        let k = normalize_path_key(&icons[pick_idx].id);
+        guard.free_selected_paths.clear();
+        guard.free_selected_paths.insert(k.clone());
+        guard.free_selection_anchor = Some(k.clone());
+        guard.free_focus_path = Some(k);
+        return true;
+    };
+
+    let cur_pos = icons[cur_idx].pos;
+    let next_idx = match key {
+        FreeDesktopNavKey::Home => ordered_indices[0],
+        FreeDesktopNavKey::End => *ordered_indices.last().unwrap(),
+        FreeDesktopNavKey::Left => icons
+            .iter()
+            .enumerate()
+            .filter(|(_, ic)| ic.pos.x < cur_pos.x)
+            .min_by_key(|(_, ic)| (cur_pos.x - ic.pos.x) + 3 * (ic.pos.y - cur_pos.y).abs())
+            .map(|(idx, _)| idx)
+            .unwrap_or(cur_idx),
+        FreeDesktopNavKey::Right => icons
+            .iter()
+            .enumerate()
+            .filter(|(_, ic)| ic.pos.x > cur_pos.x)
+            .min_by_key(|(_, ic)| (ic.pos.x - cur_pos.x) + 3 * (ic.pos.y - cur_pos.y).abs())
+            .map(|(idx, _)| idx)
+            .unwrap_or(cur_idx),
+        FreeDesktopNavKey::Up => icons
+            .iter()
+            .enumerate()
+            .filter(|(_, ic)| ic.pos.y < cur_pos.y)
+            .min_by_key(|(_, ic)| (cur_pos.y - ic.pos.y) + 3 * (ic.pos.x - cur_pos.x).abs())
+            .map(|(idx, _)| idx)
+            .unwrap_or(cur_idx),
+        FreeDesktopNavKey::Down => icons
+            .iter()
+            .enumerate()
+            .filter(|(_, ic)| ic.pos.y > cur_pos.y)
+            .min_by_key(|(_, ic)| (ic.pos.y - cur_pos.y) + 3 * (ic.pos.x - cur_pos.x).abs())
+            .map(|(idx, _)| idx)
+            .unwrap_or(cur_idx),
+    };
+
+    let next_key = normalize_path_key(&icons[next_idx].id);
+    if shift {
+        let anchor_key = guard
+            .free_selection_anchor
+            .clone()
+            .unwrap_or_else(|| normalize_path_key(&icons[cur_idx].id));
+        guard.free_selection_anchor = Some(anchor_key.clone());
+        let anchor_pos = ordered_indices
+            .iter()
+            .position(|&i| normalize_path_key(&icons[i].id) == anchor_key);
+        let next_pos = ordered_indices.iter().position(|&i| i == next_idx);
+        guard.free_selected_paths.clear();
+        if let (Some(a), Some(b)) = (anchor_pos, next_pos) {
+            for &idx in &ordered_indices[a.min(b)..=a.max(b)] {
+                guard
+                    .free_selected_paths
+                    .insert(normalize_path_key(&icons[idx].id));
+            }
+        } else {
+            guard.free_selected_paths.insert(next_key.clone());
+        }
+        guard.free_focus_path = Some(next_key);
+    } else {
+        guard.free_selected_paths.clear();
+        guard.free_selected_paths.insert(next_key.clone());
+        guard.free_selection_anchor = Some(next_key.clone());
+        guard.free_focus_path = Some(next_key);
+    }
+
+    prev_selected != guard.free_selected_paths || prev_focus != guard.free_focus_path
+}
+
+fn type_ahead_free_desktop(guard: &mut SharedFenceState, ch: char) -> bool {
+    if ch.is_control() {
+        return false;
+    }
+    let ch_lower = ch.to_lowercase().to_string();
+    if ch_lower.trim().is_empty() {
+        return false;
+    }
+    let icons = guard.config.active_free_icons().to_vec();
+    if icons.is_empty() {
+        return false;
+    }
+    let now = Instant::now();
+    let next_q = match &guard.free_type_ahead {
+        Some((prev, at)) if now.duration_since(*at) < Duration::from_millis(850) => {
+            format!("{prev}{ch_lower}")
+        }
+        _ => ch_lower.clone(),
+    };
+    guard.free_type_ahead = Some((next_q.clone(), now));
+
+    let cur_idx = guard
+        .free_focus_path
+        .as_ref()
+        .or(guard.free_selection_anchor.as_ref())
+        .and_then(|fk| icons.iter().position(|ic| normalize_path_key(&ic.id) == *fk));
+    let start = cur_idx.map(|i| (i + 1) % icons.len()).unwrap_or(0);
+
+    let hit = (0..icons.len())
+        .map(|off| (start + off) % icons.len())
+        .find(|&idx| icons[idx].display_name.to_lowercase().starts_with(&next_q))
+        .or_else(|| {
+            (0..icons.len())
+                .map(|off| (start + off) % icons.len())
+                .find(|&idx| icons[idx].display_name.to_lowercase().starts_with(&ch_lower))
+        });
+
+    let Some(idx) = hit else {
+        return false;
+    };
+    let key = normalize_path_key(&icons[idx].id);
+    guard.free_selected_paths.clear();
+    guard.free_selected_paths.insert(key.clone());
+    guard.free_selection_anchor = Some(key.clone());
+    guard.free_focus_path = Some(key);
+    true
+}
+
 fn handle_free_desktop_hotkey(
     hk: FreeDesktopHotkey,
     shared: &Arc<Mutex<SharedFenceState>>,
@@ -631,6 +798,7 @@ fn handle_free_desktop_hotkey(
                     .map(|ic| normalize_path_key(&ic.id))
                     .collect();
                 guard.free_selection_anchor = keys.first().cloned();
+                guard.free_focus_path = keys.first().cloned();
                 guard.free_selected_paths = keys.into_iter().collect();
                 res.needs_snapshot_refresh = true;
             }
@@ -649,7 +817,7 @@ fn handle_free_desktop_hotkey(
                 guard.cut_paths.clear();
                 if cut {
                     for p in &paths {
-                        guard.cut_paths.insert(p.to_ascii_lowercase());
+                        guard.cut_paths.insert(normalize_path_key(p));
                     }
                 }
                 let verb = if cut { "已剪切" } else { "已复制" };
@@ -658,6 +826,7 @@ fn handle_free_desktop_hotkey(
             } else {
                 lock_unpoisoned(shared).free_toast =
                     Some(("剪贴板被占用，请重试".to_string(), Instant::now()));
+                res.needs_snapshot_refresh = true;
             }
         }
         FreeDesktopHotkey::CopyPaths => {
@@ -668,6 +837,7 @@ fn handle_free_desktop_hotkey(
             if !paths.is_empty() && copy_text_to_clipboard(&paths.join("\r\n")).is_ok() {
                 lock_unpoisoned(shared).free_toast =
                     Some(("已复制路径".to_string(), Instant::now()));
+                res.needs_snapshot_refresh = true;
             }
         }
         FreeDesktopHotkey::Paste => {
@@ -697,7 +867,7 @@ fn handle_free_desktop_hotkey(
                 res.needs_snapshot_refresh = true;
             }
         }
-        FreeDesktopHotkey::Delete { .. } => {
+        FreeDesktopHotkey::Delete { permanent } => {
             let paths = {
                 let guard = lock_unpoisoned(shared);
                 collect_ordered_free_selected_paths(&guard)
@@ -705,27 +875,90 @@ fn handle_free_desktop_hotkey(
             if paths.is_empty() {
                 return;
             }
-            if let Ok(true) = trash_files(&paths) {
-                let mut guard = lock_unpoisoned(shared);
-                let desktop_dirs = guard.desktop_dirs.clone();
-                for p in &paths {
-                    guard.invalidate_icon_texture(p);
-                    let _ = guard.config.remove_desktop_path_everywhere(p, &desktop_dirs);
-                    guard.free_selected_paths.remove(&normalize_path_key(p));
+            let op_res = if permanent {
+                delete_files_permanently(&paths)
+            } else {
+                trash_files(&paths)
+            };
+            match op_res {
+                Ok(true) => {
+                    let mut guard = lock_unpoisoned(shared);
+                    let desktop_dirs = guard.desktop_dirs.clone();
+                    for p in &paths {
+                        guard.invalidate_icon_texture(p);
+                        let _ = guard.config.remove_desktop_path_everywhere(p, &desktop_dirs);
+                        guard.free_selected_paths.remove(&normalize_path_key(p));
+                    }
+                    guard.free_selection_anchor = None;
+                    guard.free_focus_path = None;
+                    let verb = if permanent { "已永久删除" } else { "已移至回收站" };
+                    guard.free_toast = Some((format!("{verb} {} 项", paths.len()), Instant::now()));
+                    guard.dirty_layout = true;
+                    guard.bump_free_icon_epoch();
+                    res.needs_save = true;
+                    res.needs_snapshot_refresh = true;
                 }
-                guard.dirty_layout = true;
-                res.needs_save = true;
-                res.needs_snapshot_refresh = true;
+                Ok(false) => {}
+                Err(e) => {
+                    lock_unpoisoned(shared).free_toast =
+                        Some((format!("删除失败: {e}"), Instant::now()));
+                    res.needs_snapshot_refresh = true;
+                }
             }
         }
         FreeDesktopHotkey::Refresh => {
+            lock_unpoisoned(shared).bump_free_icon_epoch();
             res.commands.push(FenceCommand::RefreshDesktop);
         }
         FreeDesktopHotkey::ClearSelection => {
             let mut guard = lock_unpoisoned(shared);
-            if !guard.free_selected_paths.is_empty() {
+            let had_any = !guard.free_selected_paths.is_empty()
+                || guard.free_selection_anchor.is_some()
+                || !guard.cut_paths.is_empty();
+            if had_any {
                 guard.free_selected_paths.clear();
                 guard.free_selection_anchor = None;
+                guard.free_focus_path = None;
+                guard.cut_paths.clear();
+                res.needs_snapshot_refresh = true;
+            }
+        }
+        FreeDesktopHotkey::OpenSelected => {
+            let paths = {
+                let guard = lock_unpoisoned(shared);
+                collect_ordered_free_selected_paths(&guard)
+            };
+            for p in paths.into_iter().take(8) {
+                if let Err(e) = launch_item(&p) {
+                    lock_unpoisoned(shared).free_toast =
+                        Some((format!("打开失败: {e}"), Instant::now()));
+                    res.needs_snapshot_refresh = true;
+                    break;
+                }
+            }
+        }
+        FreeDesktopHotkey::Properties => {
+            let first = {
+                let guard = lock_unpoisoned(shared);
+                collect_ordered_free_selected_paths(&guard).into_iter().next()
+            };
+            if let Some(p) = first {
+                let _ = show_file_properties(&p);
+            }
+        }
+        FreeDesktopHotkey::Navigate { key, shift } => {
+            let mut guard = lock_unpoisoned(shared);
+            res.repaint_fences = collect_non_empty_selected_fences(&guard);
+            guard.clear_all_selections_except(Some(SelectionScope::FreeDesktop));
+            if navigate_free_desktop_icons(&mut guard, key, shift) {
+                res.needs_snapshot_refresh = true;
+            }
+        }
+        FreeDesktopHotkey::TypeAhead(ch) => {
+            let mut guard = lock_unpoisoned(shared);
+            res.repaint_fences = collect_non_empty_selected_fences(&guard);
+            guard.clear_all_selections_except(Some(SelectionScope::FreeDesktop));
+            if type_ahead_free_desktop(&mut guard, ch) {
                 res.needs_snapshot_refresh = true;
             }
         }
@@ -755,8 +988,7 @@ fn arrange_free_icons(
     sort_items_slice(&mut items, mode);
 
     let monitors = guard.topology.monitors().to_vec();
-    let step_x = guard.config.preferences.icon_cell_w.clamp(48, 180);
-    let step_y = guard.config.preferences.icon_cell_h.clamp(56, 200);
+    let (step_x, step_y) = guard.free_desktop_cell_size();
     let work = monitors
         .iter()
         .find(|m| m.is_primary)
@@ -886,7 +1118,7 @@ pub fn apply_free_icon_menu_command(
                 guard.cut_paths.clear();
                 if cut {
                     for p in paths {
-                        guard.cut_paths.insert(p.to_ascii_lowercase());
+                        guard.cut_paths.insert(normalize_path_key(p));
                     }
                 }
                 let verb = if cut { "已剪切" } else { "已复制" };
@@ -899,8 +1131,9 @@ pub fn apply_free_icon_menu_command(
         }
         FreeIconMenuCommand::CopyPaths => {
             if copy_text_to_clipboard(&paths.join("\r\n")).is_ok() {
-                lock_unpoisoned(shared).free_toast =
-                    Some(("已复制路径".to_string(), Instant::now()));
+                let mut guard = lock_unpoisoned(shared);
+                guard.free_toast = Some(("已复制路径".to_string(), Instant::now()));
+                guard.mark_free_desktop_dirty(Some(ctx));
             }
         }
         FreeIconMenuCommand::Rename => {
@@ -957,6 +1190,7 @@ pub fn apply_free_icon_menu_command(
                             prev_free_icons,
                         });
                         guard.dirty_layout = true;
+                        guard.bump_free_icon_epoch();
                         guard.mark_free_desktop_dirty(Some(ctx));
                         out.needs_immediate_save = true;
                         true
@@ -981,7 +1215,9 @@ pub fn apply_free_icon_menu_command(
                         let _ = guard.config.remove_desktop_path_everywhere(p, &desktop_dirs);
                         guard.free_selected_paths.remove(&normalize_path_key(p));
                     }
+                    guard.free_toast = Some((format!("已移至回收站 {} 项", paths.len()), Instant::now()));
                     guard.dirty_layout = true;
+                    guard.bump_free_icon_epoch();
                     guard.mark_free_desktop_dirty(Some(ctx));
                     out.needs_immediate_save = true;
                 }

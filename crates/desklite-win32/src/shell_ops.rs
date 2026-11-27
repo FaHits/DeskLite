@@ -8,11 +8,12 @@ use windows::Win32::Storage::FileSystem::{
 };
 use windows::Win32::System::Com::{CLSCTX_INPROC_SERVER, CoCreateInstance, CoTaskMemFree};
 use windows::Win32::UI::Shell::{
-    FO_DELETE, FOF_ALLOWUNDO, FOF_NOERRORUI, FOLDERID_Desktop, FOLDERID_PublicDesktop,
-    FOS_FORCEFILESYSTEM, FOS_PICKFOLDERS, FileOpenDialog, IFileOpenDialog, KNOWN_FOLDER_FLAG,
-    SEE_MASK_INVOKEIDLIST, SHCNE_UPDATEDIR, SHCNF_PATHW, SHChangeNotify, SHELLEXECUTEINFOW,
-    SHFILEINFOW, SHFILEOPSTRUCTW, SHFileOperationW, SHGFI_DISPLAYNAME, SHGetFileInfoW,
-    SHGetKnownFolderPath, SIGDN_FILESYSPATH, ShellExecuteExW, ShellExecuteW,
+    FO_DELETE, FOF_ALLOWUNDO, FOF_NOCONFIRMMKDIR, FOF_NOERRORUI, FOF_SIMPLEPROGRESS,
+    FOLDERID_Desktop, FOLDERID_PublicDesktop, FOS_FORCEFILESYSTEM, FOS_PICKFOLDERS, FileOpenDialog,
+    IFileOpenDialog, KNOWN_FOLDER_FLAG, SEE_MASK_INVOKEIDLIST, SHCNE_UPDATEDIR, SHCNF_PATHW,
+    SHChangeNotify, SHELLEXECUTEINFOW, SHFILEINFOW, SHFILEOPSTRUCTW, SHFileOperationW,
+    SHGFI_DISPLAYNAME, SHGetFileInfoW, SHGetKnownFolderPath, SIGDN_FILESYSPATH, ShellExecuteExW,
+    ShellExecuteW,
 };
 use windows::Win32::UI::WindowsAndMessaging::SW_SHOWNORMAL;
 use windows::core::{GUID, HSTRING, PCWSTR, w};
@@ -562,9 +563,11 @@ pub fn paste_files_to_directory(
         .collect())
 }
 
-/// Sends `paths` to the Windows Recycle Bin (`SHFileOperationW` with `FO_DELETE | FOF_ALLOWUNDO`).
-/// Returns `Ok(true)` if executed without user abort.
-pub fn trash_files(paths: &[String]) -> Result<bool, Win32Error> {
+fn run_delete_file_op(
+    paths: &[String],
+    flags: u16,
+    op_name: &'static str,
+) -> Result<bool, Win32Error> {
     let valid: Vec<String> = paths
         .iter()
         .map(|s| s.trim_end_matches(['\\', '/']).to_string())
@@ -583,7 +586,7 @@ pub fn trash_files(paths: &[String]) -> Result<bool, Win32Error> {
     let mut op = SHFILEOPSTRUCTW {
         wFunc: FO_DELETE,
         pFrom: PCWSTR(double_null.as_ptr()),
-        fFlags: (FOF_ALLOWUNDO | FOF_NOERRORUI).0 as u16,
+        fFlags: flags,
         ..Default::default()
     };
     let rc = unsafe { SHFileOperationW(&mut op) };
@@ -592,11 +595,38 @@ pub fn trash_files(paths: &[String]) -> Result<bool, Win32Error> {
     }
     if rc != 0 {
         return Err(Win32Error::Status {
-            op: "SHFileOperationW(FO_DELETE)",
+            op: op_name,
             code: rc as u32,
         });
     }
     Ok(true)
+}
+
+/// Sends `paths` to the Windows Recycle Bin (`SHFileOperationW` with `FO_DELETE | FOF_ALLOWUNDO`).
+/// Returns `Ok(true)` if executed without user abort.
+pub fn trash_files(paths: &[String]) -> Result<bool, Win32Error> {
+    run_delete_file_op(
+        paths,
+        (FOF_ALLOWUNDO | FOF_NOERRORUI).0 as u16,
+        "SHFileOperationW(FO_DELETE)",
+    )
+}
+
+/// Permanently deletes `paths` (`SHFileOperationW` `FO_DELETE` without `FOF_ALLOWUNDO`),
+/// preserving the standard Windows confirmation prompt. Returns `Ok(true)` if executed
+/// without user abort.
+pub fn delete_files_permanently(paths: &[String]) -> Result<bool, Win32Error> {
+    let existing_count = paths
+        .iter()
+        .map(|s| s.trim_end_matches(['\\', '/']))
+        .filter(|p| !p.is_empty() && Path::new(p).exists())
+        .take(2)
+        .count();
+    let mut flags = FOF_NOCONFIRMMKDIR;
+    if existing_count > 1 {
+        flags |= FOF_SIMPLEPROGRESS;
+    }
+    run_delete_file_op(paths, flags.0 as u16, "SHFileOperationW(FO_DELETE permanent)")
 }
 
 #[cfg(test)]

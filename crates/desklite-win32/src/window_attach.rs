@@ -907,7 +907,8 @@ unsafe extern "system" fn bottom_subclass_proc(
             }
         }
     }
-    if msg == WM_KEYDOWN
+    if !is_free
+        && msg == WM_KEYDOWN
         && ACTIVE_TEXT_EDIT_HWND.load(std::sync::atomic::Ordering::Acquire) != (hwnd.0 as isize)
         && let Some(hk) = decode_ctrl_hotkey(wparam, lparam)
     {

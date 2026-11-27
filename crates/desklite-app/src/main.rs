@@ -30,13 +30,13 @@ use desklite_ui::{
 use desklite_win32::{
     FolderWatcher, FreeDesktopController, FreeDesktopEvent, IconCache, TrayIcon,
     WM_APP_PORTAL_DIRTY, WM_APP_TRAY, all_desktop_dirs, clipboard_has_files,
-    enable_dark_popup_menus, enable_per_monitor_dpi_v2, hide_all_fences_immediately,
-    install_desktop_z_win_event_hooks, is_desktop_dir_path, is_display_wake_power_broadcast,
-    is_vault_path, launch_item, migrate_vault_item_to_desktop, pick_folder_dialog,
-    post_reassert_all_fences_z, probe_display_topology, register_power_and_session_notifications,
-    restore_all_desktop_icons, scan_portal_directory, set_external_foreground_notify_target,
-    set_shell_desktop_icons_visible, set_window_rect_no_z, strip_alt_tab_from_host,
-    unregister_power_and_session_notifications,
+    enable_dark_popup_menus, enable_per_monitor_dpi_v2, focus_window_now,
+    hide_all_fences_immediately, install_desktop_z_win_event_hooks, is_desktop_dir_path,
+    is_display_wake_power_broadcast, is_vault_path, launch_item, migrate_vault_item_to_desktop,
+    pick_folder_dialog, post_reassert_all_fences_z, probe_display_topology,
+    register_power_and_session_notifications, restore_all_desktop_icons, scan_portal_directory,
+    set_external_foreground_notify_target, set_shell_desktop_icons_visible, set_window_rect_no_z,
+    strip_alt_tab_from_host, unregister_power_and_session_notifications,
 };
 use egui::{Pos2, Vec2, ViewportBuilder, ViewportCommand, ViewportId, WindowLevel};
 use raw_window_handle::{HasWindowHandle, RawWindowHandle};
@@ -229,16 +229,29 @@ fn refresh_all_portals(cfg: &mut NativeLayoutConfig, desktop_dirs: &[String]) {
     }
 }
 
+fn scaled_free_cell_size(topo: &DisplayTopology, cfg: &NativeLayoutConfig) -> (i32, i32) {
+    let dpi_scale = topo
+        .monitors()
+        .iter()
+        .find(|m| m.is_primary)
+        .or_else(|| topo.monitors().first())
+        .map(|m| (m.dpi_x.max(96) as f32 / 96.0).max(1.0))
+        .unwrap_or(1.0);
+    let logical_w = cfg.preferences.icon_cell_w.clamp(64, 160) as f32;
+    let logical_h = cfg.preferences.icon_cell_h.clamp(72, 180) as f32;
+    (
+        (logical_w * dpi_scale).round() as i32,
+        (logical_h * dpi_scale).round() as i32,
+    )
+}
+
 fn reconcile_free_icons_in_config(
     cfg: &mut NativeLayoutConfig,
     topo: &DisplayTopology,
     desktop_dirs: &[String],
     scanned_desktop: &[FenceItem],
 ) -> usize {
-    let cell = (
-        cfg.preferences.icon_cell_w.clamp(48, 180),
-        cfg.preferences.icon_cell_h.clamp(56, 200),
-    );
+    let cell = scaled_free_cell_size(topo, cfg);
     let origin = topo
         .monitors()
         .first()
@@ -1053,7 +1066,8 @@ impl HelperState {
             let _ = DestroyMenu(menu);
         }
 
-        match cmd.0 as u32 {
+        let raw_cmd = cmd.0 as u32;
+        match raw_cmd {
             FREE_CMD_NEW_BLANK => {
                 let _ = self
                     .tx
@@ -1130,6 +1144,18 @@ impl HelperState {
                 self.egui_ctx.request_repaint_of(ViewportId::ROOT);
             }
             _ => {}
+        }
+        let keep_external_focus = matches!(
+            raw_cmd,
+            FREE_CMD_NEW_BLANK
+                | FREE_CMD_NEW_PORTAL
+                | FREE_CMD_OPEN_DESKTOP_DIR
+                | FREE_CMD_OPEN_CONFIG_DIR
+                | FREE_CMD_EXIT
+        );
+        if !keep_external_focus {
+            let free_hwnd = lock_unpoisoned(&self.shared).free_desktop_hwnd;
+            focus_window_now(free_hwnd);
         }
     }
 
@@ -1258,6 +1284,18 @@ impl HelperState {
         if let Some(action) = action {
             let _ = self.tx.send(BgEvent::FreeIconMenuCmd(paths, action));
             self.egui_ctx.request_repaint_of(ViewportId::ROOT);
+        }
+        let keep_external_focus = matches!(
+            raw_cmd,
+            FREE_ICON_CMD_OPEN
+                | FREE_ICON_CMD_OPEN_ADMIN
+                | FREE_ICON_CMD_REVEAL
+                | FREE_ICON_CMD_RENAME
+                | FREE_ICON_CMD_PROPERTIES
+        );
+        if !keep_external_focus {
+            let free_hwnd = lock_unpoisoned(&self.shared).free_desktop_hwnd;
+            focus_window_now(free_hwnd);
         }
     }
 }
@@ -1748,6 +1786,7 @@ impl DeskLiteEguiApp {
             }
             if refresh_portals {
                 refresh_all_portals(&mut guard.config, &desktop_dirs);
+                guard.bump_free_icon_epoch();
             }
             let _ = reconcile_free_icons_in_config(
                 &mut guard.config,
@@ -1787,12 +1826,14 @@ impl DeskLiteEguiApp {
         let reconciled = {
             let mut guard = lock_unpoisoned(&self.shared);
             let topo = guard.topology.clone();
-            reconcile_free_icons_in_config(
+            let count = reconcile_free_icons_in_config(
                 &mut guard.config,
                 &topo,
                 &desktop_dirs,
                 &scanned_desktop,
-            )
+            );
+            guard.bump_free_icon_epoch();
+            count
         };
         self.push_free_desktop_snapshot();
         reconciled > 0
@@ -2086,7 +2127,26 @@ impl DeskLiteEguiApp {
         if needs_watcher_sync {
             self.sync_watchers();
         }
-        let pending_due = { lock_unpoisoned(&self.shared).pending_save_at };
+        let (pending_due, toast_remaining) = {
+            let mut guard = lock_unpoisoned(&self.shared);
+            let toast_rem = if let Some((_, at)) = guard.free_toast {
+                let elapsed = at.elapsed();
+                let ttl = Duration::from_millis(1200);
+                if elapsed >= ttl {
+                    guard.free_toast = None;
+                    needs_free_snapshot = true;
+                    None
+                } else {
+                    Some((ttl - elapsed).max(Duration::from_millis(16)))
+                }
+            } else {
+                None
+            };
+            (guard.pending_save_at, toast_rem)
+        };
+        if let Some(rem) = toast_remaining {
+            ctx.request_repaint_after_for(rem, ViewportId::ROOT);
+        }
         if needs_save {
             self.save_now();
         } else if let Some(deadline) = pending_due {
@@ -2109,7 +2169,14 @@ impl eframe::App for DeskLiteEguiApp {
         [0.0, 0.0, 0.0, 0.0]
     }
 
+    fn logic(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
+        let _ = self.drain_events_and_commands(ctx);
+    }
+
     fn ui(&mut self, ui: &mut egui::Ui, frame: &mut eframe::Frame) {
+        if self.shutting_down {
+            return;
+        }
         if self.host_attach_passes < 2
             && let Ok(handle) = frame.window_handle()
             && let RawWindowHandle::Win32(h) = handle.as_raw()
@@ -2122,9 +2189,6 @@ impl eframe::App for DeskLiteEguiApp {
         }
 
         let ctx = ui.ctx().clone();
-        if !self.drain_events_and_commands(&ctx) {
-            return;
-        }
 
         let (
             fences,
@@ -2313,7 +2377,7 @@ fn main() {
         clipboard_shortcuts: false,
         ..Default::default()
     };
-    native_options.glow_options.vsync = true;
+    native_options.glow_options.vsync = false;
 
     let _ = eframe::run_native(
         "DeskLite",

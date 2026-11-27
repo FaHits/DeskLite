@@ -778,16 +778,25 @@ pub fn render_inspector_viewport(
                                     guard.push_undo(act);
                                 }
                                 if prefs_changed {
+                                    let old_free_cell = guard.free_desktop_cell_size();
                                     guard.config.preferences.icon_cell_w = g_cell_w;
                                     guard.config.preferences.icon_cell_h = g_cell_h;
                                     guard.config.preferences.list_row_h = g_row_h;
                                     guard.config.preferences.list_icon_px = g_list_icon;
                                     guard.config.preferences.snap_threshold_px = snap_px;
+                                    let new_free_cell = guard.free_desktop_cell_size();
+                                    guard.rescale_free_icons_for_cell_size(
+                                        old_free_cell,
+                                        new_free_cell,
+                                    );
                                 }
                                 if hide_all_changed {
                                     guard.config.hide_all_fences = hide_all;
                                 }
                                 guard.mark_debounced_save(&ctx);
+                                if prefs_changed || hide_all_changed {
+                                    guard.mark_free_desktop_dirty(Some(&ctx));
+                                }
                             }
                             if prefs_changed || hide_all_changed {
                                 request_repaint_all_fences(shared, &ctx);

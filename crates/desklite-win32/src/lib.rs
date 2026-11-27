@@ -62,16 +62,16 @@ pub use events::{
 pub use fence_poc::{FencePocConfig, run_bottom_fence_poc};
 pub use folder_watch::{FolderWatcher, WM_APP_PORTAL_DIRTY};
 pub use free_desktop_wnd::{
-    FreeDesktopController, FreeDesktopEvent, FreeDesktopHotkey, FreeDesktopRenderItem,
-    FreeDesktopSnapshot,
+    FreeDesktopController, FreeDesktopEvent, FreeDesktopHotkey, FreeDesktopNavKey,
+    FreeDesktopRenderItem, FreeDesktopSnapshot,
 };
 pub use icons::{DecodedIcon, IconCache, extract_file_icon_pbgra};
 pub use shell_ops::{
-    all_desktop_dirs, is_desktop_dir_path, is_directly_on_desktop, is_vault_path, launch_as_admin,
-    launch_item, migrate_vault_item_to_desktop, move_path_in_place, paste_files_to_directory,
-    paste_files_to_directory_detailed, pick_folder_dialog, rename_file_in_place,
-    resolve_dropped_item, reveal_in_explorer, scan_portal_directory, show_file_properties,
-    trash_files, user_desktop_dir,
+    all_desktop_dirs, delete_files_permanently, is_desktop_dir_path, is_directly_on_desktop,
+    is_vault_path, launch_as_admin, launch_item, migrate_vault_item_to_desktop, move_path_in_place,
+    paste_files_to_directory, paste_files_to_directory_detailed, pick_folder_dialog,
+    rename_file_in_place, resolve_dropped_item, reveal_in_explorer, scan_portal_directory,
+    show_file_properties, trash_files, user_desktop_dir,
 };
 pub use tray::{TrayIcon, WM_APP_TRAY};
 pub use window_attach::{

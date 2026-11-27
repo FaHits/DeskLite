@@ -30,6 +30,7 @@ pub enum ItemUiAction {
     RefreshPortal,
     RemoveSelected,
     TrashSelected,
+    DeleteSelectedPermanent,
     BeginItemDrag { idx: usize, ctrl: bool, shift: bool },
     StartDragOut { idx: usize, ctrl: bool, shift: bool },
 }

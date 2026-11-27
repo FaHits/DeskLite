@@ -1,6 +1,6 @@
 # DeskLite 技术 Bug 统计与根因复盘全录
 
-> 覆盖范围：`E:\Ai_Agent\DeskLite` 从初始化提交 `5424ebf` 至当前工作分支 `feat/route-b-desktop-takeover` 共计 **45 项**典型故障与架构级缺陷修复（含前置立项阶段逆向确认的原版 DeskGo 核心错位根因）。
+> 覆盖范围：`E:\Ai_Agent\DeskLite` 从初始化提交 `5424ebf` 至当前工作分支 `feat/route-b-desktop-takeover` 共计 **46 项**典型故障与架构级缺陷修复（含前置立项阶段逆向确认的原版 DeskGo 核心错位根因）。
 
 ---
 
@@ -58,6 +58,7 @@
   - [#43 程序启动/退出瞬间格子闪现纯白矩形框（DWM/WGL 首帧与销毁竞态）](#bug-43)
   - [#44 `FreeDesktop` 自绘桌面图标顶置对齐/毛坯感、失焦不清选、悬停缩放光标残留与缺热键](#bug-44)
   - [#45 `FreeDesktop` 左键单击、空白点击与框选被 `ReleaseCapture()` 同步 `WM_CAPTURECHANGED` 静默吞掉](#bug-45)
+  - [#46 `FreeDesktop` 键盘焦点与热键断链、DPI 格距不统一、D2D 渲染粗糙、`vsync` 回归及跨格粘贴/撤销补漏](#bug-46)
 - [5. 跨 Bug 提炼的四条核心工程经验](#sec-takeaways)
 
 ---
@@ -67,10 +68,10 @@
 | 技术域 | 包含 Bug 编号 | 核心共性机制 |
 | :--- | :--- | :--- |
 | **A. Win32 窗体样式 / DWM / Z-Order** | `#01` `#03` `#04` `#09` `#14` `#15` `#16` `#23` `#29` `#33` `#39` `#43` | `WorkerW`/`Progman` 归属、`WM_WINDOWPOSCHANGING`、原生 `WM_STYLECHANGING` / `WM_NCCALCSIZE`、`TaskbarCreated` |
-| **B. 图形渲染 / WGL / Direct2D / 帧率** | `#01` `#04` `#12` `#19` `#22` `#23` `#36` `#38` `#39` `#40` `#43` `#44` | `eframe` 多 Viewport WGL `make_not_current` 崩溃与 `SwapInterval::Wait(1)` 串联阻塞、`UpdateLayeredWindow` Premultiplied Alpha |
-| **C. Win32 Shell / 桌面图标接管 / 监听** | `#08` `#10` `#13` `#18` `#28` `#32` `#33` | Win11 `SysListView32` `LVS_OWNERDATA` 陷阱、`SHChangeNotify` 级联重载 → 整体隐藏 `SHELLDLL_DefView`、`ReadDirectoryChangesW` |
-| **D. OLE / COM 拖放 / 剪贴板 / 热键 / UI 交互** | `#03` `#05` `#06` `#07` `#17` `#19` `#20` `#21` `#31` `#37` `#41` `#42` `#44` `#45` | 跨 STA 套间 COM `SendMessage` 死锁、OLE `DoDragDrop` 两阶段分流、`WM_KEYDOWN` + `MAPVK_VSC_TO_VK_EX`、全局唯一焦点域 |
-| **E. 持久化 / 多屏拓扑 / 并发与容错** | `#02` `#11` `#24` `#25` `#26` `#27` `#30` `#32` `#34` `#35` | 单一归属模型（`FenceRole`）、CCD `TopologyKey`、原子写序号临时文件、切屏稳态期保护（Settling Guard） |
+| **B. 图形渲染 / WGL / Direct2D / 帧率** | `#01` `#04` `#12` `#19` `#22` `#23` `#36` `#38` `#39` `#40` `#43` `#44` `#46` | `eframe` 多 Viewport WGL `make_not_current` 崩溃与 `SwapInterval::Wait(1)` 串联阻塞、`UpdateLayeredWindow` Premultiplied Alpha |
+| **C. Win32 Shell / 桌面图标接管 / 监听** | `#08` `#10` `#13` `#18` `#28` `#32` `#33` `#46` | Win11 `SysListView32` `LVS_OWNERDATA` 陷阱、`SHChangeNotify` 级联重载 → 整体隐藏 `SHELLDLL_DefView`、`ReadDirectoryChangesW` |
+| **D. OLE / COM 拖放 / 剪贴板 / 热键 / UI 交互** | `#03` `#05` `#06` `#07` `#17` `#19` `#20` `#21` `#31` `#37` `#41` `#42` `#44` `#45` `#46` | 跨 STA 套间 COM `SendMessage` 死锁、OLE `DoDragDrop` 两阶段分流、`WM_KEYDOWN` + `MAPVK_VSC_TO_VK_EX`、全局唯一焦点域 |
+| **E. 持久化 / 多屏拓扑 / 并发与容错** | `#02` `#11` `#24` `#25` `#26` `#27` `#30` `#32` `#34` `#35` `#46` | 单一归属模型（`FenceRole`）、CCD `TopologyKey`、原子写序号临时文件、切屏稳态期保护（Settling Guard） |
 
 ---
 
@@ -462,6 +463,21 @@ DeskLite 在 M1/M2 起即在 `desklite-core`（`TopologyKey`、`clamp.rs`、`sto
 - **现象**：在自绘桌面中左键单击图标仅显示悬停态而无法选中、左键点桌面空白不触发清选、左键拉出框选框松手后不提交选区（只有右键能触发选中）。
 - **技术根因**：`handle_lbutton_up` 先调用了 `ReleaseCapture()` 再 `std::mem::replace(&mut state.drag_state, MouseDragState::None)`；而 `ReleaseCapture()` 在返回前会同步向同线程窗口派发 `WM_CAPTURECHANGED`，将 `state.drag_state` 清为 `MouseDragState::None`，导致 `handle_lbutton_up` 取到空状态并直接跳过事件派发。
 - **修复方案**：在 `handle_lbutton_up` 中先 `std::mem::replace(&mut state.drag_state, MouseDragState::None)` 取出待处理状态，再调用 `ReleaseCapture()`，确保左键点击、空白清选与框选提交稳定生效。
+
+<a id="bug-46"></a>
+### #46 `FreeDesktop` 键盘焦点与热键断链、DPI 格距不统一、D2D 渲染粗糙、`vsync` 回归及跨格粘贴/撤销补漏
+- **提交 / 模块**：`feat/route-b-desktop-takeover` · [window_attach.rs](file:///E:/Ai_Agent/DeskLite/crates/desklite-win32/src/window_attach.rs)、[shell_ops.rs](file:///E:/Ai_Agent/DeskLite/crates/desklite-win32/src/shell_ops.rs)、[free_desktop_wnd.rs](file:///E:/Ai_Agent/DeskLite/crates/desklite-win32/src/free_desktop_wnd.rs)、[state.rs](file:///E:/Ai_Agent/DeskLite/crates/desklite-ui/src/state.rs)、[inspector.rs](file:///E:/Ai_Agent/DeskLite/crates/desklite-ui/src/inspector.rs)、[free_desktop_view.rs](file:///E:/Ai_Agent/DeskLite/crates/desklite-ui/src/free_desktop_view.rs)、[actions.rs](file:///E:/Ai_Agent/DeskLite/crates/desklite-ui/src/actions.rs)、[undo.rs](file:///E:/Ai_Agent/DeskLite/crates/desklite-ui/src/undo.rs)、[main.rs](file:///E:/Ai_Agent/DeskLite/crates/desklite-app/src/main.rs)
+- **现象**：
+  1. 自绘桌面点击后仅调用 `SetForegroundWindow` 未调用 `SetFocus`，且 `bottom_subclass_proc` 的 `WM_KEYDOWN` 拦截了 `Ctrl+A/C/X/V/Z`、`WM_CHAR` 误调 `DefSubclassProc`，导致桌面热键、`Enter`/`Alt+Enter`/`Shift+Del`/方向键/`Home`/`End`/首字母定位及右键菜单关闭后键盘焦点断链；
+  2. 高 DPI 下 `FreeDesktop` 未乘主屏缩放比例导致与格子图标大小不一致，拖动参数面板滑块时不联动缩放桌面格距且 `vsync = true` 意外回归引发多 Viewport 卡顿（`#38`）；
+  3. 桌面图标 256px 一次性下采样有锯齿、选框在亮壁纸下偏生硬、Win95 白色边框 `EDIT` 与无 Toast/不换图标缓存（`icon_epoch`）；
+  4. `drain_events_and_commands` 仅挂在 `App::ui()` 在 `PassMode::LogicOnly` 下跳过；外部文件复制到 `DesktopBucket` 未进桌面目录、从 `ExternalPortal` 剪切未刷源格、`UndoAction::PasteFiles` 撤销未归位桌面 `free_icons`。
+- **技术根因**：`bottom_subclass_proc` 缺少 `!is_free` 守卫；`free_desktop_wnd_proc` 缺少 `WM_ACTIVATE`/`WM_SYSKEYDOWN`/`WM_CTLCOLOREDIT` 与菜单关闭焦域归还；`FreeDesktopSnapshot` 缺少 `toast`/`icon_epoch`；`eframe 0.37` 的 `PassMode::LogicOnly` 只调 `App::logic()` 不调 `App::ui()`。
+- **修复方案**：
+  - `bottom_subclass_proc` 放行 `FreeDesktop` 的 `WM_KEYDOWN`/`WM_SYSKEYDOWN`；`free_desktop_wnd_proc` 补齐 `WM_ACTIVATE` + `SetFocus`、`WM_SYSKEYDOWN`（`Alt+Enter` 属性）、`Enter` 打开、`Shift+Delete` 永久删除（`delete_files_permanently`）、方向键/`Home`/`End` 空间导航与 `WM_CHAR`（修为 `DefWindowProcW`）850ms 首字母定位，并在右键菜单关闭后归还 `focus_window_now(free_desktop_hwnd)`；
+  - 新增 `SharedFenceState::free_desktop_cell_size()` 与 `rescale_free_icons_for_cell_size()` 统一物理像素尺寸与实时缩放联动，恢复 `native_options.glow_options.vsync = false`；
+  - `free_desktop_wnd.rs` 实现 `downsample_pbgra_hq`、磨砂钴蓝选框与双层文字阴影、暗色圆角无边框行内重命名、`draw_toast_pill`（1200ms 定时自动消隐）及 `icon_epoch` 缓存失效重载；
+  - 将 `drain_events_and_commands` 迁入 `eframe::App::logic()`，同时补全 `actions.rs`/`undo.rs` 跨格粘贴与撤销归位闭环（`cut_paths` 统一 `normalize_path_key`）。
 
 ---
 

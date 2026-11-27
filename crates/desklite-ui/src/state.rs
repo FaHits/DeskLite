@@ -277,6 +277,7 @@ pub struct SharedFenceState {
     pub free_desktop_hwnd: isize,
     pub free_desktop_notify_hwnd: isize,
     pub free_desktop_notify_msg: u32,
+    pub free_icon_epoch: u64,
     pub helper_hwnd: isize,
     pub menu_popup_active: bool,
     pub last_focused_fences: HashMap<i32, bool>,
@@ -292,6 +293,7 @@ pub struct SharedFenceState {
     pub item_reorder: HashMap<i32, ReorderDragState>,
     pub free_selected_paths: HashSet<String>,
     pub free_selection_anchor: Option<String>,
+    pub free_focus_path: Option<String>,
     pub free_marquee: Option<FreeMarqueeState>,
     pub free_icon_drag: Option<FreeIconDragState>,
     pub free_type_ahead: Option<(String, Instant)>,
@@ -343,6 +345,7 @@ impl SharedFenceState {
             free_desktop_hwnd: 0,
             free_desktop_notify_hwnd: 0,
             free_desktop_notify_msg: 0,
+            free_icon_epoch: 0,
             helper_hwnd: 0,
             menu_popup_active: false,
             last_focused_fences: HashMap::new(),
@@ -358,6 +361,7 @@ impl SharedFenceState {
             item_reorder: HashMap::new(),
             free_selected_paths: HashSet::new(),
             free_selection_anchor: None,
+            free_focus_path: None,
             free_marquee: None,
             free_icon_drag: None,
             free_type_ahead: None,
@@ -431,8 +435,111 @@ impl SharedFenceState {
 
     pub fn mark_free_desktop_dirty(&mut self, ctx: Option<&egui::Context>) {
         self.pending_repaint_free_desktop = true;
+        if self.free_desktop_notify_hwnd != 0 && self.free_desktop_notify_msg != 0 {
+            post_window_message(self.free_desktop_notify_hwnd, self.free_desktop_notify_msg);
+        }
         if let Some(ctx) = ctx {
             ctx.request_repaint_of(ViewportId::ROOT);
+        }
+    }
+
+    pub fn bump_free_icon_epoch(&mut self) {
+        self.free_icon_epoch = self.free_icon_epoch.wrapping_add(1);
+        self.mark_free_desktop_dirty(None);
+    }
+
+    /// Physical pixel `(cell_w, cell_h)` for the native `FreeDesktop` layered canvas,
+    /// scaling the global logical preferences by the primary monitor's DPI so desktop
+    /// icons match `fence_view` size 1:1 on high-DPI displays.
+    pub fn free_desktop_cell_size(&self) -> (i32, i32) {
+        let dpi_scale = self
+            .topology
+            .monitors()
+            .iter()
+            .find(|m| m.is_primary)
+            .or_else(|| self.topology.monitors().first())
+            .map(|m| (m.dpi_x.max(96) as f32 / 96.0).max(1.0))
+            .unwrap_or(1.0);
+        let logical_w = self.config.preferences.icon_cell_w.clamp(64, 160) as f32;
+        let logical_h = self.config.preferences.icon_cell_h.clamp(72, 180) as f32;
+        (
+            (logical_w * dpi_scale).round() as i32,
+            (logical_h * dpi_scale).round() as i32,
+        )
+    }
+
+    /// Smoothly rescales existing `free_icons` positions when global cell dimensions change,
+    /// clamping to monitors and nudging any colliding cells apart.
+    pub fn rescale_free_icons_for_cell_size(&mut self, old_cell: (i32, i32), new_cell: (i32, i32)) {
+        if old_cell == new_cell {
+            return;
+        }
+        let monitors = self.topology.monitors().to_vec();
+        let primary_work = monitors
+            .iter()
+            .find(|m| m.is_primary)
+            .or_else(|| monitors.first())
+            .map(|m| m.work_area)
+            .unwrap_or(Rect::new(0, 0, 1920, 1040));
+        let origin_x = primary_work.left + 20;
+        let origin_y = primary_work.top + 20;
+        let sx = new_cell.0 as f32 / old_cell.0.max(1) as f32;
+        let sy = new_cell.1 as f32 / old_cell.1.max(1) as f32;
+        let Some(free) = self.config.active_free_icons_mut() else {
+            return;
+        };
+
+        let mut placed: Vec<Point> = Vec::with_capacity(free.len());
+        let collides = |cand: Point, existing: &[Point]| -> bool {
+            existing
+                .iter()
+                .any(|p| (cand.x - p.x).abs() < new_cell.0 && (cand.y - p.y).abs() < new_cell.1)
+        };
+        let clamp_cand = |pt: Point| -> Point {
+            if monitors.is_empty() {
+                pt
+            } else {
+                clamp_point_to_monitors(pt, new_cell, &monitors)
+                    .map(|(p, _)| p)
+                    .unwrap_or(pt)
+            }
+        };
+
+        for icon in free.iter_mut() {
+            let scaled = Point {
+                x: origin_x + ((icon.pos.x - origin_x) as f32 * sx).round() as i32,
+                y: origin_y + ((icon.pos.y - origin_y) as f32 * sy).round() as i32,
+            };
+            let base = clamp_cand(scaled);
+            let mut chosen = base;
+            if collides(chosen, &placed) {
+                let work = monitors
+                    .iter()
+                    .find(|m| {
+                        base.x >= m.work_area.left
+                            && base.x < m.work_area.right
+                            && base.y >= m.work_area.top
+                            && base.y < m.work_area.bottom
+                    })
+                    .map(|m| m.work_area)
+                    .unwrap_or(primary_work);
+                let max_cols = ((work.right - work.left - 20) / new_cell.0.max(1)).max(1);
+                let max_rows = ((work.bottom - work.top - 20) / new_cell.1.max(1)).max(1);
+                'search: for col_off in 0..max_cols {
+                    for row_off in 0..max_rows {
+                        let cand = clamp_cand(Point {
+                            x: base.x + col_off * new_cell.0,
+                            y: work.top + 20 + row_off * new_cell.1,
+                        });
+                        if !collides(cand, &placed) {
+                            chosen = cand;
+                            break 'search;
+                        }
+                    }
+                }
+            }
+            placed.push(chosen);
+            icon.pos = chosen;
         }
     }
 
@@ -445,6 +552,7 @@ impl SharedFenceState {
                 self.selection_anchor.retain(|fid, _| *fid == keep_fid);
                 self.free_selected_paths.clear();
                 self.free_selection_anchor = None;
+                self.free_focus_path = None;
             }
             Some(SelectionScope::FreeDesktop) => {
                 self.selected_items.clear();
@@ -455,6 +563,7 @@ impl SharedFenceState {
                 self.selection_anchor.clear();
                 self.free_selected_paths.clear();
                 self.free_selection_anchor = None;
+                self.free_focus_path = None;
             }
         }
         if had_free && self.free_selected_paths.is_empty() {
@@ -526,8 +635,7 @@ impl SharedFenceState {
     }
 
     pub fn build_free_desktop_snapshot(&self) -> FreeDesktopSnapshot {
-        let cell_w = self.config.preferences.icon_cell_w.clamp(48, 180);
-        let cell_h = self.config.preferences.icon_cell_h.clamp(56, 200);
+        let cell_size = self.free_desktop_cell_size();
         let icons = if self.config.hide_all_fences {
             Vec::new()
         } else {
@@ -551,11 +659,18 @@ impl SharedFenceState {
                 })
                 .collect()
         };
+        let toast = self
+            .free_toast
+            .as_ref()
+            .filter(|(_, at)| at.elapsed() < Duration::from_millis(1200))
+            .map(|(msg, _)| msg.clone());
         FreeDesktopSnapshot {
             virtual_bounds: self.topology.virtual_bounds(),
-            cell_size: (cell_w, cell_h),
+            cell_size,
             hide_all_fences: self.config.hide_all_fences,
             icons,
+            toast,
+            icon_epoch: self.free_icon_epoch,
         }
     }
 
@@ -713,10 +828,7 @@ impl SharedFenceState {
     /// Reconciles `free_icons` against all scanned desktop items, preserving existing free-icon
     /// coordinates and assigning non-overlapping grid slots for newly unfiled items.
     pub fn reconcile_free_icons_from_desktop(&mut self, scanned_desktop: &[FenceItem]) {
-        let cell = (
-            self.config.preferences.icon_cell_w.clamp(48, 180),
-            self.config.preferences.icon_cell_h.clamp(56, 200),
-        );
+        let cell = self.free_desktop_cell_size();
         let origin = self
             .topology
             .monitors()
@@ -1214,8 +1326,7 @@ impl SharedFenceState {
     ) {
         let monitors = self.topology.monitors().to_vec();
         let desktop_dirs = self.desktop_dirs.clone();
-        let step_x = self.config.preferences.icon_cell_w.clamp(48, 180);
-        let step_y = self.config.preferences.icon_cell_h.clamp(56, 200);
+        let (step_x, step_y) = self.free_desktop_cell_size();
         let (base_x, base_y) = drop_pos.unwrap_or_else(|| {
             monitors
                 .first()

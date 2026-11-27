@@ -1406,7 +1406,7 @@ pub fn render_fence_viewport(
                                 let tex = item_textures.get(idx).and_then(|t| t.as_ref());
                                 let selected = selected_set.contains(&idx);
                                 let is_cut =
-                                    cut_paths_snap.contains(&item.path.to_ascii_lowercase());
+                                    cut_paths_snap.contains(&normalize_path_key(&item.path));
                                 let is_renaming_item = renaming_item_idx == Some(idx);
                                 let row_resp = if is_renaming_item {
                                     let (r, cm, cn) = render_list_item_renaming(
@@ -1484,7 +1484,7 @@ pub fn render_fence_viewport(
                                                 item_textures.get(idx).and_then(|t| t.as_ref());
                                             let selected = selected_set.contains(&idx);
                                             let is_cut = cut_paths_snap
-                                                .contains(&item.path.to_ascii_lowercase());
+                                                .contains(&normalize_path_key(&item.path));
                                             let is_renaming_item = renaming_item_idx == Some(idx);
                                             let tile_resp = if is_renaming_item {
                                                 let (r, cm, cn) = render_grid_item_renaming(
@@ -2865,5 +2865,226 @@ mod tests {
             &shared,
         );
         assert!(r3.commands.contains(&FenceCommand::RefreshDesktop));
+        assert!(lock_unpoisoned(&shared).free_icon_epoch >= 1);
+    }
+
+    #[test]
+    fn free_desktop_hotkeys_navigate_type_ahead_clear_cut_and_open() {
+        let shared = test_shared(Vec::new());
+        {
+            let mut g = lock_unpoisoned(&shared);
+            let snap_key = g.config.active_topology.clone().unwrap();
+            g.config.snapshots.get_mut(&snap_key).unwrap().free_icons = vec![
+                DesktopIconPos {
+                    id: r"C:\Users\Demo\Desktop\Alpha.txt".into(),
+                    display_name: "Alpha.txt".into(),
+                    pos: Point { x: 20, y: 20 },
+                },
+                DesktopIconPos {
+                    id: r"C:\Users\Demo\Desktop\Beta.txt".into(),
+                    display_name: "Beta.txt".into(),
+                    pos: Point { x: 140, y: 20 },
+                },
+                DesktopIconPos {
+                    id: r"C:\Users\Demo\Desktop\Alps.txt".into(),
+                    display_name: "Alps.txt".into(),
+                    pos: Point { x: 20, y: 140 },
+                },
+                DesktopIconPos {
+                    id: r"C:\Users\Demo\Desktop\Gamma.txt".into(),
+                    display_name: "Gamma.txt".into(),
+                    pos: Point { x: 140, y: 140 },
+                },
+            ];
+        }
+
+        // Navigate Right from nothing -> selects first (Alpha), then Right -> Beta, Down -> Gamma.
+        let _ = handle_free_desktop_event(
+            desklite_win32::FreeDesktopEvent::Hotkey(desklite_win32::FreeDesktopHotkey::Navigate {
+                key: desklite_win32::FreeDesktopNavKey::Home,
+                shift: false,
+            }),
+            &shared,
+        );
+        assert_eq!(
+            lock_unpoisoned(&shared).free_selection_anchor.as_deref(),
+            Some(r"c:\users\demo\desktop\alpha.txt")
+        );
+
+        let r_right = handle_free_desktop_event(
+            desklite_win32::FreeDesktopEvent::Hotkey(desklite_win32::FreeDesktopHotkey::Navigate {
+                key: desklite_win32::FreeDesktopNavKey::Right,
+                shift: true,
+            }),
+            &shared,
+        );
+        assert!(r_right.needs_snapshot_refresh);
+        {
+            let g = lock_unpoisoned(&shared);
+            assert_eq!(g.free_selected_paths.len(), 2);
+            assert!(g
+                .free_selected_paths
+                .contains(r"c:\users\demo\desktop\alpha.txt"));
+            assert!(g
+                .free_selected_paths
+                .contains(r"c:\users\demo\desktop\beta.txt"));
+        }
+
+        let _ = handle_free_desktop_event(
+            desklite_win32::FreeDesktopEvent::Hotkey(desklite_win32::FreeDesktopHotkey::Navigate {
+                key: desklite_win32::FreeDesktopNavKey::End,
+                shift: false,
+            }),
+            &shared,
+        );
+        assert!(lock_unpoisoned(&shared)
+            .free_selected_paths
+            .contains(r"c:\users\demo\desktop\gamma.txt"));
+
+        // TypeAhead "al" -> matches Alpha then Alps.
+        let _ = handle_free_desktop_event(
+            desklite_win32::FreeDesktopEvent::Hotkey(desklite_win32::FreeDesktopHotkey::TypeAhead(
+                'a',
+            )),
+            &shared,
+        );
+        assert!(lock_unpoisoned(&shared)
+            .free_selected_paths
+            .contains(r"c:\users\demo\desktop\alpha.txt"));
+        let _ = handle_free_desktop_event(
+            desklite_win32::FreeDesktopEvent::Hotkey(desklite_win32::FreeDesktopHotkey::TypeAhead(
+                'l',
+            )),
+            &shared,
+        );
+        assert!(lock_unpoisoned(&shared)
+            .free_selected_paths
+            .contains(r"c:\users\demo\desktop\alps.txt"));
+
+        // OpenSelected on nonexistent path writes toast and keeps selection/anchor.
+        let r_open = handle_free_desktop_event(
+            desklite_win32::FreeDesktopEvent::Hotkey(
+                desklite_win32::FreeDesktopHotkey::OpenSelected,
+            ),
+            &shared,
+        );
+        assert!(r_open.needs_snapshot_refresh);
+        assert!(lock_unpoisoned(&shared).free_toast.is_some());
+        assert_eq!(
+            lock_unpoisoned(&shared).free_selection_anchor.as_deref(),
+            Some(r"c:\users\demo\desktop\alps.txt")
+        );
+
+        // ClearSelection clears free_selected_paths AND cut_paths.
+        lock_unpoisoned(&shared)
+            .cut_paths
+            .insert(r"c:\users\demo\desktop\alps.txt".into());
+        let r_clr = handle_free_desktop_event(
+            desklite_win32::FreeDesktopEvent::Hotkey(
+                desklite_win32::FreeDesktopHotkey::ClearSelection,
+            ),
+            &shared,
+        );
+        assert!(r_clr.needs_snapshot_refresh);
+        let g = lock_unpoisoned(&shared);
+        assert!(g.free_selected_paths.is_empty());
+        assert!(g.cut_paths.is_empty());
+    }
+
+    #[test]
+    fn free_desktop_dpi_scaling_rescale_and_paste_undo_restores_added_desktop_items() {
+        let dir = std::env::temp_dir().join(format!(
+            "desklite_stage2_undo_{}",
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let file_path = dir.join("note.txt");
+        std::fs::write(&file_path, "hi").unwrap();
+        let file_str = file_path.to_string_lossy().into_owned();
+        let dir_str = dir.to_string_lossy().into_owned();
+
+        let bucket = FenceSpec {
+            id: 101,
+            name: "Bucket".into(),
+            kind: FenceKind::IconGrid,
+            rect: Rect::new(20, 20, 320, 320),
+            collapsed: false,
+            locked: false,
+            role: Some(FenceRole::DesktopBucket),
+            portal_dir: None,
+            backdrop_alpha: 115,
+            layout_override: None,
+            items: vec![resolve_dropped_item(&file_path, 0)],
+        };
+        let shared = test_shared(vec![bucket]);
+        {
+            let mut g = lock_unpoisoned(&shared);
+            g.set_desktop_dirs(vec![dir_str.clone()]);
+            g.topology = DisplayTopology::try_from_monitors(vec![MonitorDescriptor {
+                device_key: "DISPLAY1".into(),
+                friendly_name: "Primary".into(),
+                rect: Rect::new(0, 0, 1920, 1080),
+                work_area: Rect::new(0, 0, 1920, 1032),
+                dpi_x: 144,
+                dpi_y: 144,
+                is_primary: true,
+            }])
+            .unwrap();
+            g.config.preferences.icon_cell_w = 102;
+            g.config.preferences.icon_cell_h = 144;
+            assert_eq!(g.free_desktop_cell_size(), (153, 216));
+
+            let snap_key = g.config.active_topology.clone().unwrap();
+            g.config.snapshots.get_mut(&snap_key).unwrap().free_icons = vec![
+                DesktopIconPos {
+                    id: file_str.clone(),
+                    display_name: "note.txt".into(),
+                    pos: Point { x: 20, y: 20 },
+                },
+                DesktopIconPos {
+                    id: dir.join("second.txt").to_string_lossy().into_owned(),
+                    display_name: "second.txt".into(),
+                    pos: Point { x: 104, y: 20 },
+                },
+            ];
+            let old_cell = (84, 96);
+            let new_cell = g.free_desktop_cell_size();
+            g.rescale_free_icons_for_cell_size(old_cell, new_cell);
+            let icons = g.config.active_free_icons();
+            assert!((icons[1].pos.x - icons[0].pos.x).abs() >= new_cell.0);
+            g.mark_free_desktop_dirty(None);
+            assert!(g.pending_repaint_free_desktop);
+
+            g.push_undo(UndoAction::PasteFiles {
+                fence_id: Some(101),
+                created_paths: Vec::new(),
+                moved_pairs: Vec::new(),
+                removed_from_fences: Vec::new(),
+                added_paths: vec![file_str.clone()],
+                is_portal: false,
+            });
+            // Remove from free_icons to mirror assign_desktop_items_to_bucket state.
+            let _ = g.config.remove_free_icon(&file_str);
+        }
+
+        let ctx = egui::Context::default();
+        let mut out = FenceUiOutput::default();
+        crate::undo::execute_undo(Some(101), &shared, &ctx, &mut out);
+        {
+            let g = lock_unpoisoned(&shared);
+            assert!(g.config.fences[0].items.is_empty());
+            assert!(
+                g.config
+                    .active_free_icons()
+                    .iter()
+                    .any(|ic| normalize_path_key(&ic.id) == normalize_path_key(&file_str)),
+                "undo of DesktopBucket PasteFiles should restore added_paths to free_icons"
+            );
+            assert!(g.free_icon_epoch >= 1);
+        }
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

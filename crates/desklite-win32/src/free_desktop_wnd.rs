@@ -38,8 +38,10 @@ use windows::Win32::Graphics::Dxgi::Common::DXGI_FORMAT_B8G8R8A8_UNORM;
 use windows::Win32::Graphics::Gdi::{
     AC_SRC_ALPHA, AC_SRC_OVER, BI_RGB, BITMAPINFO, BITMAPINFOHEADER, BLENDFUNCTION, BeginPaint,
     CLEARTYPE_QUALITY, CLIP_DEFAULT_PRECIS, ClientToScreen, CreateCompatibleDC, CreateDIBSection,
-    CreateFontW, DEFAULT_CHARSET, DEFAULT_PITCH, DIB_RGB_COLORS, DeleteDC, DeleteObject, EndPaint,
-    FF_DONTCARE, HBITMAP, HDC, HFONT, HGDIOBJ, OUT_DEFAULT_PRECIS, PAINTSTRUCT, SelectObject,
+    CreateFontW, CreateSolidBrush, DEFAULT_CHARSET, DEFAULT_PITCH, DIB_RGB_COLORS, DeleteDC,
+    DeleteObject, EndPaint, FF_DONTCARE, GetMonitorInfoW, HBITMAP, HBRUSH, HDC, HFONT, HGDIOBJ,
+    MONITOR_DEFAULTTOPRIMARY, MONITORINFO, MonitorFromPoint, OUT_DEFAULT_PRECIS, PAINTSTRUCT,
+    SelectObject, SetBkColor, SetTextColor,
 };
 use windows::Win32::System::Com::{COINIT_APARTMENTTHREADED, CoInitializeEx, CoUninitialize};
 use windows::Win32::System::LibraryLoader::GetModuleHandleW;
@@ -47,9 +49,10 @@ use windows::Win32::System::SystemServices::{MK_CONTROL, MK_SHIFT};
 use windows::Win32::UI::Controls::{EM_SETSEL, WM_MOUSELEAVE};
 use windows::Win32::UI::HiDpi::GetDpiForWindow;
 use windows::Win32::UI::Input::KeyboardAndMouse::{
-    GetCapture, GetKeyState, MAPVK_VSC_TO_VK_EX, MapVirtualKeyW, ReleaseCapture, SetCapture,
-    SetFocus, TME_LEAVE, TRACKMOUSEEVENT, TrackMouseEvent, VK_CONTROL, VK_DELETE, VK_ESCAPE,
-    VK_F2, VK_F5, VK_MENU, VK_PROCESSKEY, VK_RETURN, VK_SHIFT,
+    GetCapture, GetFocus, GetKeyState, MAPVK_VSC_TO_VK_EX, MapVirtualKeyW, ReleaseCapture,
+    SetCapture, SetFocus, TME_LEAVE, TRACKMOUSEEVENT, TrackMouseEvent, VK_CONTROL, VK_DELETE,
+    VK_DOWN, VK_END, VK_ESCAPE, VK_F2, VK_F5, VK_HOME, VK_LEFT, VK_MENU, VK_PROCESSKEY, VK_RETURN,
+    VK_RIGHT, VK_SHIFT, VK_UP,
 };
 use windows::Win32::UI::Shell::{
     DefSubclassProc, DragAcceptFiles, DragFinish, DragQueryFileW, DragQueryPoint, HDROP,
@@ -62,15 +65,15 @@ use windows::Win32::UI::WindowsAndMessaging::{
     LoadCursorW, PostMessageW, PostQuitMessage, RegisterClassExW, SW_HIDE, SW_SHOWNOACTIVATE,
     SWP_NOACTIVATE, SWP_NOZORDER, SendMessageW, SetCursor, SetForegroundWindow, SetWindowLongPtrW,
     SetWindowPos, ShowWindow, ShowWindowAsync, TranslateMessage, ULW_ALPHA, UpdateLayeredWindow,
-    WM_ACTIVATE, WM_APP, WM_CAPTURECHANGED, WM_CHAR, WM_CONTEXTMENU, WM_CREATE, WM_DESTROY,
-    WM_DPICHANGED, WM_DROPFILES, WM_ERASEBKGND, WM_GETDLGCODE, WM_KEYDOWN, WM_KILLFOCUS,
-    WM_LBUTTONDBLCLK, WM_LBUTTONDOWN, WM_LBUTTONUP, WM_MOUSEMOVE, WM_NCDESTROY, WM_PAINT,
-    WM_RBUTTONUP, WM_SETCURSOR, WM_SETFONT, WNDCLASSEXW, WS_BORDER, WS_CHILD, WS_EX_LAYERED,
-    WS_EX_TOOLWINDOW, WS_POPUP, WS_VISIBLE,
+    WM_ACTIVATE, WM_APP, WM_CAPTURECHANGED, WM_CHAR, WM_CONTEXTMENU, WM_CREATE, WM_CTLCOLOREDIT,
+    WM_DESTROY, WM_DPICHANGED, WM_DROPFILES, WM_ERASEBKGND, WM_GETDLGCODE, WM_KEYDOWN,
+    WM_KILLFOCUS, WM_LBUTTONDBLCLK, WM_LBUTTONDOWN, WM_LBUTTONUP, WM_MOUSEMOVE, WM_NCDESTROY,
+    WM_PAINT, WM_RBUTTONUP, WM_SETCURSOR, WM_SETFONT, WM_SYSKEYDOWN, WNDCLASSEXW, WS_CHILD,
+    WS_EX_LAYERED, WS_EX_TOOLWINDOW, WS_POPUP, WS_VISIBLE,
 };
 use windows::core::{HSTRING, w};
 
-use crate::icons::IconCache;
+use crate::icons::{DecodedIcon, IconCache};
 use crate::window_attach::attach_free_desktop_canvas;
 use crate::{Win32Error, win_err};
 
@@ -117,6 +120,10 @@ pub struct FreeDesktopSnapshot {
     pub hide_all_fences: bool,
     /// Icons to draw on the free desktop layer.
     pub icons: Vec<FreeDesktopRenderItem>,
+    /// Optional transient status toast rendered near the bottom of the primary work area.
+    pub toast: Option<String>,
+    /// Monotonically bumped epoch used to invalidate cached shell icons and D2D bitmaps.
+    pub icon_epoch: u64,
 }
 
 impl Default for FreeDesktopSnapshot {
@@ -126,8 +133,21 @@ impl Default for FreeDesktopSnapshot {
             cell_size: (84, 96),
             hide_all_fences: false,
             icons: Vec::new(),
+            toast: None,
+            icon_epoch: 0,
         }
     }
+}
+
+/// Directional navigation keys emitted from the native `FreeDesktop` window.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum FreeDesktopNavKey {
+    Left,
+    Right,
+    Up,
+    Down,
+    Home,
+    End,
 }
 
 /// Keyboard shortcut actions dispatched directly from the native `FreeDesktop` window.
@@ -143,6 +163,10 @@ pub enum FreeDesktopHotkey {
     Delete { permanent: bool },
     Refresh,
     ClearSelection,
+    OpenSelected,
+    Properties,
+    Navigate { key: FreeDesktopNavKey, shift: bool },
+    TypeAhead(char),
 }
 
 /// Events emitted by the `FreeDesktop` native Win32 canvas toward the app event loop.
@@ -478,6 +502,8 @@ struct DesktopRenderer {
     cached_font_size: f32,
     icon_cache: IconCache,
     bitmap_cache: HashMap<String, ID2D1Bitmap>,
+    last_icon_epoch: u64,
+    last_icon_dim: u32,
     surface: Option<LayeredSurface>,
 }
 
@@ -499,6 +525,8 @@ impl DesktopRenderer {
             cached_font_size: 0.0,
             icon_cache,
             bitmap_cache: HashMap::new(),
+            last_icon_epoch: 0,
+            last_icon_dim: 0,
             surface: None,
         })
     }
@@ -537,7 +565,7 @@ impl DesktopRenderer {
 
         let fmt = unsafe {
             self.dwrite_factory.CreateTextFormat(
-                w!("Segoe UI"),
+                w!("Microsoft YaHei UI"),
                 None,
                 DWRITE_FONT_WEIGHT_NORMAL,
                 DWRITE_FONT_STYLE_NORMAL,
@@ -546,6 +574,17 @@ impl DesktopRenderer {
                 w!(""),
             )
         }
+        .or_else(|_| unsafe {
+            self.dwrite_factory.CreateTextFormat(
+                w!("Segoe UI"),
+                None,
+                DWRITE_FONT_WEIGHT_NORMAL,
+                DWRITE_FONT_STYLE_NORMAL,
+                DWRITE_FONT_STRETCH_NORMAL,
+                font_size,
+                w!(""),
+            )
+        })
         .map_err(|e| win_err("CreateTextFormat", e))?;
 
         unsafe {
@@ -583,6 +622,7 @@ impl DesktopRenderer {
         &mut self,
         rt: &ID2D1DCRenderTarget,
         path: &str,
+        target_dim: u32,
     ) -> Option<ID2D1Bitmap> {
         if let Some(bmp) = self.bitmap_cache.get(path) {
             return Some(bmp.clone());
@@ -591,6 +631,11 @@ impl DesktopRenderer {
         if decoded.width == 0 || decoded.height == 0 {
             return None;
         }
+        let resampled = downsample_pbgra_hq(decoded, target_dim.max(16));
+        let (bmp_w, bmp_h, pixels): (u32, u32, &[u8]) = match &resampled {
+            Some((w, h, buf)) => (*w, *h, buf.as_slice()),
+            None => (decoded.width, decoded.height, decoded.pbgra.as_slice()),
+        };
         let props = D2D1_BITMAP_PROPERTIES {
             pixelFormat: D2D1_PIXEL_FORMAT {
                 format: DXGI_FORMAT_B8G8R8A8_UNORM,
@@ -602,11 +647,11 @@ impl DesktopRenderer {
         let bmp = unsafe {
             rt.CreateBitmap(
                 D2D_SIZE_U {
-                    width: decoded.width,
-                    height: decoded.height,
+                    width: bmp_w,
+                    height: bmp_h,
                 },
-                Some(decoded.pbgra.as_ptr().cast()),
-                decoded.width.saturating_mul(4),
+                Some(pixels.as_ptr().cast()),
+                bmp_w.saturating_mul(4),
                 &props,
             )
         }
@@ -621,7 +666,7 @@ impl DesktopRenderer {
         snapshot: &FreeDesktopSnapshot,
         hovered_path: Option<&str>,
         marquee: Option<(Point, Point)>,
-        active_rename_path: Option<&str>,
+        active_rename: Option<(&str, Rect)>,
     ) {
         let bounds = normalized_bounds(snapshot.virtual_bounds);
         let width = bounds.width().max(1);
@@ -649,6 +694,19 @@ impl DesktopRenderer {
         let (cw, ch) = effective_cell_size(snapshot.cell_size);
         let dpi = unsafe { GetDpiForWindow(hwnd) }.max(96) as f32;
         let font_size = compute_label_font_size(cw, ch, dpi);
+        let (icon_dim, _) = free_cell_metrics(cw as f32, ch as f32, font_size);
+        let target_icon_px = (icon_dim.round() as u32).max(16);
+
+        if snapshot.icon_epoch != self.last_icon_epoch {
+            self.icon_cache.clear();
+            self.bitmap_cache.clear();
+            self.last_icon_epoch = snapshot.icon_epoch;
+        }
+        if self.last_icon_dim != target_icon_px {
+            self.bitmap_cache.clear();
+            self.last_icon_dim = target_icon_px;
+        }
+
         let text_format = match self.ensure_text_format(font_size) {
             Ok(fmt) => fmt,
             Err(_) => return,
@@ -683,13 +741,14 @@ impl DesktopRenderer {
             }));
         }
 
+        let brushes = RenderBrushes::new(&rt);
+        let dwrite = self.dwrite_factory.clone();
         if !snapshot.hide_all_fences {
-            let brushes = RenderBrushes::new(&rt);
-            let dwrite = self.dwrite_factory.clone();
+            let rename_path = active_rename.map(|(p, _)| p);
             for item in &snapshot.icons {
                 let is_hovered = hovered_path == Some(item.path.as_str());
-                let hide_label = active_rename_path == Some(item.path.as_str());
-                let bmp = self.get_or_create_bitmap(&rt, &item.path);
+                let hide_label = rename_path == Some(item.path.as_str());
+                let bmp = self.get_or_create_bitmap(&rt, &item.path, target_icon_px);
                 draw_icon_cell(
                     &rt,
                     &dwrite,
@@ -705,9 +764,17 @@ impl DesktopRenderer {
                 );
             }
 
+            if let Some((_, rename_rect)) = active_rename {
+                draw_rename_backdrop(&rt, &brushes, rename_rect);
+            }
+
             if let Some((origin, current)) = marquee {
                 draw_marquee_box(&rt, &brushes, bounds, origin, current);
             }
+        }
+
+        if let Some(toast_msg) = snapshot.toast.as_deref().filter(|s| !s.is_empty()) {
+            draw_toast_pill(&rt, &dwrite, &text_format, &brushes, bounds, toast_msg);
         }
 
         let end_res = unsafe { rt.EndDraw(None, None) };
@@ -758,22 +825,110 @@ struct RenderBrushes {
     text: Option<ID2D1SolidColorBrush>,
     marquee_fill: Option<ID2D1SolidColorBrush>,
     marquee_border: Option<ID2D1SolidColorBrush>,
+    rename_fill: Option<ID2D1SolidColorBrush>,
+    rename_border: Option<ID2D1SolidColorBrush>,
+    toast_fill: Option<ID2D1SolidColorBrush>,
+    toast_border: Option<ID2D1SolidColorBrush>,
 }
 
 impl RenderBrushes {
     fn new(rt: &ID2D1DCRenderTarget) -> Self {
         Self {
-            sel_fill: make_brush(rt, 88.0 / 255.0, 156.0 / 255.0, 250.0 / 255.0, 0.28),
-            sel_border: make_brush(rt, 135.0 / 255.0, 196.0 / 255.0, 1.0, 0.62),
+            sel_fill: make_brush(rt, 36.0 / 255.0, 98.0 / 255.0, 184.0 / 255.0, 0.36),
+            sel_border: make_brush(rt, 145.0 / 255.0, 204.0 / 255.0, 1.0, 0.52),
             hover_fill: make_brush(rt, 1.0, 1.0, 1.0, 0.13),
             hover_border: make_brush(rt, 1.0, 1.0, 1.0, 0.22),
             fallback_fill: make_brush(rt, 0.72, 0.78, 0.86, 0.75),
-            shadow: make_brush(rt, 0.0, 0.0, 0.0, 0.78),
+            shadow: make_brush(rt, 0.0, 0.0, 0.0, 0.62),
             text: make_brush(rt, 244.0 / 255.0, 247.0 / 255.0, 1.0, 0.98),
             marquee_fill: make_brush(rt, 64.0 / 255.0, 152.0 / 255.0, 1.0, 0.22),
             marquee_border: make_brush(rt, 110.0 / 255.0, 185.0 / 255.0, 1.0, 0.86),
+            rename_fill: make_brush(rt, 28.0 / 255.0, 34.0 / 255.0, 44.0 / 255.0, 0.96),
+            rename_border: make_brush(rt, 120.0 / 255.0, 185.0 / 255.0, 1.0, 0.80),
+            toast_fill: make_brush(rt, 22.0 / 255.0, 26.0 / 255.0, 34.0 / 255.0, 0.90),
+            toast_border: make_brush(rt, 1.0, 1.0, 1.0, 0.16),
         }
     }
+}
+
+/// Downsamples a 32bpp premultiplied BGRA bitmap with exact area-averaging when larger than
+/// `max_dim`, avoiding jagged `LINEAR` >4x downscaling in Direct2D.
+fn downsample_pbgra_hq(src: &DecodedIcon, max_dim: u32) -> Option<(u32, u32, Vec<u8>)> {
+    let sw = src.width;
+    let sh = src.height;
+    if sw == 0 || sh == 0 || max_dim == 0 || (sw <= max_dim && sh <= max_dim) {
+        return None;
+    }
+    let expected_len = (sw as usize).saturating_mul(sh as usize).saturating_mul(4);
+    if src.pbgra.len() < expected_len {
+        return None;
+    }
+
+    let (dw, dh) = if sw >= sh {
+        let h = ((u64::from(sh) * u64::from(max_dim) + u64::from(sw) / 2) / u64::from(sw)).max(1)
+            as u32;
+        (max_dim, h)
+    } else {
+        let w = ((u64::from(sw) * u64::from(max_dim) + u64::from(sh) / 2) / u64::from(sh)).max(1)
+            as u32;
+        (w, max_dim)
+    };
+
+    let mut dst = vec![0u8; (dw as usize) * (dh as usize) * 4];
+    let scale_x = sw as f32 / dw as f32;
+    let scale_y = sh as f32 / dh as f32;
+
+    for dy in 0..dh {
+        let sy0 = dy as f32 * scale_y;
+        let sy1 = (dy + 1) as f32 * scale_y;
+        let iy0 = (sy0.floor() as u32).min(sh - 1);
+        let iy1 = (sy1.ceil() as u32).clamp(iy0 + 1, sh);
+
+        for dx in 0..dw {
+            let sx0 = dx as f32 * scale_x;
+            let sx1 = (dx + 1) as f32 * scale_x;
+            let ix0 = (sx0.floor() as u32).min(sw - 1);
+            let ix1 = (sx1.ceil() as u32).clamp(ix0 + 1, sw);
+
+            let mut acc_b = 0.0f32;
+            let mut acc_g = 0.0f32;
+            let mut acc_r = 0.0f32;
+            let mut acc_a = 0.0f32;
+            let mut acc_w = 0.0f32;
+
+            for iy in iy0..iy1 {
+                let wy = (sy1.min((iy + 1) as f32) - sy0.max(iy as f32)).max(0.0);
+                if wy <= 0.0 {
+                    continue;
+                }
+                let row_off = (iy as usize) * (sw as usize) * 4;
+                for ix in ix0..ix1 {
+                    let wx = (sx1.min((ix + 1) as f32) - sx0.max(ix as f32)).max(0.0);
+                    let w = wx * wy;
+                    if w <= 0.0 {
+                        continue;
+                    }
+                    let off = row_off + (ix as usize) * 4;
+                    acc_b += f32::from(src.pbgra[off]) * w;
+                    acc_g += f32::from(src.pbgra[off + 1]) * w;
+                    acc_r += f32::from(src.pbgra[off + 2]) * w;
+                    acc_a += f32::from(src.pbgra[off + 3]) * w;
+                    acc_w += w;
+                }
+            }
+
+            let out_off = ((dy as usize) * (dw as usize) + (dx as usize)) * 4;
+            if acc_w > 0.0 {
+                let inv = 1.0 / acc_w;
+                dst[out_off] = (acc_b * inv).round().clamp(0.0, 255.0) as u8;
+                dst[out_off + 1] = (acc_g * inv).round().clamp(0.0, 255.0) as u8;
+                dst[out_off + 2] = (acc_r * inv).round().clamp(0.0, 255.0) as u8;
+                dst[out_off + 3] = (acc_a * inv).round().clamp(0.0, 255.0) as u8;
+            }
+        }
+    }
+
+    Some((dw, dh, dst))
 }
 
 fn make_brush(
@@ -866,10 +1021,10 @@ fn draw_icon_cell(
     let ch = cell_size.1 as f32;
 
     let cell_rect = D2D_RECT_F {
-        left: lx + 2.0,
-        top: ly + 2.0,
-        right: lx + cw - 2.0,
-        bottom: ly + ch - 2.0,
+        left: lx + 3.0,
+        top: ly + 3.0,
+        right: lx + cw - 3.0,
+        bottom: ly + ch - 3.0,
     };
     let stroke_rect = D2D_RECT_F {
         left: cell_rect.left + 0.5,
@@ -881,13 +1036,13 @@ fn draw_icon_cell(
     if item.selected {
         let fill_rr = D2D1_ROUNDED_RECT {
             rect: cell_rect,
-            radiusX: 6.0,
-            radiusY: 6.0,
+            radiusX: 7.0,
+            radiusY: 7.0,
         };
         let stroke_rr = D2D1_ROUNDED_RECT {
             rect: stroke_rect,
-            radiusX: 5.5,
-            radiusY: 5.5,
+            radiusX: 6.5,
+            radiusY: 6.5,
         };
         if let Some(fill) = &brushes.sel_fill {
             unsafe { rt.FillRoundedRectangle(&fill_rr, fill) };
@@ -898,13 +1053,13 @@ fn draw_icon_cell(
     } else if is_hovered {
         let fill_rr = D2D1_ROUNDED_RECT {
             rect: cell_rect,
-            radiusX: 6.0,
-            radiusY: 6.0,
+            radiusX: 7.0,
+            radiusY: 7.0,
         };
         let stroke_rr = D2D1_ROUNDED_RECT {
             rect: stroke_rect,
-            radiusX: 5.5,
-            radiusY: 5.5,
+            radiusX: 6.5,
+            radiusY: 6.5,
         };
         if let Some(fill) = &brushes.hover_fill {
             unsafe { rt.FillRoundedRectangle(&fill_rr, fill) };
@@ -975,21 +1130,23 @@ fn draw_icon_cell(
     };
     let label_utf16: Vec<u16> = label_text.encode_utf16().collect();
     if let Some(shadow) = &brushes.shadow {
-        let shadow_rect = D2D_RECT_F {
-            left: label_rect.left + 1.0,
-            top: label_rect.top + 1.0,
-            right: label_rect.right + 1.0,
-            bottom: label_rect.bottom + 1.0,
-        };
-        unsafe {
-            rt.DrawText(
-                &label_utf16,
-                text_format,
-                &shadow_rect,
-                shadow,
-                D2D1_DRAW_TEXT_OPTIONS_CLIP,
-                DWRITE_MEASURING_MODE_NATURAL,
-            );
+        for (dx, dy) in [(0.0f32, 1.0f32), (1.0f32, 1.0f32)] {
+            let shadow_rect = D2D_RECT_F {
+                left: label_rect.left + dx,
+                top: label_rect.top + dy,
+                right: label_rect.right + dx,
+                bottom: label_rect.bottom + dy,
+            };
+            unsafe {
+                rt.DrawText(
+                    &label_utf16,
+                    text_format,
+                    &shadow_rect,
+                    shadow,
+                    D2D1_DRAW_TEXT_OPTIONS_CLIP,
+                    DWRITE_MEASURING_MODE_NATURAL,
+                );
+            }
         }
     }
     if let Some(text_brush) = &brushes.text {
@@ -998,6 +1155,124 @@ fn draw_icon_cell(
                 &label_utf16,
                 text_format,
                 &label_rect,
+                text_brush,
+                D2D1_DRAW_TEXT_OPTIONS_CLIP,
+                DWRITE_MEASURING_MODE_NATURAL,
+            );
+        }
+    }
+}
+
+fn draw_rename_backdrop(
+    rt: &ID2D1DCRenderTarget,
+    brushes: &RenderBrushes,
+    client_rect: Rect,
+) {
+    let rc = D2D_RECT_F {
+        left: (client_rect.left - 3) as f32,
+        top: (client_rect.top - 2) as f32,
+        right: (client_rect.right + 3) as f32,
+        bottom: (client_rect.bottom + 2) as f32,
+    };
+    let stroke_rc = D2D_RECT_F {
+        left: rc.left + 0.5,
+        top: rc.top + 0.5,
+        right: (rc.right - 0.5).max(rc.left + 0.5),
+        bottom: (rc.bottom - 0.5).max(rc.top + 0.5),
+    };
+    let fill_rr = D2D1_ROUNDED_RECT {
+        rect: rc,
+        radiusX: 5.0,
+        radiusY: 5.0,
+    };
+    let stroke_rr = D2D1_ROUNDED_RECT {
+        rect: stroke_rc,
+        radiusX: 4.5,
+        radiusY: 4.5,
+    };
+    if let Some(fill) = &brushes.rename_fill {
+        unsafe { rt.FillRoundedRectangle(&fill_rr, fill) };
+    }
+    if let Some(border) = &brushes.rename_border {
+        unsafe { rt.DrawRoundedRectangle(&stroke_rr, border, 1.0, None) };
+    }
+}
+
+fn draw_toast_pill(
+    rt: &ID2D1DCRenderTarget,
+    dwrite: &IDWriteFactory,
+    text_format: &IDWriteTextFormat,
+    brushes: &RenderBrushes,
+    bounds: Rect,
+    text: &str,
+) {
+    let mut work = bounds;
+    let center_pt = POINT {
+        x: bounds.left + bounds.width() / 2,
+        y: bounds.top + bounds.height() / 2,
+    };
+    let mon = unsafe { MonitorFromPoint(center_pt, MONITOR_DEFAULTTOPRIMARY) };
+    let mut mi = MONITORINFO {
+        cbSize: size_of::<MONITORINFO>() as u32,
+        ..Default::default()
+    };
+    if unsafe { GetMonitorInfoW(mon, &mut mi) }.as_bool() {
+        work = Rect::new(mi.rcWork.left, mi.rcWork.top, mi.rcWork.right, mi.rcWork.bottom);
+    }
+
+    let max_w = ((work.width() as f32) - 48.0).clamp(160.0, 520.0);
+    let metrics = measure_dwrite_text(dwrite, text_format, text, max_w, 64.0);
+    let (tw, th) = metrics
+        .map(|m| (m.widthIncludingTrailingWhitespace.ceil().max(48.0), m.height.ceil().max(18.0)))
+        .unwrap_or((160.0, 20.0));
+
+    let pill_w = (tw + 28.0).min(max_w + 28.0);
+    let pill_h = th + 14.0;
+    let local_center_x = (work.left + work.width() / 2 - bounds.left) as f32;
+    let local_bottom = (work.bottom - bounds.top) as f32 - 36.0;
+    let left = (local_center_x - pill_w * 0.5).round();
+    let top = (local_bottom - pill_h).round().max(16.0);
+    let rc = D2D_RECT_F {
+        left,
+        top,
+        right: left + pill_w,
+        bottom: top + pill_h,
+    };
+    let stroke_rc = D2D_RECT_F {
+        left: rc.left + 0.5,
+        top: rc.top + 0.5,
+        right: rc.right - 0.5,
+        bottom: rc.bottom - 0.5,
+    };
+    let fill_rr = D2D1_ROUNDED_RECT {
+        rect: rc,
+        radiusX: 10.0,
+        radiusY: 10.0,
+    };
+    let stroke_rr = D2D1_ROUNDED_RECT {
+        rect: stroke_rc,
+        radiusX: 9.5,
+        radiusY: 9.5,
+    };
+    if let Some(fill) = &brushes.toast_fill {
+        unsafe { rt.FillRoundedRectangle(&fill_rr, fill) };
+    }
+    if let Some(border) = &brushes.toast_border {
+        unsafe { rt.DrawRoundedRectangle(&stroke_rr, border, 1.0, None) };
+    }
+    let text_rc = D2D_RECT_F {
+        left: rc.left + 12.0,
+        top: rc.top + 7.0,
+        right: rc.right - 12.0,
+        bottom: rc.bottom - 7.0,
+    };
+    let utf16: Vec<u16> = text.encode_utf16().collect();
+    if let Some(text_brush) = &brushes.text {
+        unsafe {
+            rt.DrawText(
+                &utf16,
+                text_format,
+                &text_rc,
                 text_brush,
                 D2D1_DRAW_TEXT_OPTIONS_CLIP,
                 DWRITE_MEASURING_MODE_NATURAL,
@@ -1057,6 +1332,7 @@ struct InlineRenameState {
     edit_hwnd: HWND,
     font: HFONT,
     old_path: String,
+    client_rect: Rect,
 }
 
 struct WindowState {
@@ -1073,7 +1349,19 @@ struct WindowState {
     tracking_mouse_leave: bool,
     suppress_next_lbutton_up: bool,
     inline_rename: Option<InlineRenameState>,
+    rename_bg_brush: HBRUSH,
     window_shown: bool,
+}
+
+impl Drop for WindowState {
+    fn drop(&mut self) {
+        if !self.rename_bg_brush.is_invalid() {
+            unsafe {
+                let _ = DeleteObject(HGDIOBJ(self.rename_bg_brush.0));
+            }
+            self.rename_bg_brush = HBRUSH::default();
+        }
+    }
 }
 
 impl WindowState {
@@ -1092,14 +1380,19 @@ impl WindowState {
             } => Some((*origin, *current)),
             _ => None,
         };
-        let rename_path = self.inline_rename.as_ref().map(|r| r.old_path.clone());
+        let active_rename = self
+            .inline_rename
+            .as_ref()
+            .map(|r| (r.old_path.clone(), r.client_rect));
         let hovered = self.hovered_path.clone();
         self.renderer.paint_and_commit(
             self.hwnd,
             &self.snapshot,
             hovered.as_deref(),
             marquee,
-            rename_path.as_deref(),
+            active_rename
+                .as_ref()
+                .map(|(path, rc)| (path.as_str(), *rc)),
         );
     }
 
@@ -1154,8 +1447,12 @@ impl WindowState {
         // Close any previous edit cleanly without confusing the newly requested rename session.
         self.destroy_inline_rename_silently();
 
-        let client_rect =
-            compute_rename_edit_client_rect(req.item_screen_rect, self.snapshot.virtual_bounds);
+        let dpi = unsafe { GetDpiForWindow(self.hwnd) }.max(96) as f32;
+        let client_rect = compute_rename_edit_client_rect_for_dpi(
+            req.item_screen_rect,
+            self.snapshot.virtual_bounds,
+            dpi,
+        );
         let hinstance = unsafe { GetModuleHandleW(None) }.ok();
         let text_w = HSTRING::from(req.current_name.as_str());
 
@@ -1166,7 +1463,6 @@ impl WindowState {
                 &text_w,
                 WS_CHILD
                     | WS_VISIBLE
-                    | WS_BORDER
                     | windows::Win32::UI::WindowsAndMessaging::WINDOW_STYLE(
                         (ES_AUTOHSCROLL | ES_CENTER) as u32,
                     ),
@@ -1185,10 +1481,9 @@ impl WindowState {
         };
 
         let (cw, ch) = effective_cell_size(self.snapshot.cell_size);
-        let dpi = unsafe { GetDpiForWindow(self.hwnd) }.max(96) as f32;
         let font_px = -(compute_label_font_size(cw, ch, dpi).round() as i32);
         let font = unsafe {
-            CreateFontW(
+            let primary = CreateFontW(
                 font_px,
                 0,
                 0,
@@ -1202,8 +1497,28 @@ impl WindowState {
                 CLIP_DEFAULT_PRECIS,
                 CLEARTYPE_QUALITY,
                 (FF_DONTCARE.0 | DEFAULT_PITCH.0) as u32,
-                w!("Segoe UI"),
-            )
+                w!("Microsoft YaHei UI"),
+            );
+            if primary.is_invalid() {
+                CreateFontW(
+                    font_px,
+                    0,
+                    0,
+                    0,
+                    400,
+                    0,
+                    0,
+                    0,
+                    DEFAULT_CHARSET,
+                    OUT_DEFAULT_PRECIS,
+                    CLIP_DEFAULT_PRECIS,
+                    CLEARTYPE_QUALITY,
+                    (FF_DONTCARE.0 | DEFAULT_PITCH.0) as u32,
+                    w!("Segoe UI"),
+                )
+            } else {
+                primary
+            }
         };
         if !font.is_invalid() {
             unsafe {
@@ -1240,8 +1555,9 @@ impl WindowState {
             edit_hwnd,
             font,
             old_path: req.path,
+            client_rect,
         });
-        // Repaint so underlying icon label hides immediately beneath the EDIT control.
+        // Repaint so underlying icon label hides immediately and rounded dark container appears.
         self.repaint();
 
         let stem_len = rename_stem_utf16_len(&req.current_name);
@@ -1278,6 +1594,11 @@ impl WindowState {
         };
 
         cleanup_rename_controls(&rename);
+        unsafe {
+            if GetForegroundWindow() == self.hwnd {
+                let _ = SetFocus(Some(self.hwnd));
+            }
+        }
         self.repaint();
         self.emit(event);
     }
@@ -1285,6 +1606,11 @@ impl WindowState {
     fn destroy_inline_rename_silently(&mut self) {
         if let Some(rename) = self.inline_rename.take() {
             cleanup_rename_controls(&rename);
+            unsafe {
+                if GetForegroundWindow() == self.hwnd {
+                    let _ = SetFocus(Some(self.hwnd));
+                }
+            }
             self.repaint();
         }
     }
@@ -1354,6 +1680,7 @@ fn run_window_thread(
         let _ = RegisterClassExW(&wc);
     }
 
+    let rename_bg_brush = unsafe { CreateSolidBrush(COLORREF(0x002C_221C)) };
     let boxed_state = Box::new(WindowState {
         hwnd: HWND::default(),
         hwnd_slot: Arc::clone(&hwnd_slot),
@@ -1368,6 +1695,7 @@ fn run_window_thread(
         tracking_mouse_leave: false,
         suppress_next_lbutton_up: false,
         inline_rename: None,
+        rename_bg_brush,
         window_shown: false,
     });
     let state_ptr = Box::into_raw(boxed_state);
@@ -1578,6 +1906,36 @@ unsafe extern "system" fn free_desktop_wnd_proc(
             }
             unsafe { DefWindowProcW(hwnd, msg, wparam, lparam) }
         }
+        WM_CTLCOLOREDIT => {
+            if !state.rename_bg_brush.is_invalid() {
+                let hdc = HDC(wparam.0 as *mut c_void);
+                unsafe {
+                    let _ = SetTextColor(hdc, COLORREF(0x00FF_F7F4));
+                    let _ = SetBkColor(hdc, COLORREF(0x002C_221C));
+                }
+                return LRESULT(state.rename_bg_brush.0 as isize);
+            }
+            unsafe { DefWindowProcW(hwnd, msg, wparam, lparam) }
+        }
+        WM_SYSKEYDOWN => {
+            let is_repeat = (lparam.0 & (1 << 30)) != 0;
+            let vk = (wparam.0 & 0xFFFF) as u32;
+            let alt_down = (lparam.0 & (1 << 29)) != 0
+                || (unsafe { GetKeyState(VK_MENU.0 as i32) } as u16 & 0x8000) != 0;
+            let ctrl_down = (unsafe { GetKeyState(VK_CONTROL.0 as i32) } as u16 & 0x8000) != 0;
+            let shift_down = (unsafe { GetKeyState(VK_SHIFT.0 as i32) } as u16 & 0x8000) != 0;
+            if !is_repeat
+                && state.inline_rename.is_none()
+                && vk == u32::from(VK_RETURN.0)
+                && alt_down
+                && !ctrl_down
+                && !shift_down
+            {
+                state.emit(FreeDesktopEvent::Hotkey(FreeDesktopHotkey::Properties));
+                return LRESULT(0);
+            }
+            unsafe { DefWindowProcW(hwnd, msg, wparam, lparam) }
+        }
         WM_KEYDOWN => {
             if state.inline_rename.is_none()
                 && let Some(hk) = decode_free_desktop_hotkey(wparam, lparam)
@@ -1628,15 +1986,35 @@ unsafe extern "system" fn free_desktop_wnd_proc(
                     state.finish_inline_rename(false);
                     state.emit(FreeDesktopEvent::FocusLost);
                 }
+                return unsafe { DefWindowProcW(hwnd, msg, wparam, lparam) };
             }
-            LRESULT(0)
-        }
-        WM_CHAR => {
-            // Suppress system beep on Enter/Esc inside single-line EDIT control.
-            if matches!(wparam.0, 0x0A | 0x0D | 0x1B) {
+            if let Some(rename) = &state.inline_rename {
+                unsafe {
+                    let _ = SetFocus(Some(rename.edit_hwnd));
+                }
                 return LRESULT(0);
             }
-            unsafe { DefSubclassProc(hwnd, msg, wparam, lparam) }
+            unsafe {
+                let _ = SetFocus(Some(hwnd));
+                DefWindowProcW(hwnd, msg, wparam, lparam)
+            }
+        }
+        WM_CHAR => {
+            if state.inline_rename.is_none() {
+                let ctrl_down =
+                    (unsafe { GetKeyState(VK_CONTROL.0 as i32) } as u16 & 0x8000) != 0;
+                let alt_down = (unsafe { GetKeyState(VK_MENU.0 as i32) } as u16 & 0x8000) != 0;
+                if !ctrl_down
+                    && !alt_down
+                    && let Some(ch) = char::from_u32(wparam.0 as u32)
+                    && ch >= ' '
+                    && ch != '\x7f'
+                {
+                    state.emit(FreeDesktopEvent::Hotkey(FreeDesktopHotkey::TypeAhead(ch)));
+                    return LRESULT(0);
+                }
+            }
+            unsafe { DefWindowProcW(hwnd, msg, wparam, lparam) }
         }
         WM_KILLFOCUS => {
             let gaining = HWND(wparam.0 as *mut c_void);
@@ -1666,10 +2044,19 @@ unsafe extern "system" fn free_desktop_wnd_proc(
     }
 }
 
-fn decode_free_desktop_hotkey(wparam: WPARAM, lparam: LPARAM) -> Option<FreeDesktopHotkey> {
-    if (lparam.0 & (1 << 30)) != 0 {
-        return None;
+fn ensure_window_foreground_and_focus(hwnd: HWND) {
+    unsafe {
+        if GetForegroundWindow() != hwnd {
+            let _ = SetForegroundWindow(hwnd);
+        }
+        if GetFocus() != hwnd {
+            let _ = SetFocus(Some(hwnd));
+        }
     }
+}
+
+fn decode_free_desktop_hotkey(wparam: WPARAM, lparam: LPARAM) -> Option<FreeDesktopHotkey> {
+    let is_repeat = (lparam.0 & (1 << 30)) != 0;
     let mut vk = (wparam.0 & 0xFFFF) as u32;
     if vk == u32::from(VK_PROCESSKEY.0) {
         let scancode = ((lparam.0 >> 16) & 0xFF) as u32;
@@ -1682,6 +2069,9 @@ fn decode_free_desktop_hotkey(wparam: WPARAM, lparam: LPARAM) -> Option<FreeDesk
     let shift_down = (unsafe { GetKeyState(VK_SHIFT.0 as i32) } as u16 & 0x8000) != 0;
 
     if ctrl_down && !alt_down {
+        if is_repeat {
+            return None;
+        }
         return match (vk, shift_down) {
             (0x41, false) => Some(FreeDesktopHotkey::SelectAll),
             (0x43, false) => Some(FreeDesktopHotkey::Copy),
@@ -1693,6 +2083,33 @@ fn decode_free_desktop_hotkey(wparam: WPARAM, lparam: LPARAM) -> Option<FreeDesk
         };
     }
     if !ctrl_down && !alt_down {
+        let nav_key = if vk == u32::from(VK_LEFT.0) {
+            Some(FreeDesktopNavKey::Left)
+        } else if vk == u32::from(VK_RIGHT.0) {
+            Some(FreeDesktopNavKey::Right)
+        } else if vk == u32::from(VK_UP.0) {
+            Some(FreeDesktopNavKey::Up)
+        } else if vk == u32::from(VK_DOWN.0) {
+            Some(FreeDesktopNavKey::Down)
+        } else if vk == u32::from(VK_HOME.0) {
+            Some(FreeDesktopNavKey::Home)
+        } else if vk == u32::from(VK_END.0) {
+            Some(FreeDesktopNavKey::End)
+        } else {
+            None
+        };
+        if let Some(key) = nav_key {
+            return Some(FreeDesktopHotkey::Navigate {
+                key,
+                shift: shift_down,
+            });
+        }
+        if is_repeat {
+            return None;
+        }
+        if vk == u32::from(VK_RETURN.0) && !shift_down {
+            return Some(FreeDesktopHotkey::OpenSelected);
+        }
         if vk == u32::from(VK_F2.0) && !shift_down {
             return Some(FreeDesktopHotkey::Rename);
         }
@@ -1714,11 +2131,7 @@ fn decode_free_desktop_hotkey(wparam: WPARAM, lparam: LPARAM) -> Option<FreeDesk
 fn handle_lbutton_down(state: &mut WindowState, wparam: WPARAM, lparam: LPARAM) {
     state.finish_inline_rename(false);
     state.suppress_next_lbutton_up = false;
-    unsafe {
-        if GetForegroundWindow() != state.hwnd {
-            let _ = SetForegroundWindow(state.hwnd);
-        }
-    }
+    ensure_window_foreground_and_focus(state.hwnd);
 
     let screen_pt = screen_point_from_lparam(lparam, state.snapshot.virtual_bounds);
     let ctrl = (wparam.0 & MK_CONTROL.0 as usize) != 0;
@@ -1862,6 +2275,7 @@ fn handle_lbutton_dblclk(state: &mut WindowState, lparam: LPARAM) {
 }
 
 fn handle_rbutton_up(state: &mut WindowState, lparam: LPARAM) {
+    ensure_window_foreground_and_focus(state.hwnd);
     let mut pt = POINT {
         x: signed_loword(lparam.0),
         y: signed_hiword(lparam.0),
@@ -1992,16 +2406,34 @@ fn hit_test_icon_at(snapshot: &FreeDesktopSnapshot, screen_pt: Point) -> Option<
         })
 }
 
-fn compute_rename_edit_client_rect(item_screen_rect: Rect, virtual_bounds: Rect) -> Rect {
+fn compute_rename_edit_client_rect_for_dpi(
+    item_screen_rect: Rect,
+    virtual_bounds: Rect,
+    dpi: f32,
+) -> Rect {
     let bounds = normalized_bounds(virtual_bounds);
     let item_w = item_screen_rect.width().max(72);
     let item_h = item_screen_rect.height().max(48);
-    let edit_h = (item_h / 3).clamp(22, 34);
-    let top_offset = (item_h - edit_h - 2).max(0);
+    let cw = item_w as f32;
+    let ch = item_h as f32;
+    let font_size = compute_label_font_size(item_w, item_h, dpi);
+    let (icon_dim, gap) = free_cell_metrics(cw, ch, font_size);
+    let est_two_line_h = font_size * 2.55;
+    let content_h = icon_dim + gap + est_two_line_h;
+    let top_y = ((ch - content_h) * 0.5).round().max(4.0);
+    let label_top = (top_y + icon_dim + gap).round().min(ch - 20.0);
+    let edit_h = ((font_size * 1.65).round() as i32).clamp(22, 34);
+    let max_top = (item_h - edit_h - 2).max(0);
+    let top_offset = (label_top as i32).clamp(0, max_top);
     let left = item_screen_rect.left - bounds.left + 2;
     let top = item_screen_rect.top - bounds.top + top_offset;
     let width = (item_w - 4).max(64);
     Rect::new(left, top, left + width, top + edit_h)
+}
+
+#[cfg_attr(not(test), allow(dead_code))]
+fn compute_rename_edit_client_rect(item_screen_rect: Rect, virtual_bounds: Rect) -> Rect {
+    compute_rename_edit_client_rect_for_dpi(item_screen_rect, virtual_bounds, 96.0)
 }
 
 fn rename_stem_utf16_len(name: &str) -> usize {
@@ -2052,6 +2484,8 @@ mod tests {
                     is_cut: false,
                 },
             ],
+            toast: None,
+            icon_epoch: 0,
         };
         assert_eq!(hit_test_icon_at(&snap, Point { x: -60, y: 80 }), Some(1));
         assert_eq!(hit_test_icon_at(&snap, Point { x: 10, y: 10 }), None);
@@ -2073,5 +2507,33 @@ mod tests {
         assert_eq!(edit.left, 102);
         assert!(edit.top > 100 && edit.bottom <= 196);
         assert_eq!(edit.width(), 76);
+
+        let edit_tall = compute_rename_edit_client_rect_for_dpi(
+            Rect::new(0, 0, 102, 144),
+            Rect::new(0, 0, 1920, 1080),
+            96.0,
+        );
+        // Should align right below the vertically centered icon rather than pinned to the bottom edge.
+        assert!(edit_tall.top >= 78 && edit_tall.top <= 98);
+        assert!(edit_tall.bottom < 140);
+    }
+
+    #[test]
+    fn downsample_pbgra_hq_preserves_dimensions_and_alpha() {
+        let mut buf = vec![0u8; 8 * 8 * 4];
+        let (chunks, _) = buf.as_chunks_mut::<4>();
+        for px in chunks {
+            *px = [40, 80, 120, 200];
+        }
+        let icon = DecodedIcon {
+            width: 8,
+            height: 8,
+            pbgra: buf,
+        };
+        assert!(downsample_pbgra_hq(&icon, 8).is_none());
+        let (w, h, out) = downsample_pbgra_hq(&icon, 4).expect("should downsample");
+        assert_eq!((w, h), (4, 4));
+        assert_eq!(out.len(), 4 * 4 * 4);
+        assert_eq!(&out[0..4], &[40, 80, 120, 200]);
     }
 }

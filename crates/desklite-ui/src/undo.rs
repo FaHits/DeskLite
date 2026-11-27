@@ -294,7 +294,25 @@ pub fn execute_undo(
                     );
                 }
             }
+            if !is_portal {
+                for added in &added_paths {
+                    let added_key = normalize_path_key(added);
+                    let was_created = existing_created
+                        .iter()
+                        .any(|c| normalize_path_key(c) == added_key);
+                    if !was_created
+                        && Path::new(added).exists()
+                        && guard.config.desktop_owner_of(added, &desktop_dirs).is_none()
+                    {
+                        guard.place_released_icons_on_free_desktop(
+                            std::slice::from_ref(added),
+                            None,
+                        );
+                    }
+                }
+            }
             guard.refresh_all_unfiled_from_disk_if_present();
+            guard.bump_free_icon_epoch();
             guard.dirty_layout = true;
             out.needs_immediate_save = true;
             if move_errors > 0 {

@@ -9,10 +9,10 @@ use desklite_core::{
 };
 use desklite_win32::{
     AsyncDragRequest, Win32Hotkey, all_bucket_fence_hwnds, allow_foreground_self,
-    clipboard_has_files, copy_text_to_clipboard, free_desktop_hwnd as win32_free_desktop_hwnd,
-    is_ctrl_key_down, is_directly_on_desktop, launch_as_admin, launch_item,
-    paste_files_to_directory_detailed, read_clipboard_files, rename_file_in_place,
-    resolve_dropped_item, reveal_in_explorer, scan_portal_directory,
+    clipboard_has_files, copy_text_to_clipboard, delete_files_permanently,
+    free_desktop_hwnd as win32_free_desktop_hwnd, is_ctrl_key_down, is_directly_on_desktop,
+    launch_as_admin, launch_item, paste_files_to_directory_detailed, read_clipboard_files,
+    rename_file_in_place, resolve_dropped_item, reveal_in_explorer, scan_portal_directory,
     set_clipboard_files_for_window, set_file_drag_active, set_hwnd_locked, show_file_properties,
     start_file_drag_out_async, trash_files, user_desktop_dir,
 };
@@ -223,7 +223,7 @@ pub fn handle_keyboard_shortcuts(
     } else if key_enter && !selected_set.is_empty() {
         *out_action = Some(ItemUiAction::LaunchSelected);
     } else if shift_del && !selected_set.is_empty() {
-        *out_action = Some(ItemUiAction::TrashSelected);
+        *out_action = Some(ItemUiAction::DeleteSelectedPermanent);
     } else if key_del && !selected_set.is_empty() {
         if is_bucket {
             *out_action = Some(ItemUiAction::RemoveSelected);
@@ -502,7 +502,7 @@ pub fn execute_item_action(
                     guard.cut_paths.clear();
                     if cut {
                         for p in &paths {
-                            guard.cut_paths.insert(p.to_ascii_lowercase());
+                            guard.cut_paths.insert(normalize_path_key(p));
                         }
                     }
                     let verb = if cut { "已剪切" } else { "已复制" };
@@ -630,12 +630,18 @@ pub fn execute_item_action(
                 guard.mark_free_desktop_dirty(Some(ctx));
             }
         }
-        ItemUiAction::TrashSelected => {
+        ItemUiAction::TrashSelected | ItemUiAction::DeleteSelectedPermanent => {
+            let permanent = matches!(act, ItemUiAction::DeleteSelectedPermanent);
             let paths = sorted_selected_paths(fence_id, spec, shared);
             if paths.is_empty() {
                 return;
             }
-            match trash_files(&paths) {
+            let res = if permanent {
+                delete_files_permanently(&paths)
+            } else {
+                trash_files(&paths)
+            };
+            match res {
                 Ok(true) => {
                     let mut guard = lock_unpoisoned(shared);
                     let desktop_dirs = guard.desktop_dirs.clone();
@@ -654,7 +660,7 @@ pub fn execute_item_action(
                     guard.dirty_layout = true;
                     out.needs_immediate_save = true;
                     guard.request_repaint_fence(ctx, fence_id);
-                    guard.mark_free_desktop_dirty(Some(ctx));
+                    guard.bump_free_icon_epoch();
                 }
                 Ok(false) => {}
                 Err(e) => {
@@ -911,36 +917,19 @@ pub fn handle_paste_action(
                             target_paths.push(ds);
                         }
                     }
-                } else if is_cut {
-                    if let Some(ref desktop) = desktop_opt
-                        && let Ok(pairs) = paste_files_to_directory_detailed(
-                            std::slice::from_ref(&s),
-                            desktop,
-                            true,
-                        )
-                    {
-                        for (src, dst) in pairs {
-                            let ds = dst.to_string_lossy().into_owned();
+                } else if let Some(ref desktop) = desktop_opt
+                    && let Ok(pairs) =
+                        paste_files_to_directory_detailed(std::slice::from_ref(&s), desktop, is_cut)
+                {
+                    for (src, dst) in pairs {
+                        let ds = dst.to_string_lossy().into_owned();
+                        if is_cut {
                             moved_pairs.push((src.to_string_lossy().into_owned(), ds.clone()));
-                            target_paths.push(ds);
-                        }
-                    }
-                } else if owner.is_some() {
-                    if let Some(ref desktop) = desktop_opt
-                        && let Ok(pairs) = paste_files_to_directory_detailed(
-                            std::slice::from_ref(&s),
-                            desktop,
-                            false,
-                        )
-                    {
-                        for (_, dst) in pairs {
-                            let ds = dst.to_string_lossy().into_owned();
+                        } else {
                             created_paths.push(ds.clone());
-                            target_paths.push(ds);
                         }
+                        target_paths.push(ds);
                     }
-                } else {
-                    target_paths.push(s);
                 }
             }
 
@@ -949,6 +938,7 @@ pub fn handle_paste_action(
             }
             let mut guard = lock_unpoisoned(shared);
             let mut removed_from_fences = Vec::new();
+            let mut portal_fids_to_refresh = Vec::new();
             if is_cut {
                 for f in &mut guard.config.fences {
                     if f.id != fence_id && f.is_desktop_bucket(&desktop_dirs) {
@@ -965,9 +955,25 @@ pub fn handle_paste_action(
                         if !rem.is_empty() {
                             removed_from_fences.push((f.id, rem));
                         }
+                    } else if f.id != fence_id
+                        && let Some(dir) = f.external_portal_dir(&desktop_dirs)
+                    {
+                        let dir_key = normalize_path_key(&dir);
+                        let touched = moved_pairs.iter().any(|(src, _)| {
+                            Path::new(src).parent().is_some_and(|p| {
+                                normalize_path_key(&p.to_string_lossy()) == dir_key
+                            })
+                        });
+                        if touched {
+                            f.items = scan_portal_directory(Path::new(&dir));
+                            portal_fids_to_refresh.push(f.id);
+                        }
                     }
                 }
                 guard.cut_paths.clear();
+            }
+            for pfid in portal_fids_to_refresh {
+                guard.request_repaint_fence(ctx, pfid);
             }
             let items: Vec<FenceItem> = target_paths
                 .iter()
