@@ -27,6 +27,7 @@ use crate::item_grid::{
     ItemUiAction, apply_reorder_items, compute_reorder_target, draw_header_icon_btn,
     fit_single_line, handle_item_interactions, handle_text_edit_clipboard, paint_reorder_indicator,
     render_grid_item, render_grid_item_renaming, render_list_item, render_list_item_renaming,
+    right_click_released_in,
 };
 use crate::snap::snap_move_rect;
 use crate::state::{
@@ -1256,6 +1257,7 @@ pub fn render_fence_viewport(
                                     (cx, cy),
                                     &monitors,
                                 );
+                                desklite_win32::promote_fence_above_siblings(my_hwnd);
                                 desklite_win32::move_window_no_z(my_hwnd, nx, ny);
                                 lock_unpoisoned(shared).title_drag = Some(TitleDragState {
                                     fence_id,
@@ -1277,7 +1279,7 @@ pub fn render_fence_viewport(
                             lock_unpoisoned(shared).clear_all_selections_except(None);
                         }
                     }
-                    if title_resp.secondary_clicked() {
+                    if right_click_released_in(&title_resp, title_resp.rect) {
                         if !focused_now {
                             focus_window_now(my_hwnd);
                         }
@@ -1342,17 +1344,17 @@ pub fn render_fence_viewport(
                     ui.make_persistent_id(("empty_body", fence_id)),
                     Sense::click(),
                 );
-                if (empty_resp.clicked() || empty_resp.secondary_clicked()) && !focused_now {
+                let empty_right_clicked = right_click_released_in(&empty_resp, empty_hit_rect);
+                if (empty_resp.clicked() || empty_right_clicked) && !focused_now {
                     focus_window_now(my_hwnd);
                 }
-                if (empty_resp.clicked() || empty_resp.secondary_clicked()) && resize_dir.is_none()
-                {
+                if (empty_resp.clicked() || empty_right_clicked) && resize_dir.is_none() {
                     let mods = ctx.input(|i| i.modifiers);
                     if !mods.ctrl && !mods.shift {
                         lock_unpoisoned(shared).clear_all_selections_except(None);
                     }
                 }
-                if empty_resp.secondary_clicked() {
+                if empty_right_clicked {
                     open_fence_menu(
                         fence_id,
                         my_hwnd,
@@ -1431,6 +1433,7 @@ pub fn render_fence_viewport(
             }
 
             let mut item_action: Option<ItemUiAction> = None;
+            let mut item_opened_menu = false;
             let mut item_rects: Vec<(usize, egui::Rect)> = Vec::with_capacity(spec.items.len());
             let viewport_clip_rect = ui.available_rect_before_wrap();
             let blank_hit_rect = viewport_clip_rect.expand2(Vec2::new(8.0, 0.0));
@@ -1439,24 +1442,13 @@ pub fn render_fence_viewport(
                 ui.make_persistent_id(("blank_body", fence_id)),
                 Sense::click_and_drag(),
             );
-            if (blank_resp.clicked() || blank_resp.secondary_clicked()) && resize_dir.is_none() {
+            if blank_resp.clicked() && resize_dir.is_none() {
                 if !focused_now {
                     focus_window_now(my_hwnd);
                 }
                 let mods = ctx.input(|i| i.modifiers);
                 if !mods.ctrl && !mods.shift {
                     lock_unpoisoned(shared).clear_all_selections_except(None);
-                }
-                if blank_resp.secondary_clicked() {
-                    open_fence_menu(
-                        fence_id,
-                        my_hwnd,
-                        None,
-                        true,
-                        &monitors,
-                        shared,
-                        &ctx,
-                    );
                 }
             }
             let body_blank_resp: Option<egui::Response> = Some(blank_resp);
@@ -1526,17 +1518,20 @@ pub fn render_fence_viewport(
                                     row_resp.scroll_to_me(None);
                                 }
                                 item_rects.push((idx, row_resp.rect));
-                                if !is_renaming_item {
-                                    handle_item_interactions(
+                                if !is_renaming_item
+                                    && handle_item_interactions(
                                         &row_resp,
                                         my_hwnd,
                                         idx,
                                         item,
+                                        viewport_clip_rect,
                                         selected,
                                         sel_count,
                                         is_bucket,
                                         &mut item_action,
-                                    );
+                                    )
+                                {
+                                    item_opened_menu = true;
                                 }
                             }
                         }
@@ -1600,17 +1595,20 @@ pub fn render_fence_viewport(
                                                 tile_resp.scroll_to_me(None);
                                             }
                                             item_rects.push((idx, tile_resp.rect));
-                                            if !is_renaming_item {
-                                                handle_item_interactions(
+                                            if !is_renaming_item
+                                                && handle_item_interactions(
                                                     &tile_resp,
                                                     my_hwnd,
                                                     idx,
                                                     item,
+                                                    viewport_clip_rect,
                                                     selected,
                                                     sel_count,
                                                     is_bucket,
                                                     &mut item_action,
-                                                );
+                                                )
+                                            {
+                                                item_opened_menu = true;
                                             }
                                             if (idx + 1) % cols == 0 {
                                                 ui.end_row();
@@ -1619,6 +1617,29 @@ pub fn render_fence_viewport(
                                     });
                             });
                         }
+                    }
+
+                    if !item_opened_menu
+                        && let Some(ref b_resp) = body_blank_resp
+                        && resize_dir.is_none()
+                        && right_click_released_in(b_resp, viewport_clip_rect)
+                    {
+                        if !focused_now {
+                            focus_window_now(my_hwnd);
+                        }
+                        let mods = ctx.input(|i| i.modifiers);
+                        if !mods.ctrl && !mods.shift {
+                            lock_unpoisoned(shared).clear_all_selections_except(None);
+                        }
+                        open_fence_menu(
+                            fence_id,
+                            my_hwnd,
+                            None,
+                            true,
+                            &monitors,
+                            shared,
+                            &ctx,
+                        );
                     }
 
                     if let Some((idx, old_path, new_name)) = rename_commit {

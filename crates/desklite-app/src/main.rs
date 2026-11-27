@@ -31,17 +31,18 @@ use desklite_ui::{
 use desklite_win32::{
     ActiveShellMenuGuard, CUSTOM_MENU_CMD_BASE, CustomMenuItem, FolderWatcher,
     FreeDesktopController, FreeDesktopEvent, HybridMenuOutcome, IconCache, TrayIcon,
-    WM_APP_PORTAL_DIRTY, WM_APP_TRAY, all_desktop_dirs, attach_desktop_background_submenu,
+    WM_APP_PORTAL_DIRTY, WM_APP_TRAY, all_desktop_dirs, append_lazy_desktop_background_submenu,
     clipboard_has_files, enable_dark_popup_menus, enable_per_monitor_dpi_v2, focus_window_now,
-    handle_active_shell_menu_msg, hide_all_fences_immediately, install_desktop_z_win_event_hooks,
-    install_ui_thread_cloak_hook, invoke_shell_context_command, is_desktop_dir_path,
-    is_directly_on_desktop, is_display_wake_power_broadcast, is_shell_menu_cmd_id, is_vault_path,
-    launch_item, migrate_vault_item_to_desktop, pick_folder_dialog, post_reassert_all_fences_z,
-    probe_display_topology, reassert_desktop_z_order_sync,
-    register_power_and_session_notifications, restore_all_desktop_icons, scan_portal_directory,
-    set_external_foreground_notify_target, set_shell_desktop_icons_visible, set_window_cloaked,
-    set_window_rect_no_z, set_z_reassert_notify_target, show_hybrid_shell_items_menu,
-    strip_alt_tab_from_host, unregister_power_and_session_notifications,
+    force_foreground_for_popup, handle_active_shell_menu_msg, hide_all_fences_immediately,
+    install_desktop_z_win_event_hooks, install_ui_thread_cloak_hook, invoke_shell_context_command,
+    is_desktop_dir_path, is_directly_on_desktop, is_display_wake_power_broadcast,
+    is_shell_menu_cmd_id, is_vault_path, launch_item, migrate_vault_item_to_desktop,
+    pick_folder_dialog, post_reassert_all_fences_z, probe_display_topology,
+    reassert_desktop_z_order_sync, register_power_and_session_notifications,
+    restore_all_desktop_icons, scan_portal_directory, set_external_foreground_notify_target,
+    set_shell_desktop_icons_visible, set_window_cloaked, set_window_rect_no_z,
+    set_z_reassert_notify_target, show_hybrid_shell_items_menu, strip_alt_tab_from_host,
+    unregister_power_and_session_notifications,
 };
 use egui::{Pos2, Vec2, ViewportBuilder, ViewportCommand, ViewportId, WindowLevel};
 use raw_window_handle::{HasWindowHandle, RawWindowHandle};
@@ -54,14 +55,14 @@ use windows::Win32::System::Threading::CreateMutexW;
 use windows::Win32::UI::Shell::ShellExecuteW;
 use windows::Win32::UI::WindowsAndMessaging::{
     AppendMenuW, CREATESTRUCTW, CreatePopupMenu, CreateWindowExW, DefWindowProcW, DestroyMenu,
-    DestroyWindow, DispatchMessageW, GetCursorPos, GetMessageW, GetWindowLongPtrW, GWLP_USERDATA,
+    DestroyWindow, DispatchMessageW, GWLP_USERDATA, GetCursorPos, GetMessageW, GetWindowLongPtrW,
     KillTimer, MB_ICONINFORMATION, MB_OK, MF_CHECKED, MF_GRAYED, MF_POPUP, MF_SEPARATOR, MF_STRING,
     MSG, MessageBoxW, PostMessageW, PostQuitMessage, RegisterClassExW, RegisterWindowMessageW,
-    SPI_SETWORKAREA, SW_SHOWNORMAL, SetForegroundWindow, SetTimer, SetWindowLongPtrW,
-    TPM_BOTTOMALIGN, TPM_LEFTALIGN, TPM_RETURNCMD, TPM_TOPALIGN, TrackPopupMenuEx,
-    TranslateMessage, WM_APP, WM_CREATE, WM_DESTROY, WM_DISPLAYCHANGE, WM_DPICHANGED,
-    WM_ENDSESSION, WM_POWERBROADCAST, WM_QUERYENDSESSION, WM_RBUTTONUP, WM_SETTINGCHANGE, WM_TIMER,
-    WM_WTSSESSION_CHANGE, WNDCLASSEXW, WS_EX_TOOLWINDOW, WS_POPUP, WTS_SESSION_UNLOCK,
+    SPI_SETWORKAREA, SW_SHOWNORMAL, SetTimer, SetWindowLongPtrW, TPM_BOTTOMALIGN, TPM_LEFTALIGN,
+    TPM_RETURNCMD, TPM_TOPALIGN, TrackPopupMenuEx, TranslateMessage, WM_APP, WM_CREATE, WM_DESTROY,
+    WM_DISPLAYCHANGE, WM_DPICHANGED, WM_ENDSESSION, WM_POWERBROADCAST, WM_QUERYENDSESSION,
+    WM_RBUTTONUP, WM_SETTINGCHANGE, WM_TIMER, WM_WTSSESSION_CHANGE, WNDCLASSEXW, WS_EX_TOOLWINDOW,
+    WS_POPUP, WTS_SESSION_UNLOCK,
 };
 use windows::core::{HSTRING, w};
 
@@ -726,8 +727,8 @@ impl HelperState {
         let _ = unsafe { GetCursorPos(&mut pt) };
         let cmd = {
             let _popup_guard = MenuPopupActiveGuard::enter(&self.shared);
+            force_foreground_for_popup(self.hwnd.0 as isize);
             unsafe {
-                let _ = SetForegroundWindow(self.hwnd);
                 TrackPopupMenuEx(
                     menu,
                     (TPM_LEFTALIGN | TPM_BOTTOMALIGN | TPM_RETURNCMD).0,
@@ -933,8 +934,8 @@ impl HelperState {
 
         let cmd = {
             let _popup_guard = MenuPopupActiveGuard::enter(&self.shared);
+            force_foreground_for_popup(self.hwnd.0 as isize);
             unsafe {
-                let _ = SetForegroundWindow(self.hwnd);
                 TrackPopupMenuEx(
                     menu,
                     (TPM_LEFTALIGN | TPM_TOPALIGN | TPM_RETURNCMD).0,
@@ -1074,9 +1075,10 @@ impl HelperState {
         } else {
             self.hwnd
         };
-        let bg_shell_cm =
-            attach_desktop_background_submenu(menu, "系统桌面菜单 (新建 / 显示 / 个性化)", owner_hwnd)
-                .map(|(cm, _)| cm);
+        let lazy_bg_sub = append_lazy_desktop_background_submenu(
+            menu,
+            "系统桌面菜单 (新建 / 显示 / 个性化)",
+        );
 
         unsafe {
             let _ = AppendMenuW(menu, MF_SEPARATOR, 0, None);
@@ -1088,13 +1090,13 @@ impl HelperState {
             );
         }
 
-        let cmd = {
+        let (cmd, lazy_cm) = {
             let _popup_guard = MenuPopupActiveGuard::enter(&self.shared);
-            let _shell_guard = bg_shell_cm
-                .as_ref()
-                .map(|cm| ActiveShellMenuGuard::install(cm, ignored_menus));
-            unsafe {
-                let _ = SetForegroundWindow(self.hwnd);
+            let mut shell_guard = lazy_bg_sub.map(|sub_h| {
+                ActiveShellMenuGuard::install_lazy_desktop_bg(sub_h, owner_hwnd, ignored_menus)
+            });
+            force_foreground_for_popup(self.hwnd.0 as isize);
+            let res = unsafe {
                 TrackPopupMenuEx(
                     menu,
                     (TPM_LEFTALIGN | TPM_TOPALIGN | TPM_RETURNCMD).0,
@@ -1103,14 +1105,18 @@ impl HelperState {
                     self.hwnd,
                     None,
                 )
-            }
+            };
+            let cm = shell_guard
+                .as_mut()
+                .and_then(ActiveShellMenuGuard::take_lazy_context_menu);
+            (res, cm)
         };
         unsafe {
             let _ = DestroyMenu(menu);
         }
 
         let raw_cmd = cmd.0 as u32;
-        if let Some(cm) = bg_shell_cm
+        if let Some(cm) = lazy_cm
             && is_shell_menu_cmd_id(raw_cmd)
         {
             if invoke_shell_context_command(&cm, owner_hwnd, raw_cmd - 1, x, y).is_ok() {
@@ -1302,8 +1308,8 @@ impl HelperState {
         y: i32,
     ) -> u32 {
         let _popup_guard = MenuPopupActiveGuard::enter(&self.shared);
+        force_foreground_for_popup(self.hwnd.0 as isize);
         let cmd = unsafe {
-            let _ = SetForegroundWindow(self.hwnd);
             TrackPopupMenuEx(
                 menu,
                 (TPM_LEFTALIGN | TPM_TOPALIGN | TPM_RETURNCMD).0,
@@ -2828,6 +2834,57 @@ fn main() {
                 guard.set_helper_hwnd(helper_hwnd);
                 guard.set_drag_notify_target(helper_hwnd, WM_APP_DRAG_DONE);
                 guard.set_free_desktop_notify_target(helper_hwnd, WM_APP_REFRESH_FREE_DESKTOP);
+                let item_req_slot = Arc::clone(&fence_item_menu_req);
+                guard.menu_dispatcher = Some(Arc::new(move |cmd| {
+                    if helper_hwnd == 0 {
+                        return;
+                    }
+                    let target = HWND(helper_hwnd as *mut _);
+                    match cmd {
+                        FenceCommand::ShowFenceMenu {
+                            fence_id,
+                            screen_x,
+                            screen_y,
+                            include_body_actions,
+                        } => {
+                            let packed = (((screen_y as i16 as u16) as usize) << 16)
+                                | ((screen_x as i16 as u16) as usize);
+                            let msg = if include_body_actions {
+                                WM_APP_SHOW_FENCE_MENU_BODY
+                            } else {
+                                WM_APP_SHOW_FENCE_MENU
+                            };
+                            unsafe {
+                                let _ = PostMessageW(
+                                    Some(target),
+                                    msg,
+                                    WPARAM(fence_id as usize),
+                                    LPARAM(packed as isize),
+                                );
+                            }
+                        }
+                        FenceCommand::ShowFenceItemMenu {
+                            fence_id,
+                            paths,
+                            is_bucket,
+                            screen_x,
+                            screen_y,
+                        } => {
+                            *lock_unpoisoned(&item_req_slot) = Some((fence_id, paths, is_bucket));
+                            let packed = (((screen_y as i16 as u16) as usize) << 16)
+                                | ((screen_x as i16 as u16) as usize);
+                            unsafe {
+                                let _ = PostMessageW(
+                                    Some(target),
+                                    WM_APP_SHOW_FENCE_ITEM_MENU,
+                                    WPARAM(0),
+                                    LPARAM(packed as isize),
+                                );
+                            }
+                        }
+                        _ => {}
+                    }
+                }));
                 build_free_desktop_snapshot(&guard)
             };
             free_desktop_ctrl.update_snapshot(initial_snapshot);

@@ -360,6 +360,7 @@ pub struct SharedFenceState {
     pub pending_repaint_free_desktop: bool,
     pub popup_owners: HashMap<i32, PopupOwnerState>,
     pub pending_commands: Vec<FenceCommand>,
+    pub menu_dispatcher: Option<Arc<dyn Fn(FenceCommand) + Send + Sync>>,
     pub dirty_layout: bool,
     pub pending_save_at: Option<Instant>,
 }
@@ -430,6 +431,7 @@ impl SharedFenceState {
             pending_repaint_free_desktop: false,
             popup_owners: HashMap::new(),
             pending_commands: Vec::new(),
+            menu_dispatcher: None,
             dirty_layout: false,
             pending_save_at: None,
         }
@@ -778,6 +780,15 @@ impl SharedFenceState {
     }
 
     pub fn push_command(&mut self, ctx: &egui::Context, cmd: FenceCommand) {
+        if let Some(dispatcher) = &self.menu_dispatcher
+            && matches!(
+                cmd,
+                FenceCommand::ShowFenceMenu { .. } | FenceCommand::ShowFenceItemMenu { .. }
+            )
+        {
+            dispatcher(cmd);
+            return;
+        }
         self.pending_commands.push(cmd);
         ctx.request_repaint_of(ViewportId::ROOT);
     }

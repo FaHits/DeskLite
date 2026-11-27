@@ -34,17 +34,31 @@ pub enum ItemUiAction {
     StartDragOut { idx: usize, ctrl: bool, shift: bool },
 }
 
+pub fn right_click_released_in(resp: &egui::Response, clip_rect: egui::Rect) -> bool {
+    if resp.secondary_clicked() {
+        return true;
+    }
+    resp.ctx.input(|i| {
+        i.pointer.button_released(PointerButton::Secondary)
+            && i.pointer
+                .interact_pos()
+                .or_else(|| i.pointer.latest_pos())
+                .is_some_and(|p| resp.rect.intersect(clip_rect).contains(p))
+    })
+}
+
 #[allow(clippy::too_many_arguments)]
 pub fn handle_item_interactions(
     resp: &egui::Response,
     my_hwnd: isize,
     idx: usize,
     item: &FenceItem,
+    clip_rect: egui::Rect,
     _is_selected: bool,
     _selected_count: usize,
     is_bucket: bool,
     out_action: &mut Option<ItemUiAction>,
-) {
+) -> bool {
     let focused_now = resp.ctx.input(|i| i.focused);
     if resp.clicked() {
         if !focused_now {
@@ -57,7 +71,8 @@ pub fn handle_item_interactions(
             shift: mods.shift,
         });
     }
-    if resp.secondary_clicked() {
+    let mut opened_context_menu = false;
+    if right_click_released_in(resp, clip_rect) {
         if !focused_now {
             focus_window_now(my_hwnd);
         }
@@ -70,6 +85,7 @@ pub fn handle_item_interactions(
             screen_x,
             screen_y,
         });
+        opened_context_menu = true;
     }
     if resp.double_clicked() {
         *out_action = Some(ItemUiAction::Launch(item.path.clone()));
@@ -84,6 +100,7 @@ pub fn handle_item_interactions(
             *out_action = Some(ItemUiAction::StartDragOut { idx, ctrl, shift });
         }
     }
+    opened_context_menu
 }
 
 pub fn compute_reorder_target(

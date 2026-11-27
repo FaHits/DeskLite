@@ -14,7 +14,7 @@ use windows::Win32::Graphics::Gdi::{
     RDW_INVALIDATE, RDW_NOERASE, RedrawWindow,
 };
 use windows::Win32::System::LibraryLoader::{GetProcAddress, LoadLibraryW};
-use windows::Win32::System::Threading::{GetCurrentProcessId, GetCurrentThreadId};
+use windows::Win32::System::Threading::{AttachThreadInput, GetCurrentProcessId, GetCurrentThreadId};
 use windows::Win32::UI::Accessibility::{HWINEVENTHOOK, SetWinEventHook, UnhookWinEvent};
 use windows::Win32::UI::Controls::MARGINS;
 use windows::Win32::UI::HiDpi::GetDpiForWindow;
@@ -25,12 +25,13 @@ use windows::Win32::UI::Input::KeyboardAndMouse::{
 use windows::Win32::UI::WindowsAndMessaging::{
     AllowSetForegroundWindow, CBT_CREATEWNDW, CWPSTRUCT, CallNextHookEx, CallWindowProcW,
     EVENT_OBJECT_REORDER, EVENT_SYSTEM_FOREGROUND, EVENT_SYSTEM_MINIMIZEEND,
-    EVENT_SYSTEM_MINIMIZESTART, FindWindowW, GW_HWNDNEXT, GWL_EXSTYLE, GWL_STYLE, GWLP_HWNDPARENT,
-    GWLP_WNDPROC, GetClassNameW, GetCursorPos, GetDesktopWindow, GetForegroundWindow, GetTopWindow,
-    GetWindow, GetWindowLongPtrW, GetWindowRect, HCBT_CREATEWND, HHOOK, HTBOTTOM, HTBOTTOMLEFT,
-    HTBOTTOMRIGHT, HTCLIENT, HTLEFT, HTRIGHT, HTTOP, HTTOPLEFT, HTTOPRIGHT, HWND_BOTTOM, HWND_TOP,
-    IDC_ARROW, IsIconic, IsWindow, IsWindowVisible, LoadCursorW, PostMessageW, SC_MAXIMIZE,
-    SC_MINIMIZE, SC_RESTORE, STYLESTRUCT, SW_HIDE, SWP_FRAMECHANGED, SWP_NOACTIVATE, SWP_NOMOVE,
+    EVENT_SYSTEM_MINIMIZESTART, FindWindowW, GW_HWNDNEXT, GW_HWNDPREV, GWL_EXSTYLE, GWL_STYLE,
+    GWLP_HWNDPARENT, GWLP_WNDPROC, GetClassNameW, GetCursorPos, GetDesktopWindow,
+    GetForegroundWindow, GetTopWindow, GetWindow, GetWindowLongPtrW, GetWindowRect,
+    GetWindowThreadProcessId, HCBT_CREATEWND, HHOOK, HTBOTTOM, HTBOTTOMLEFT, HTBOTTOMRIGHT,
+    HTCLIENT, HTLEFT, HTRIGHT, HTTOP, HTTOPLEFT, HTTOPRIGHT, HWND_BOTTOM, HWND_TOP, IDC_ARROW,
+    IsIconic, IsWindow, IsWindowVisible, LoadCursorW, PostMessageW, SC_MAXIMIZE, SC_MINIMIZE,
+    SC_RESTORE, STYLESTRUCT, SW_HIDE, SWP_FRAMECHANGED, SWP_NOACTIVATE, SWP_NOMOVE,
     SWP_NOSENDCHANGING, SWP_NOSIZE, SWP_NOZORDER, SetCursor, SetForegroundWindow,
     SetWindowLongPtrW, SetWindowPos, SetWindowsHookExW, ShowWindow, UnhookWindowsHookEx,
     WH_CALLWNDPROC, WH_CBT, WINDOWPOS, WINEVENT_OUTOFCONTEXT, WINEVENT_SKIPOWNPROCESS, WM_APP,
@@ -165,6 +166,7 @@ pub fn is_ctrl_key_down() -> bool {
 
 pub fn focus_window_now(raw_hwnd: isize) {
     if raw_hwnd != 0 {
+        promote_fence_above_siblings(raw_hwnd);
         let hwnd = HWND(raw_hwnd as *mut _);
         unsafe {
             if GetForegroundWindow() != hwnd {
@@ -177,6 +179,36 @@ pub fn focus_window_now(raw_hwnd: isize) {
 pub fn allow_foreground_self() {
     unsafe {
         let _ = AllowSetForegroundWindow(GetCurrentProcessId());
+    }
+}
+
+/// Reliably gives a Win32 helper window foreground activation before `TrackPopupMenuEx`,
+/// attaching to the current foreground window's input queue if cross-thread activation fails.
+pub fn force_foreground_for_popup(raw_hwnd: isize) {
+    if raw_hwnd == 0 {
+        return;
+    }
+    allow_foreground_self();
+    let hwnd = HWND(raw_hwnd as *mut _);
+    unsafe {
+        let fg = GetForegroundWindow();
+        if fg == hwnd {
+            return;
+        }
+        if SetForegroundWindow(hwnd).as_bool() && GetForegroundWindow() == hwnd {
+            return;
+        }
+        if !fg.is_invalid() {
+            let fg_tid = GetWindowThreadProcessId(fg, None);
+            let cur_tid = GetCurrentThreadId();
+            if fg_tid != 0 && cur_tid != 0 && fg_tid != cur_tid {
+                let attached = AttachThreadInput(fg_tid, cur_tid, true).as_bool();
+                let _ = SetForegroundWindow(hwnd);
+                if attached {
+                    let _ = AttachThreadInput(fg_tid, cur_tid, false);
+                }
+            }
+        }
     }
 }
 
@@ -909,6 +941,88 @@ pub fn reassert_desktop_z_order_sync() {
     }
 }
 
+fn has_sibling_fence_above(
+    ordered_above: &[isize],
+    sibling_fences: &HashSet<isize>,
+    target: isize,
+) -> bool {
+    for &raw in ordered_above {
+        if raw == target {
+            return false;
+        }
+        if sibling_fences.contains(&raw) {
+            return true;
+        }
+    }
+    false
+}
+
+/// Raises a focused or dragged bucket fence above its sibling fences while keeping it strictly
+/// underneath all normal visible application windows (top slot of the Desktop layer).
+pub fn promote_fence_above_siblings(raw_hwnd: isize) {
+    if raw_hwnd == 0 || is_free_desktop_hwnd(raw_hwnd) || raw_hwnd == inspector_hwnd() {
+        return;
+    }
+    let hwnd = HWND(raw_hwnd as *mut _);
+    if !unsafe { IsWindow(Some(hwnd)).as_bool() && IsWindowVisible(hwnd).as_bool() } {
+        return;
+    }
+    let fence_hwnds = snapshot_fence_hwnd_set();
+    if !fence_hwnds.contains(&raw_hwnd) {
+        return;
+    }
+    let free_raw = free_desktop_hwnd();
+    let live_owner = unsafe { resolve_live_owner(0) };
+    if live_owner == 0 {
+        return;
+    }
+
+    let mut sibling_fences: HashSet<isize> = fence_hwnds.clone();
+    sibling_fences.remove(&free_raw);
+
+    let mut ordered_above = Vec::new();
+    let mut cur = hwnd;
+    for _ in 0..4096 {
+        let Ok(prev) = (unsafe { GetWindow(cur, GW_HWNDPREV) }) else {
+            break;
+        };
+        if prev.is_invalid() {
+            break;
+        }
+        let prev_raw = prev.0 as isize;
+        if sibling_fences.contains(&prev_raw) && unsafe { IsWindowVisible(prev).as_bool() } {
+            ordered_above.push(prev_raw);
+        }
+        cur = prev;
+    }
+    ordered_above.reverse();
+
+    let sibling_above = has_sibling_fence_above(&ordered_above, &sibling_fences, raw_hwnd);
+    let strictly_ok = unsafe { is_strictly_in_desktop_layer(hwnd, live_owner, &fence_hwnds) };
+    if !sibling_above && strictly_ok {
+        return;
+    }
+
+    let _serial_guard = lock_unpoisoned(Z_REASSERT_LOCK.get_or_init(|| Mutex::new(())));
+    let _in_flight = InFlightReorderGuard::enter();
+    let anchor = unsafe { find_desktop_layer_anchor(hwnd, live_owner, &fence_hwnds) };
+    if anchor == hwnd {
+        return;
+    }
+    let _hwnd_guard = ReassertingHwndGuard::enter(raw_hwnd);
+    let _ = unsafe {
+        SetWindowPos(
+            hwnd,
+            Some(anchor),
+            0,
+            0,
+            0,
+            0,
+            SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE | SWP_NOSENDCHANGING,
+        )
+    };
+}
+
 /// Walks top-down from `GetTopWindow(None)` down to `owner_hwnd` (or visible `Progman`) and
 /// returns the `hwndInsertAfter` anchor preserving strict layering:
 /// `visible app windows > DeskLite bucket fences > FreeDesktop canvas > WorkerW/Progman`.
@@ -1368,6 +1482,7 @@ unsafe extern "system" fn bottom_subclass_proc(
     }
     if !is_free && msg == WM_ENTERSIZEMOVE {
         IN_SIZE_MOVE_HWND.store(hwnd.0 as isize, std::sync::atomic::Ordering::Release);
+        promote_fence_above_siblings(hwnd.0 as isize);
     }
     if msg == WM_EXITSIZEMOVE || msg == WM_CAPTURECHANGED || msg == WM_CANCELMODE {
         let raw = hwnd.0 as isize;
@@ -1406,6 +1521,9 @@ unsafe extern "system" fn bottom_subclass_proc(
         return LRESULT(1);
     }
     if msg == WM_LBUTTONDOWN || msg == WM_RBUTTONDOWN {
+        if !is_free {
+            promote_fence_above_siblings(hwnd.0 as isize);
+        }
         unsafe {
             if GetForegroundWindow() != hwnd {
                 let _ = SetForegroundWindow(hwnd);
@@ -1901,5 +2019,14 @@ mod tests {
         // Owner never reached in scan.
         let (ok3, _) = evaluate_z_chain_plan(&[10, 101, 102, 103, 200], &apps, &fences, Some(200), false);
         assert!(!ok3);
+    }
+
+    #[test]
+    fn has_sibling_fence_above_detects_covering_fences_only() {
+        let siblings: HashSet<isize> = [101, 102, 103].into_iter().collect();
+        assert!(!has_sibling_fence_above(&[10, 101, 102, 103], &siblings, 101));
+        assert!(has_sibling_fence_above(&[10, 101, 102, 103], &siblings, 102));
+        assert!(has_sibling_fence_above(&[10, 101, 102, 103], &siblings, 103));
+        assert!(!has_sibling_fence_above(&[10, 999, 102], &siblings, 102));
     }
 }

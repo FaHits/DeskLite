@@ -9,15 +9,16 @@ use windows::Win32::UI::Controls::{DRAWITEMSTRUCT, MEASUREITEMSTRUCT, ODT_MENU};
 use windows::Win32::UI::Input::KeyboardAndMouse::{GetKeyState, VK_CONTROL, VK_SHIFT};
 use windows::Win32::UI::Shell::Common::ITEMIDLIST;
 use windows::Win32::UI::Shell::{
-    CMF_CANRENAME, CMF_EXPLORE, CMF_EXTENDEDVERBS, CMF_NORMAL, CMIC_MASK_CONTROL_DOWN,
-    CMIC_MASK_PTINVOKE, CMIC_MASK_SHIFT_DOWN, CMINVOKECOMMANDINFO, CMINVOKECOMMANDINFOEX,
-    GCS_VERBA, GCS_VERBW, IContextMenu, IContextMenu2, IContextMenu3, ILFindLastID, ILFree,
-    IShellFolder, SEE_MASK_UNICODE, SHBindToParent, SHGetDesktopFolder, SHParseDisplayName,
+    CMF_ASYNCVERBSTATE, CMF_CANRENAME, CMF_EXPLORE, CMF_EXTENDEDVERBS, CMF_NORMAL,
+    CMIC_MASK_CONTROL_DOWN, CMIC_MASK_PTINVOKE, CMIC_MASK_SHIFT_DOWN, CMINVOKECOMMANDINFO,
+    CMINVOKECOMMANDINFOEX, GCS_VERBA, GCS_VERBW, IContextMenu, IContextMenu2, IContextMenu3,
+    ILFindLastID, ILFree, IShellFolder, SEE_MASK_UNICODE, SHBindToParent, SHGetDesktopFolder,
+    SHParseDisplayName,
 };
 use windows::Win32::UI::WindowsAndMessaging::{
-    AppendMenuW, CreatePopupMenu, DestroyMenu, GetMenuItemCount, HMENU, InsertMenuW,
-    MENU_ITEM_FLAGS, MF_BYPOSITION, MF_POPUP, MF_SEPARATOR, MF_STRING, SW_SHOWNORMAL, WM_DRAWITEM,
-    WM_INITMENUPOPUP, WM_MEASUREITEM, WM_MENUCHAR,
+    AppendMenuW, CreatePopupMenu, DeleteMenu, DestroyMenu, GetMenuItemCount, HMENU, InsertMenuW,
+    MENU_ITEM_FLAGS, MF_BYPOSITION, MF_GRAYED, MF_POPUP, MF_SEPARATOR, MF_STRING, SW_SHOWNORMAL,
+    WM_DRAWITEM, WM_INITMENUPOPUP, WM_MEASUREITEM, WM_MENUCHAR,
 };
 use windows::core::{HSTRING, Interface, PCSTR, PCWSTR, PSTR};
 
@@ -137,19 +138,27 @@ impl Drop for OwnedMenu {
     }
 }
 
+struct LazyDesktopBgState {
+    sub_hwnd: isize,
+    owner_hwnd: HWND,
+    loaded: bool,
+    cm: Option<IContextMenu>,
+}
+
 struct ActiveShellMenuState {
     cm3: Option<IContextMenu3>,
     cm2: Option<IContextMenu2>,
     ignored_menus: HashSet<isize>,
+    lazy_bg: Option<LazyDesktopBgState>,
 }
 
 thread_local! {
-    static ACTIVE_SHELL_MENU: Cell<*const ActiveShellMenuState> = const { Cell::new(std::ptr::null()) };
+    static ACTIVE_SHELL_MENU: Cell<*mut ActiveShellMenuState> = const { Cell::new(std::ptr::null_mut()) };
 }
 
 pub struct ActiveShellMenuGuard {
-    _state: Box<ActiveShellMenuState>,
-    prev: *const ActiveShellMenuState,
+    state: Box<ActiveShellMenuState>,
+    prev: *mut ActiveShellMenuState,
 }
 
 impl ActiveShellMenuGuard {
@@ -160,21 +169,48 @@ impl ActiveShellMenuGuard {
         } else {
             cm.cast::<IContextMenu2>().ok()
         };
-        let state = Box::new(ActiveShellMenuState {
+        let mut state = Box::new(ActiveShellMenuState {
             cm3,
             cm2,
             ignored_menus,
+            lazy_bg: None,
         });
-        let ptr: *const ActiveShellMenuState = &*state;
+        let ptr: *mut ActiveShellMenuState = &mut *state;
         let prev = ACTIVE_SHELL_MENU.with(|cell| {
             let old = cell.get();
             cell.set(ptr);
             old
         });
-        Self {
-            _state: state,
-            prev,
-        }
+        Self { state, prev }
+    }
+
+    pub fn install_lazy_desktop_bg(
+        sub_hwnd: isize,
+        owner_hwnd: HWND,
+        ignored_menus: HashSet<isize>,
+    ) -> Self {
+        let mut state = Box::new(ActiveShellMenuState {
+            cm3: None,
+            cm2: None,
+            ignored_menus,
+            lazy_bg: Some(LazyDesktopBgState {
+                sub_hwnd,
+                owner_hwnd,
+                loaded: false,
+                cm: None,
+            }),
+        });
+        let ptr: *mut ActiveShellMenuState = &mut *state;
+        let prev = ACTIVE_SHELL_MENU.with(|cell| {
+            let old = cell.get();
+            cell.set(ptr);
+            old
+        });
+        Self { state, prev }
+    }
+
+    pub fn take_lazy_context_menu(&mut self) -> Option<IContextMenu> {
+        self.state.lazy_bg.as_mut().and_then(|bg| bg.cm.take())
     }
 }
 
@@ -201,13 +237,49 @@ pub fn handle_active_shell_menu_msg(
     if ptr.is_null() {
         return None;
     }
-    let state = unsafe { &*ptr };
+    let state = unsafe { &mut *ptr };
 
     match msg {
         WM_INITMENUPOPUP => {
             let hmenu = wparam.0 as isize;
             if state.ignored_menus.contains(&hmenu) {
                 return None;
+            }
+            if let Some(lazy) = state.lazy_bg.as_mut()
+                && hmenu == lazy.sub_hwnd
+                && !lazy.loaded
+            {
+                lazy.loaded = true;
+                let sub = HMENU(hmenu as *mut _);
+                let _ = unsafe { DeleteMenu(sub, 0, MF_BYPOSITION) };
+                if let Some(cm) = acquire_desktop_background_context_menu(lazy.owner_hwnd) {
+                    let mut flags = CMF_NORMAL | CMF_ASYNCVERBSTATE;
+                    if is_vk_down(VK_SHIFT.0) {
+                        flags |= CMF_EXTENDEDVERBS;
+                    }
+                    let hr = unsafe {
+                        cm.QueryContextMenu(
+                            sub,
+                            0,
+                            SHELL_MENU_CMD_FIRST,
+                            SHELL_MENU_CMD_LAST,
+                            flags,
+                        )
+                    };
+                    if !hr.is_err() && unsafe { GetMenuItemCount(Some(sub)) } > 0 {
+                        state.cm3 = cm.cast::<IContextMenu3>().ok();
+                        state.cm2 = if state.cm3.is_some() {
+                            None
+                        } else {
+                            cm.cast::<IContextMenu2>().ok()
+                        };
+                        lazy.cm = Some(cm);
+                    }
+                }
+                if unsafe { GetMenuItemCount(Some(sub)) } <= 0 {
+                    let empty_lbl = HSTRING::from("无可用系统桌面项");
+                    let _ = unsafe { AppendMenuW(sub, MF_STRING | MF_GRAYED, 0, &empty_lbl) };
+                }
             }
         }
         WM_DRAWITEM => {
@@ -471,7 +543,7 @@ pub fn show_hybrid_shell_items_menu(
     let mut ignored_menus = HashSet::new();
 
     if let Some(cm) = &cm_opt {
-        let mut flags = CMF_NORMAL | CMF_EXPLORE;
+        let mut flags = CMF_NORMAL | CMF_EXPLORE | CMF_ASYNCVERBSTATE;
         if paths.len() == 1 {
             flags |= CMF_CANRENAME;
         }
@@ -534,31 +606,20 @@ pub fn show_hybrid_shell_items_menu(
     HybridMenuOutcome::Cancelled
 }
 
-/// Attaches the Windows desktop folder background `IContextMenu` (`新建 >` / `显示设置` / `个性化`, etc.)
-/// into a cascading submenu of `parent_menu`, returning the `IContextMenu` so `ActiveShellMenuGuard`
-/// and command invocation work seamlessly while `track_popup` runs.
-pub fn attach_desktop_background_submenu(
-    parent_menu: HMENU,
-    label: &str,
-    owner_hwnd: HWND,
-) -> Option<(IContextMenu, HMENU)> {
-    let cm = acquire_desktop_background_context_menu(owner_hwnd)?;
+/// Appends an initially-empty cascading placeholder submenu for Windows desktop background
+/// items (`新建 >` / `显示设置` / `个性化`), populated lazily on `WM_INITMENUPOPUP` so
+/// blank desktop right-click opens instantaneously without stalling on Shell COM extensions.
+pub fn append_lazy_desktop_background_submenu(parent_menu: HMENU, label: &str) -> Option<isize> {
     let sub = OwnedMenu::new()?;
-    let mut flags = CMF_NORMAL;
-    if is_vk_down(VK_SHIFT.0) {
-        flags |= CMF_EXTENDEDVERBS;
-    }
-    let hr = unsafe { cm.QueryContextMenu(sub.0, 0, SHELL_MENU_CMD_FIRST, SHELL_MENU_CMD_LAST, flags) };
-    if hr.is_err() || unsafe { GetMenuItemCount(Some(sub.0)) } <= 0 {
-        return None;
-    }
+    let loading = HSTRING::from("加载中...");
+    let _ = unsafe { AppendMenuW(sub.0, MF_STRING | MF_GRAYED, 0, &loading) };
     let sub_h = sub.0;
     let wlabel = HSTRING::from(label);
     if unsafe { AppendMenuW(parent_menu, MF_POPUP, sub_h.0 as usize, &wlabel) }.is_err() {
         return None;
     }
     let _ = sub.release();
-    Some((cm, sub_h))
+    Some(sub_h.0 as isize)
 }
 
 #[cfg(test)]
