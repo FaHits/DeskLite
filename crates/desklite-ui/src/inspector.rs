@@ -114,7 +114,12 @@ pub fn open_param_editor_for_fence(
     ctx.request_repaint_of(ViewportId::ROOT);
 }
 
-fn inspector_card<R>(ui: &mut Ui, title: &str, add_contents: impl FnOnce(&mut Ui) -> R) -> R {
+fn inspector_card_with_header<R>(
+    ui: &mut Ui,
+    title: &str,
+    add_header_right: impl FnOnce(&mut Ui),
+    add_contents: impl FnOnce(&mut Ui) -> R,
+) -> R {
     let card_frame = Frame::new()
         .fill(Color32::from_rgba_unmultiplied(255, 255, 255, 9))
         .stroke(Stroke::new(
@@ -126,16 +131,23 @@ fn inspector_card<R>(ui: &mut Ui, title: &str, add_contents: impl FnOnce(&mut Ui
     card_frame
         .show(ui, |ui| {
             ui.set_width(ui.available_width());
-            ui.label(
-                egui::RichText::new(title)
-                    .size(11.5)
-                    .strong()
-                    .color(Color32::from_rgb(154, 170, 198)),
-            );
+            ui.horizontal(|ui| {
+                ui.label(
+                    egui::RichText::new(title)
+                        .size(11.5)
+                        .strong()
+                        .color(Color32::from_rgb(154, 170, 198)),
+                );
+                ui.with_layout(Layout::right_to_left(Align::Center), add_header_right);
+            });
             ui.add_space(6.0);
             add_contents(ui)
         })
         .inner
+}
+
+fn inspector_card<R>(ui: &mut Ui, title: &str, add_contents: impl FnOnce(&mut Ui) -> R) -> R {
+    inspector_card_with_header(ui, title, |_| {}, add_contents)
 }
 
 fn labeled_row(ui: &mut Ui, label: &str, add_control: impl FnOnce(&mut Ui)) {
@@ -257,8 +269,15 @@ pub fn render_inspector_viewport(
     }
 
     let target_id = insp.target_fence_id;
-    let (target_spec_opt, target_hwnd, override_count) = {
+    let (target_spec_opt, target_hwnd, overridden_names) = {
         let guard = lock_unpoisoned(shared);
+        let overridden_names = guard
+            .config
+            .fences
+            .iter()
+            .filter(|f| f.layout_override.as_ref().is_some_and(|o| !o.is_empty()))
+            .map(format_fence_title)
+            .collect::<Vec<_>>();
         (
             guard
                 .config
@@ -267,12 +286,7 @@ pub fn render_inspector_viewport(
                 .find(|f| f.id == target_id)
                 .cloned(),
             guard.attached_hwnds.get(&target_id).copied().unwrap_or(0),
-            guard
-                .config
-                .fences
-                .iter()
-                .filter(|f| f.layout_override.as_ref().is_some_and(|o| !o.is_empty()))
-                .count(),
+            overridden_names,
         )
     };
     let Some(spec) = target_spec_opt else {
@@ -590,60 +604,73 @@ pub fn render_inspector_viewport(
                             } else {
                                 ov.icon_cell_w.is_some() || ov.icon_cell_h.is_some()
                             };
+                            let has_any_override = !ov.is_empty();
                             let single_title = if is_list_mode {
-                                "单格排版（当前格子 · 紧凑列表）"
+                                "单格独立覆写 · 紧凑列表"
                             } else {
-                                "单格排版（当前格子 · 图标网格）"
+                                "单格独立覆写 · 图标网格"
                             };
-                            inspector_card(ui, single_title, |ui| {
-                                ui.spacing_mut().item_spacing.y = 7.0;
-                                if is_list_mode {
-                                    labeled_row(ui, "列表行高", |ui| {
-                                        if px_slider(ui, &mut s_row_h, 24..=56) {
-                                            ov.list_row_h = Some(s_row_h);
-                                            single_changed = true;
-                                        }
-                                    });
-                                    labeled_row(ui, "列表图标", |ui| {
-                                        if px_slider(ui, &mut s_list_icon, 14..=36) {
-                                            ov.list_icon_px = Some(s_list_icon);
-                                            single_changed = true;
-                                        }
-                                    });
-                                } else {
-                                    labeled_row(ui, "网格格宽", |ui| {
-                                        if px_slider(ui, &mut s_cell_w, 64..=160) {
-                                            ov.icon_cell_w = Some(s_cell_w);
-                                            single_changed = true;
-                                        }
-                                    });
-                                    labeled_row(ui, "网格格高", |ui| {
-                                        if px_slider(ui, &mut s_cell_h, 72..=180) {
-                                            ov.icon_cell_h = Some(s_cell_h);
-                                            single_changed = true;
-                                        }
-                                    });
-                                }
-                                ui.horizontal(|ui| {
-                                    let status = if has_mode_override {
-                                        "当前已使用单格独立参数（不影响其它格子）"
-                                    } else {
-                                        "当前跟随全局排版"
-                                    };
-                                    ui.label(
-                                        egui::RichText::new(status)
-                                            .size(11.0)
-                                            .color(Color32::from_rgb(142, 156, 180)),
-                                    );
+                            inspector_card_with_header(
+                                ui,
+                                single_title,
+                                |ui| {
                                     if has_mode_override {
-                                        ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
-                                            if ui.small_button("恢复跟随全局").clicked() {
-                                                single_reset = true;
+                                        if ui.small_button("恢复跟随").clicked() {
+                                            single_reset = true;
+                                        }
+                                        ui.label(
+                                            egui::RichText::new("已独立")
+                                                .size(11.0)
+                                                .color(Color32::from_rgb(245, 194, 107)),
+                                        );
+                                    } else if has_any_override {
+                                        if ui.small_button("恢复跟随").clicked() {
+                                            single_reset = true;
+                                        }
+                                        ui.label(
+                                            egui::RichText::new("他模式已独立")
+                                                .size(11.0)
+                                                .color(Color32::from_rgb(245, 194, 107)),
+                                        );
+                                    } else {
+                                        ui.label(
+                                            egui::RichText::new("跟随全局中")
+                                                .size(11.0)
+                                                .color(Color32::from_rgb(138, 152, 176)),
+                                        );
+                                    }
+                                },
+                                |ui| {
+                                    ui.spacing_mut().item_spacing.y = 7.0;
+                                    if is_list_mode {
+                                        labeled_row(ui, "列表行高", |ui| {
+                                            if px_slider(ui, &mut s_row_h, 24..=56) {
+                                                ov.list_row_h = Some(s_row_h);
+                                                single_changed = true;
+                                            }
+                                        });
+                                        labeled_row(ui, "列表图标", |ui| {
+                                            if px_slider(ui, &mut s_list_icon, 14..=36) {
+                                                ov.list_icon_px = Some(s_list_icon);
+                                                single_changed = true;
+                                            }
+                                        });
+                                    } else {
+                                        labeled_row(ui, "网格格宽", |ui| {
+                                            if px_slider(ui, &mut s_cell_w, 64..=160) {
+                                                ov.icon_cell_w = Some(s_cell_w);
+                                                single_changed = true;
+                                            }
+                                        });
+                                        labeled_row(ui, "网格格高", |ui| {
+                                            if px_slider(ui, &mut s_cell_h, 72..=180) {
+                                                ov.icon_cell_h = Some(s_cell_h);
+                                                single_changed = true;
                                             }
                                         });
                                     }
-                                });
-                            });
+                                },
+                            );
 
                             let mut g_cell_w = prefs_snap.icon_cell_w.clamp(64, 160);
                             let mut g_cell_h = prefs_snap.icon_cell_h.clamp(72, 180);
@@ -652,68 +679,80 @@ pub fn render_inspector_viewport(
                             let mut snap_px = prefs_snap.snap_threshold_px.clamp(0, 40);
                             let mut hide_all = hide_all_snap;
                             let mut prefs_changed = false;
+                            let mut free_cell_prefs_changed = false;
                             let mut hide_all_changed = false;
                             let mut sync_all_to_global = false;
 
-                            inspector_card(ui, "全局默认排版与桌面设置", |ui| {
-                                ui.spacing_mut().item_spacing.y = 7.0;
-                                labeled_row(ui, "网格格宽", |ui| {
-                                    if px_slider(ui, &mut g_cell_w, 64..=160) {
-                                        prefs_changed = true;
-                                    }
-                                });
-                                labeled_row(ui, "网格格高", |ui| {
-                                    if px_slider(ui, &mut g_cell_h, 72..=180) {
-                                        prefs_changed = true;
-                                    }
-                                });
-                                labeled_row(ui, "列表行高", |ui| {
-                                    if px_slider(ui, &mut g_row_h, 24..=56) {
-                                        prefs_changed = true;
-                                    }
-                                });
-                                labeled_row(ui, "列表图标", |ui| {
-                                    if px_slider(ui, &mut g_list_icon, 14..=36) {
-                                        prefs_changed = true;
-                                    }
-                                });
-                                labeled_row(ui, "边缘吸附", |ui| {
-                                    if px_slider(ui, &mut snap_px, 0..=40) {
-                                        prefs_changed = true;
-                                    }
-                                });
-                                labeled_row(ui, "桌面显隐", |ui| {
-                                    if ui
-                                        .checkbox(&mut hide_all, "隐藏全部格子（双击桌面切换）")
-                                        .changed()
-                                    {
-                                        hide_all_changed = true;
-                                    }
-                                });
-                                if override_count > 0 {
-                                    ui.horizontal_wrapped(|ui| {
-                                        ui.label(
+                            inspector_card_with_header(
+                                ui,
+                                "全局默认排版与桌面设置",
+                                |ui| {
+                                    if !overridden_names.is_empty() {
+                                        if ui.small_button("全部跟随全局").clicked() {
+                                            sync_all_to_global = true;
+                                        }
+                                        let badge = ui.label(
                                             egui::RichText::new(format!(
-                                                "已有 {override_count} 个格子启用单格独立排版（不随全局变化）"
+                                                "{} 格独立",
+                                                overridden_names.len()
                                             ))
                                             .size(11.0)
                                             .color(Color32::from_rgb(245, 194, 107)),
                                         );
-                                        if ui.small_button("同步到全部格子").clicked() {
-                                            sync_all_to_global = true;
+                                        badge.on_hover_text(format!(
+                                            "以下格子已启用单格独立覆写（不随全局变化）：\n{}",
+                                            overridden_names.join("、")
+                                        ));
+                                    } else {
+                                        ui.label(
+                                            egui::RichText::new("全部已跟随")
+                                                .size(11.0)
+                                                .color(Color32::from_rgb(138, 152, 176)),
+                                        );
+                                    }
+                                },
+                                |ui| {
+                                    ui.spacing_mut().item_spacing.y = 7.0;
+                                    labeled_row(ui, "网格格宽", |ui| {
+                                        if px_slider(ui, &mut g_cell_w, 64..=160) {
+                                            prefs_changed = true;
+                                            free_cell_prefs_changed = true;
                                         }
                                     });
-                                }
-                            });
+                                    labeled_row(ui, "网格格高", |ui| {
+                                        if px_slider(ui, &mut g_cell_h, 72..=180) {
+                                            prefs_changed = true;
+                                            free_cell_prefs_changed = true;
+                                        }
+                                    });
+                                    labeled_row(ui, "列表行高", |ui| {
+                                        if px_slider(ui, &mut g_row_h, 24..=56) {
+                                            prefs_changed = true;
+                                        }
+                                    });
+                                    labeled_row(ui, "列表图标", |ui| {
+                                        if px_slider(ui, &mut g_list_icon, 14..=36) {
+                                            prefs_changed = true;
+                                        }
+                                    });
+                                    labeled_row(ui, "边缘吸附", |ui| {
+                                        if px_slider(ui, &mut snap_px, 0..=40) {
+                                            prefs_changed = true;
+                                        }
+                                    });
+                                    labeled_row(ui, "桌面显隐", |ui| {
+                                        if ui
+                                            .checkbox(&mut hide_all, "隐藏全部格子（双击桌面切换）")
+                                            .changed()
+                                        {
+                                            hide_all_changed = true;
+                                        }
+                                    });
+                                },
+                            );
 
                             if single_reset {
-                                if is_list_mode {
-                                    ov.list_row_h = None;
-                                    ov.list_icon_px = None;
-                                } else {
-                                    ov.icon_cell_w = None;
-                                    ov.icon_cell_h = None;
-                                }
+                                ov = desklite_core::FenceLayoutOverride::default();
                                 single_changed = true;
                             }
 
@@ -799,14 +838,16 @@ pub fn render_inspector_viewport(
                                     guard.config.preferences.list_row_h = g_row_h;
                                     guard.config.preferences.list_icon_px = g_list_icon;
                                     guard.config.preferences.snap_threshold_px = snap_px;
-                                    let new_free_cell = guard.free_desktop_cell_size();
-                                    guard.clamp_free_icons_for_cell_size(new_free_cell);
+                                    if free_cell_prefs_changed {
+                                        let new_free_cell = guard.free_desktop_cell_size();
+                                        guard.clamp_free_icons_for_cell_size(new_free_cell);
+                                    }
                                 }
                                 if hide_all_changed {
                                     guard.config.hide_all_fences = hide_all;
                                 }
                                 guard.mark_debounced_save(&ctx);
-                                if prefs_changed || hide_all_changed {
+                                if free_cell_prefs_changed || hide_all_changed {
                                     guard.mark_free_desktop_dirty(Some(&ctx));
                                 }
                             }

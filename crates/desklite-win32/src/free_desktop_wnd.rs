@@ -229,6 +229,7 @@ struct PendingCommands {
 struct ControllerInner {
     hwnd: Arc<AtomicIsize>,
     pending: Arc<Mutex<PendingCommands>>,
+    sync_queued: Arc<AtomicBool>,
     shutdown_requested: AtomicBool,
     thread: Mutex<Option<JoinHandle<()>>>,
 }
@@ -290,8 +291,10 @@ impl FreeDesktopController {
         let (event_tx, event_rx) = std::sync::mpsc::channel::<FreeDesktopEvent>();
         let (ready_tx, ready_rx) = std::sync::mpsc::sync_channel::<Result<isize, Win32Error>>(1);
         let pending = Arc::new(Mutex::new(PendingCommands::default()));
+        let sync_queued = Arc::new(AtomicBool::new(false));
         let hwnd_slot = Arc::new(AtomicIsize::new(0));
         let thread_pending = Arc::clone(&pending);
+        let thread_sync_queued = Arc::clone(&sync_queued);
         let thread_hwnd_slot = Arc::clone(&hwnd_slot);
 
         let handle = thread::Builder::new()
@@ -302,6 +305,7 @@ impl FreeDesktopController {
                     notify_msg,
                     event_tx,
                     thread_pending,
+                    thread_sync_queued,
                     thread_hwnd_slot,
                     ready_tx,
                 );
@@ -330,6 +334,7 @@ impl FreeDesktopController {
         let inner = Arc::new(ControllerInner {
             hwnd: hwnd_slot,
             pending,
+            sync_queued,
             shutdown_requested: AtomicBool::new(false),
             thread: Mutex::new(Some(handle)),
         });
@@ -350,7 +355,7 @@ impl FreeDesktopController {
             let mut guard = lock_unpoisoned(&self.inner.pending);
             guard.snapshot = Some(snapshot);
         }
-        self.post_app_msg(WM_APP_SYNC_STATE);
+        self.queue_sync_state();
     }
 
     /// Opens an inline Win32 `EDIT` control over `item_screen_rect` to rename `path`.
@@ -366,7 +371,7 @@ impl FreeDesktopController {
                 item_screen_rect,
             });
         }
-        self.post_app_msg(WM_APP_BEGIN_RENAME);
+        let _ = self.post_app_msg(WM_APP_BEGIN_RENAME);
     }
 
     /// Updates the virtual canvas bounds without replacing icon items.
@@ -378,7 +383,7 @@ impl FreeDesktopController {
             let mut guard = lock_unpoisoned(&self.inner.pending);
             guard.bounds = Some(rect);
         }
-        self.post_app_msg(WM_APP_SYNC_STATE);
+        self.queue_sync_state();
     }
 
     /// Gracefully destroys the window and joins its Win32 message-loop thread.
@@ -386,11 +391,21 @@ impl FreeDesktopController {
         self.inner.shutdown();
     }
 
-    fn post_app_msg(&self, msg: u32) {
+    fn queue_sync_state(&self) {
+        if !self.inner.sync_queued.swap(true, Ordering::AcqRel)
+            && !self.post_app_msg(WM_APP_SYNC_STATE)
+        {
+            self.inner.sync_queued.store(false, Ordering::Release);
+        }
+    }
+
+    fn post_app_msg(&self, msg: u32) -> bool {
         let raw = self.inner.hwnd.load(Ordering::Acquire);
         if raw != 0 {
             let hwnd = HWND(raw as *mut c_void);
-            let _ = unsafe { PostMessageW(Some(hwnd), msg, WPARAM(0), LPARAM(0)) };
+            unsafe { PostMessageW(Some(hwnd), msg, WPARAM(0), LPARAM(0)) }.is_ok()
+        } else {
+            false
         }
     }
 }
@@ -1342,6 +1357,7 @@ struct WindowState {
     notify_msg: u32,
     event_tx: std::sync::mpsc::Sender<FreeDesktopEvent>,
     pending: Arc<Mutex<PendingCommands>>,
+    sync_queued: Arc<AtomicBool>,
     snapshot: FreeDesktopSnapshot,
     renderer: DesktopRenderer,
     drag_state: MouseDragState,
@@ -1397,10 +1413,14 @@ impl WindowState {
     }
 
     fn sync_pending(&mut self) {
+        self.sync_queued.store(false, Ordering::Release);
         let (new_snapshot, new_bounds) = {
             let mut guard = lock_unpoisoned(&self.pending);
             (guard.snapshot.take(), guard.bounds.take())
         };
+        if new_snapshot.is_none() && new_bounds.is_none() && self.window_shown {
+            return;
+        }
 
         let prev_bounds = self.snapshot.virtual_bounds;
         if let Some(snap) = new_snapshot {
@@ -1648,6 +1668,7 @@ fn run_window_thread(
     notify_msg: u32,
     event_tx: std::sync::mpsc::Sender<FreeDesktopEvent>,
     pending: Arc<Mutex<PendingCommands>>,
+    sync_queued: Arc<AtomicBool>,
     hwnd_slot: Arc<AtomicIsize>,
     ready_tx: std::sync::mpsc::SyncSender<Result<isize, Win32Error>>,
 ) {
@@ -1688,6 +1709,7 @@ fn run_window_thread(
         notify_msg,
         event_tx,
         pending,
+        sync_queued,
         snapshot: FreeDesktopSnapshot::default(),
         renderer,
         drag_state: MouseDragState::None,

@@ -1,6 +1,6 @@
 # DeskLite 技术 Bug 统计与根因复盘全录
 
-> 覆盖范围：`E:\Ai_Agent\DeskLite` 从初始化提交 `5424ebf` 至当前工作分支 `feat/route-b-desktop-takeover` 共计 **47 项**典型故障与架构级缺陷修复（含前置立项阶段逆向确认的原版 DeskGo 核心错位根因）。
+> 覆盖范围：`E:\Ai_Agent\DeskLite` 从初始化提交 `5424ebf` 至当前工作分支 `feat/route-b-desktop-takeover` 共计 **48 项**典型故障与架构级缺陷修复（含前置立项阶段逆向确认的原版 DeskGo 核心错位根因）。
 
 ---
 
@@ -60,6 +60,7 @@
   - [#45 `FreeDesktop` 左键单击、空白点击与框选被 `ReleaseCapture()` 同步 `WM_CAPTURECHANGED` 静默吞掉](#bug-45)
   - [#46 `FreeDesktop` 键盘焦点与热键断链、DPI 格距不统一、D2D 渲染粗糙、`vsync` 回归及跨格粘贴/撤销补漏](#bug-46)
   - [#47 全局排版联动抽搐/不动、`FreeDesktop` 坐标按比例漂移、参数框悬浮拉伸光标与拖拽预览悬于光标下方](#bug-47)
+  - [#48 多格子全局参数重绘丢失、列表行高受残留独立覆写屏蔽、`FreeDesktop` 未合并同步导致改完点桌面卡顿 1s 与 `IDC_SIZENS` 残留](#bug-48)
 - [5. 跨 Bug 提炼的四条核心工程经验](#sec-takeaways)
 
 ---
@@ -495,6 +496,22 @@ DeskLite 在 M1/M2 起即在 `desklite-core`（`TopologyKey`、`clamp.rs`、`sto
   - `state.rs` 新增 `clamp_free_icons_for_cell_size`（保持桌面图标 `(x, y)` 锚点不动，仅在超出工作区右/下边界时内收夹紧）；`fence_view.rs` 移除格距 `animate_value_with_time` 动画直用目标尺寸；`inspector.rs` 在全局卡片统计 `override_count` 并提供提示与“同步到全部格子”一键清空按钮（`single_reset` 同步触发 `request_repaint_fence`）；
   - `inspector.rs` 统一封装 `rx`/`ry`/`rw`/`rh` 四个 `DragValue`，悬停且非拖拽时（`resp.hovered() && !resp.dragged()`）重置为 `egui::CursorIcon::Default`；
   - `drag_ghost.rs` 新增 `ghost_window_origin(cursor_x, cursor_y)` 返回 `(cursor_x - GHOST_SIZE / 2, cursor_y - (GHOST_SIZE as f32 * 0.86).round() as i32)`，`drag_out.rs` 在 Phase 1 与 Phase 2 `SHDRAGIMAGE.ptOffset` 均对齐 `y = 0.86 * size` 使预览图居中悬浮于光标上方。
+
+<a id="bug-48"></a>
+### #48 多格子全局参数重绘丢失、列表行高受残留独立覆写屏蔽、`FreeDesktop` 未合并同步导致改完点桌面卡顿 1s 与 `IDC_SIZENS` 残留
+- **提交 / 模块**：`feat/route-b-desktop-takeover` · [window_attach.rs](file:///E:/Ai_Agent/DeskLite/crates/desklite-win32/src/window_attach.rs)、[free_desktop_wnd.rs](file:///E:/Ai_Agent/DeskLite/crates/desklite-win32/src/free_desktop_wnd.rs)、[lib.rs](file:///E:/Ai_Agent/DeskLite/crates/desklite-win32/src/lib.rs)、[state.rs](file:///E:/Ai_Agent/DeskLite/crates/desklite-ui/src/state.rs)、[inspector.rs](file:///E:/Ai_Agent/DeskLite/crates/desklite-ui/src/inspector.rs)
+- **现象**：
+  1. 在参数设置面板调整全局参数时，桌面与前景格子联动，其它非聚焦格子仅概率性重绘，已启用单格独立覆写的外部映射格子完全不动（且切换为紧凑列表时仍受旧 `list_row_h` 覆写屏蔽，导致全局“列表行高”看似失灵）；
+  2. “单格排版”标题让未覆写的 `Desktop` 也像处于独立态，且独立覆写计数与“全部同步”按钮埋在全局卡片最底部，用户难以发现；
+  3. 拖动参数后从设置面板底部移出点击桌面时，桌面概率卡顿约 1 秒且鼠标短暂卡在上下拉伸光标（`IDC_SIZENS`）。
+- **技术根因**：
+  1. `request_repaint_all_fences` 与 `request_repaint_fence` 仅调用 `ctx.request_repaint_of`，而 `eframe` 在多 Viewport 连续拖动滑块时会以 `Outdated UserEvent::RequestRepaint` 丢弃跨 Viewport 重绘请求；
+  2. `single_reset` 仅清除当前视图模式（网格或列表）的两项覆写字段，切换视图模式后仍残留另一模式的覆写值；单格与全局卡片标题未展示跟随/独立状态与全局恢复入口；
+  3. `FreeDesktopController::update_snapshot` / `set_bounds` 未对 `WM_APP_SYNC_STATE` 做队列合并，连续拖动滑块（含不涉及桌面的列表参数）会在 `desklite-free-desktop` 线程堆积数十次全屏 `UpdateLayeredWindow` 绘制，阻塞桌面 `WM_SETCURSOR`（保留离开设置面板底边时触发的 `HTBOTTOM` `IDC_SIZENS`）与点击响应。
+- **修复方案**：
+  - `window_attach.rs` 新增并导出 `invalidate_window_no_erase`（`RedrawWindow(..., RDW_INVALIDATE | RDW_NOERASE | RDW_INTERNALPAINT)`），在 `state.rs` 的 `request_repaint_fence`、`request_repaint_all_fences` 与 `flush_pending_repaints` 中同步直触已挂载子窗口 `HWND`，根除跨 Viewport 丢帧；
+  - `free_desktop_wnd.rs` 为 `ControllerInner` / `WindowState` 引入 `sync_queued: Arc<AtomicBool>` 合并 `WM_APP_SYNC_STATE`，并在 `inspector.rs` 区分仅网格格距变化才触发 `FreeDesktop` 重绘，消除桌面端约 1 秒绘制积压与 `IDC_SIZENS` 光标卡滞；
+  - `inspector.rs` 新增 `inspector_card_with_header`：将 `{N} 格独立`（悬停展示具体格子名称）与 `全部跟随全局` 按钮直接置入“全局默认排版与桌面设置”标题行右侧，单格卡片更名为“单格独立覆写 · …”并在标题行显示“跟随全局中 / 已独立 / 他模式已独立”与“恢复跟随”（点击即清空该格全部模式覆写）。
 
 ---
 

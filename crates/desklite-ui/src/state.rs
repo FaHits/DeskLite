@@ -11,10 +11,10 @@ use desklite_core::{
 };
 use desklite_win32::{
     DragTargetOutcome, FreeDesktopRenderItem, FreeDesktopSnapshot, IconCache, all_desktop_dirs,
-    foreground_window_handle, inspector_hwnd, is_ctrl_key_down, is_directly_on_desktop,
-    is_file_drag_active, is_popup_menu_hwnd, paste_files_to_directory_detailed,
-    post_window_message, resolve_dropped_item, scan_portal_directory, set_window_rect_no_z,
-    trash_files, user_desktop_dir,
+    foreground_window_handle, inspector_hwnd, invalidate_window_no_erase, is_ctrl_key_down,
+    is_directly_on_desktop, is_file_drag_active, is_popup_menu_hwnd,
+    paste_files_to_directory_detailed, post_window_message, resolve_dropped_item,
+    scan_portal_directory, set_window_rect_no_z, trash_files, user_desktop_dir,
 };
 use egui::{
     Color32, ColorImage, CornerRadius, Pos2, Stroke, TextureHandle, TextureOptions, Vec2,
@@ -424,6 +424,11 @@ impl SharedFenceState {
     pub fn request_repaint_fence(&self, ctx: &egui::Context, fence_id: i32) {
         if self.fence_viewport_is_mounted(fence_id) {
             ctx.request_repaint_of(ViewportId::from_hash_of(("desklite_fence", fence_id)));
+            if let Some(&hwnd) = self.attached_hwnds.get(&fence_id)
+                && hwnd != 0
+            {
+                invalidate_window_no_erase(hwnd);
+            }
         }
     }
 
@@ -1608,23 +1613,28 @@ pub fn apply_param_editor_rect(
             );
         }
     }
-    let mounted = lock_unpoisoned(shared).fence_viewport_is_mounted(fence_id);
-    if mounted {
-        ctx.request_repaint_of(ViewportId::from_hash_of(("desklite_fence", fence_id)));
-    }
+    lock_unpoisoned(shared).request_repaint_fence(ctx, fence_id);
     final_rect
 }
 
 pub fn request_repaint_all_fences(shared: &Arc<Mutex<SharedFenceState>>, ctx: &egui::Context) {
-    let ids: Vec<i32> = {
+    let targets: Vec<(i32, isize)> = {
         let guard = lock_unpoisoned(shared);
         if guard.config.hide_all_fences {
             return;
         }
-        guard.config.fences.iter().map(|f| f.id).collect()
+        guard
+            .config
+            .fences
+            .iter()
+            .map(|f| (f.id, guard.attached_hwnds.get(&f.id).copied().unwrap_or(0)))
+            .collect()
     };
-    for fid in ids {
+    for (fid, hwnd) in targets {
         ctx.request_repaint_of(ViewportId::from_hash_of(("desklite_fence", fid)));
+        if hwnd != 0 {
+            invalidate_window_no_erase(hwnd);
+        }
     }
 }
 
@@ -1633,9 +1643,9 @@ pub fn request_repaint_free_desktop(ctx: &egui::Context) {
 }
 
 pub fn flush_pending_repaints(shared: &Arc<Mutex<SharedFenceState>>, ctx: &egui::Context) {
-    let (fids, free) = {
+    let (targets, free) = {
         let mut guard = lock_unpoisoned(shared);
-        let fids: Vec<i32> = if guard.config.hide_all_fences {
+        let targets: Vec<(i32, isize)> = if guard.config.hide_all_fences {
             guard.pending_repaint_fences.clear();
             Vec::new()
         } else {
@@ -1643,13 +1653,17 @@ pub fn flush_pending_repaints(shared: &Arc<Mutex<SharedFenceState>>, ctx: &egui:
             drained
                 .into_iter()
                 .filter(|fid| guard.config.fences.iter().any(|f| f.id == *fid))
+                .map(|fid| (fid, guard.attached_hwnds.get(&fid).copied().unwrap_or(0)))
                 .collect()
         };
         let free = guard.pending_repaint_free_desktop;
-        (fids, free)
+        (targets, free)
     };
-    for fid in fids {
+    for (fid, hwnd) in targets {
         ctx.request_repaint_of(ViewportId::from_hash_of(("desklite_fence", fid)));
+        if hwnd != 0 {
+            invalidate_window_no_erase(hwnd);
+        }
     }
     if free {
         request_repaint_free_desktop(ctx);

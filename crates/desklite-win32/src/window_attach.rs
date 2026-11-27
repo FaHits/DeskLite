@@ -11,7 +11,7 @@ use windows::Win32::Graphics::Dwm::{
 };
 use windows::Win32::Graphics::Gdi::{
     GetMonitorInfoW, MONITOR_DEFAULTTONEAREST, MONITORINFO, MonitorFromPoint, RDW_INTERNALPAINT,
-    RDW_INVALIDATE, RedrawWindow,
+    RDW_INVALIDATE, RDW_NOERASE, RedrawWindow,
 };
 use windows::Win32::System::LibraryLoader::{GetProcAddress, LoadLibraryW};
 use windows::Win32::System::Threading::GetCurrentProcessId;
@@ -228,6 +228,25 @@ pub fn post_window_message(raw_hwnd: isize, msg: u32) {
                 msg,
                 WPARAM(0),
                 LPARAM(0),
+            );
+        }
+    }
+}
+
+/// Invalidates a live child window without erasing its background so Win32/eframe dispatches
+/// a reliable `WM_PAINT` / `RedrawRequested` frame even when cross-viewport repaint events lag.
+pub fn invalidate_window_no_erase(raw_hwnd: isize) {
+    if raw_hwnd == 0 {
+        return;
+    }
+    let hwnd = HWND(raw_hwnd as *mut _);
+    if unsafe { IsWindow(Some(hwnd)).as_bool() } {
+        unsafe {
+            let _ = RedrawWindow(
+                Some(hwnd),
+                None,
+                None,
+                RDW_INVALIDATE | RDW_NOERASE | RDW_INTERNALPAINT,
             );
         }
     }
