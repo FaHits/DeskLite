@@ -3,8 +3,8 @@ use std::time::Instant;
 
 use desklite_core::{FenceKind, MIN_FENCE_HEIGHT, MIN_FENCE_WIDTH, Rect};
 use desklite_win32::{
-    find_window_by_exact_title, focus_window_now, live_sizemove_rect_for_hwnd, set_hwnd_locked,
-    style_floating_inspector_window,
+    find_window_by_exact_title, focus_window_now, live_sizemove_rect_for_hwnd,
+    post_uncloak_after_swap, set_hwnd_locked, set_window_cloaked, style_floating_inspector_window,
 };
 use egui::{
     Align, Color32, CornerRadius, Frame, Key, Layout, Margin, PointerButton, Pos2, ScrollArea,
@@ -14,8 +14,9 @@ use egui::{
 use crate::item_grid::draw_header_icon_btn;
 use crate::state::{
     FenceUiOutput, INSPECTOR_HEIGHT, INSPECTOR_TITLE, INSPECTOR_WIDTH, InspectorState,
-    SharedFenceState, UndoAction, apply_param_editor_rect, duplicate_fence_with_style,
-    format_fence_title, lock_unpoisoned, request_repaint_all_fences, resolve_fence_layout,
+    SharedFenceState, UndoAction, ViewModeAnimState, apply_param_editor_rect,
+    duplicate_fence_with_style, format_fence_title, lock_unpoisoned, request_repaint_all_fences,
+    resolve_fence_layout,
 };
 
 fn clamp_drag_pos_to_monitors(
@@ -87,6 +88,8 @@ pub fn open_param_editor_for_fence(
             initial_pos,
             hwnd: existing_hwnd,
             styled,
+            reveal_frames: 1,
+            needs_uncloak: true,
             drag_grab: None,
             draft_name: Some((fence_id, spec.name.clone())),
             name_edit_initial: Some((fence_id, spec.name.clone())),
@@ -100,8 +103,9 @@ pub fn open_param_editor_for_fence(
     };
     let insp_vid = ViewportId::from_hash_of("desklite_inspector");
     if insp_hwnd != 0 {
-        ctx.send_viewport_cmd_to(insp_vid, ViewportCommand::Visible(true));
+        set_window_cloaked(insp_hwnd, true);
         desklite_win32::move_window_no_z(insp_hwnd, initial_pos.0, initial_pos.1);
+        ctx.send_viewport_cmd_to(insp_vid, ViewportCommand::Visible(true));
         focus_window_now(insp_hwnd);
     }
     {
@@ -179,10 +183,13 @@ pub fn close_inspector_safely(
     out: &mut FenceUiOutput,
 ) {
     let mut repainted_fid = None;
-    {
+    let insp_hwnd_for_hide = {
         let mut guard = lock_unpoisoned(shared);
+        let h = guard.inspector.as_ref().map(|i| i.hwnd).unwrap_or(0);
         let (draft_to_commit, initial_name) = if let Some(ref mut ins) = guard.inspector {
             ins.open = false;
+            ins.needs_uncloak = false;
+            ins.reveal_frames = 0;
             ins.drag_grab = None;
             (ins.draft_name.take(), ins.name_edit_initial.take())
         } else {
@@ -208,8 +215,12 @@ pub fn close_inspector_safely(
             }
         }
         guard.dirty_layout = true;
-    }
+        h
+    };
     out.needs_immediate_save = true;
+    if insp_hwnd_for_hide != 0 {
+        set_window_cloaked(insp_hwnd_for_hide, true);
+    }
     ctx.send_viewport_cmd(ViewportCommand::Visible(false));
     if let Some(fid) = repainted_fid {
         lock_unpoisoned(shared).request_repaint_fence(ctx, fid);
@@ -241,8 +252,11 @@ pub fn render_inspector_viewport(
                 ins.hwnd = h;
             }
             if ins.hwnd != 0 && !ins.styled {
+                set_window_cloaked(ins.hwnd, true);
                 style_floating_inspector_window(ins.hwnd);
                 ins.styled = true;
+                ins.reveal_frames = ins.reveal_frames.max(1);
+                ins.needs_uncloak = true;
             }
         }
         (
@@ -824,6 +838,16 @@ pub fn render_inspector_viewport(
                                         f.layout_override = if ov.is_empty() { None } else { Some(ov) };
                                     }
                                 }
+                                if kind_changed {
+                                    guard.view_mode_anims.insert(
+                                        target_id,
+                                        ViewModeAnimState {
+                                            started_at: Instant::now(),
+                                            duration_ms: 170,
+                                            to_list: matches!(next_kind, FenceKind::FileList),
+                                        },
+                                    );
+                                }
                                 if sync_all_to_global {
                                     for f in &mut guard.config.fences {
                                         f.layout_override = None;
@@ -921,6 +945,20 @@ pub fn render_inspector_viewport(
 
     if close_inspector {
         close_inspector_safely(shared, &ctx, &mut out);
+    } else if insp.hwnd != 0 {
+        if insp.reveal_frames > 0 {
+            if let Some(ref mut ins) = lock_unpoisoned(shared).inspector {
+                ins.reveal_frames = ins.reveal_frames.saturating_sub(1);
+            }
+            ctx.request_repaint();
+        } else if insp.needs_uncloak {
+            desklite_win32::move_window_no_z(insp.hwnd, insp.initial_pos.0, insp.initial_pos.1);
+            post_uncloak_after_swap(insp.hwnd);
+            if let Some(ref mut ins) = lock_unpoisoned(shared).inspector {
+                ins.needs_uncloak = false;
+            }
+            ctx.request_repaint_of(ViewportId::ROOT);
+        }
     }
 
     out

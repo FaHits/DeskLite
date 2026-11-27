@@ -31,13 +31,14 @@ use desklite_win32::{
     FolderWatcher, FreeDesktopController, FreeDesktopEvent, IconCache, TrayIcon,
     WM_APP_PORTAL_DIRTY, WM_APP_TRAY, all_desktop_dirs, clipboard_has_files,
     enable_dark_popup_menus, enable_per_monitor_dpi_v2, focus_window_now,
-    hide_all_fences_immediately, install_desktop_z_win_event_hooks, is_desktop_dir_path,
-    is_display_wake_power_broadcast, is_vault_path, launch_item, migrate_vault_item_to_desktop,
-    pick_folder_dialog, post_reassert_all_fences_z, probe_display_topology,
-    reassert_desktop_z_order_sync, register_power_and_session_notifications,
-    restore_all_desktop_icons, scan_portal_directory, set_external_foreground_notify_target,
-    set_shell_desktop_icons_visible, set_window_rect_no_z, set_z_reassert_notify_target,
-    strip_alt_tab_from_host, unregister_power_and_session_notifications,
+    hide_all_fences_immediately, install_desktop_z_win_event_hooks, install_ui_thread_cloak_hook,
+    is_desktop_dir_path, is_display_wake_power_broadcast, is_vault_path, launch_item,
+    migrate_vault_item_to_desktop, pick_folder_dialog, post_reassert_all_fences_z,
+    probe_display_topology, reassert_desktop_z_order_sync,
+    register_power_and_session_notifications, restore_all_desktop_icons, scan_portal_directory,
+    set_external_foreground_notify_target, set_shell_desktop_icons_visible, set_window_cloaked,
+    set_window_rect_no_z, set_z_reassert_notify_target, strip_alt_tab_from_host,
+    unregister_power_and_session_notifications,
 };
 use egui::{Pos2, Vec2, ViewportBuilder, ViewportCommand, ViewportId, WindowLevel};
 use raw_window_handle::{HasWindowHandle, RawWindowHandle};
@@ -2246,10 +2247,14 @@ impl eframe::App for DeskLiteEguiApp {
                     };
                     (
                         ins.open,
-                        Pos2::new(
-                            ins.initial_pos.0 as f32 / scale,
-                            ins.initial_pos.1 as f32 / scale,
-                        ),
+                        if ins.styled {
+                            Pos2::new(
+                                ins.initial_pos.0 as f32 / scale,
+                                ins.initial_pos.1 as f32 / scale,
+                            )
+                        } else {
+                            Pos2::new(-32000.0, -32000.0)
+                        },
                     )
                 })
             } else {
@@ -2315,6 +2320,18 @@ impl eframe::App for DeskLiteEguiApp {
 
         if self.prev_hide_all_fences != hide_all_fences {
             if self.prev_hide_all_fences && !hide_all_fences {
+                let mut guard = lock_unpoisoned(&self.shared);
+                let targets: Vec<(i32, isize)> = guard
+                    .attached_hwnds
+                    .iter()
+                    .map(|(&fid, &h)| (fid, h))
+                    .collect();
+                for (fid, hwnd) in targets {
+                    set_window_cloaked(hwnd, true);
+                    guard.pending_reveal_fences.insert(fid, 1);
+                    guard.request_repaint_fence(&ctx, fid);
+                }
+                drop(guard);
                 post_reassert_all_fences_z();
             }
             self.push_free_desktop_snapshot();
@@ -2367,6 +2384,7 @@ fn main() {
 
     enable_per_monitor_dpi_v2();
     enable_dark_popup_menus();
+    let _ui_cloak_hook = install_ui_thread_cloak_hook();
     let Ok(topology) = probe_display_topology() else {
         return;
     };

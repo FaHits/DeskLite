@@ -246,6 +246,8 @@ pub struct InspectorState {
     pub initial_pos: (i32, i32),
     pub hwnd: isize,
     pub styled: bool,
+    pub reveal_frames: u8,
+    pub needs_uncloak: bool,
     pub drag_grab: Option<(i32, i32)>,
     pub draft_name: Option<(i32, String)>,
     pub name_edit_initial: Option<(i32, String)>,
@@ -273,6 +275,13 @@ pub struct CollapseAnimState {
     pub from_phys_h: i32,
     pub to_phys_h: i32,
     pub target_collapsed: bool,
+}
+
+#[derive(Debug, Clone, Copy)]
+pub struct ViewModeAnimState {
+    pub started_at: Instant,
+    pub duration_ms: u64,
+    pub to_list: bool,
 }
 
 pub struct SharedFenceState {
@@ -312,6 +321,7 @@ pub struct SharedFenceState {
     pub pending_toggle_collapse: HashSet<i32>,
     pub pending_collapse_until: HashMap<i32, Instant>,
     pub collapse_anims: HashMap<i32, CollapseAnimState>,
+    pub view_mode_anims: HashMap<i32, ViewModeAnimState>,
     pub topology_settling_until: Option<Instant>,
     pub undo_stack: Vec<UndoAction>,
     pub cut_paths: HashSet<String>,
@@ -381,6 +391,7 @@ impl SharedFenceState {
             pending_toggle_collapse: HashSet::new(),
             pending_collapse_until: HashMap::new(),
             collapse_anims: HashMap::new(),
+            view_mode_anims: HashMap::new(),
             topology_settling_until: None,
             undo_stack: Vec::new(),
             cut_paths: HashSet::new(),
@@ -833,6 +844,7 @@ impl SharedFenceState {
         self.pending_toggle_collapse.retain(|id| active_ids.contains(id));
         self.pending_collapse_until.retain(|id, _| active_ids.contains(id));
         self.collapse_anims.retain(|id, _| active_ids.contains(id));
+        self.view_mode_anims.retain(|id, _| active_ids.contains(id));
         if self
             .item_rename_prompt
             .as_ref()

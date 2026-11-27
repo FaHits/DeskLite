@@ -30,8 +30,8 @@ use crate::item_grid::{
 };
 use crate::snap::snap_move_rect;
 use crate::state::{
-    MarqueeState, PopupOwnerState, RESIZE_EDGE, TitleDragState, UndoAction, flush_pending_repaints,
-    lock_unpoisoned, resolve_fence_layout,
+    MarqueeState, PopupOwnerState, RESIZE_EDGE, TitleDragState, UndoAction, ViewModeAnimState,
+    flush_pending_repaints, lock_unpoisoned, resolve_fence_layout,
 };
 
 // Re-export public API for backward compatibility with desklite-app and tests.
@@ -70,6 +70,7 @@ fn ensure_fence_attached(fence_id: i32, shared: &Arc<Mutex<SharedFenceState>>) {
             return;
         }
     }
+    desklite_win32::set_window_cloaked(raw_hwnd, true);
     attach_desktop_owner_and_rounded_corners(raw_hwnd);
     if all_bucket_fence_hwnds().contains(&raw_hwnd) {
         let mut guard = lock_unpoisoned(shared);
@@ -928,6 +929,29 @@ pub fn render_fence_viewport(
                 bottom: 6,
             });
 
+        let is_list = matches!(spec.kind, FenceKind::FileList);
+        let view_anim_opt = {
+            lock_unpoisoned(shared)
+                .view_mode_anims
+                .get(&fence_id)
+                .copied()
+        };
+        let (view_content_mix, list_morph) = if let Some(va) = view_anim_opt {
+            let raw_t =
+                va.started_at.elapsed().as_secs_f32() / (va.duration_ms.max(1) as f32 / 1000.0);
+            let mix = ease_out_cubic(raw_t);
+            if raw_t >= 1.0 {
+                lock_unpoisoned(shared).view_mode_anims.remove(&fence_id);
+                (1.0_f32, if is_list { 1.0_f32 } else { 0.0_f32 })
+            } else {
+                ctx.request_repaint();
+                let morph = if va.to_list { mix } else { 1.0 - mix };
+                (mix, morph.clamp(0.0, 1.0))
+            }
+        } else {
+            (1.0_f32, if is_list { 1.0_f32 } else { 0.0_f32 })
+        };
+
         title_bar_frame.show(ui, |ui| {
             ui.set_height(COLLAPSED_HEIGHT - 12.0);
             ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
@@ -950,42 +974,75 @@ pub fn render_fence_viewport(
                     );
                 }
 
-                let is_list = matches!(spec.kind, FenceKind::FileList);
                 if draw_header_icon_btn(ui, "切换网格 / 列表视图", |painter, r, fg| {
                     let c = r.center();
-                    if is_list {
-                        for dy in [-3.5_f32, 0.0, 3.5] {
-                            painter.line_segment(
-                                [Pos2::new(c.x - 5.0, c.y + dy), Pos2::new(c.x + 5.0, c.y + dy)],
-                                Stroke::new(1.5, fg),
+                    let m = list_morph;
+                    let lerp = |a: f32, b: f32, t: f32| a + (b - a) * t;
+                    let bar_h = lerp(3.5, 1.6, m);
+                    let rx = lerp(1.0, 0.8, m);
+                    let cr = CornerRadius::same(rx.round() as u8);
+
+                    // Top & bottom pairs stretch smoothly inward and merge into full bars.
+                    let x_outer = lerp(4.0, 5.0, m);
+                    let x_inner = lerp(0.5, 0.0, m);
+                    let y_top = lerp(-2.25, -3.5, m);
+                    let y_bot = lerp(2.25, 3.5, m);
+                    for yc in [y_top, y_bot] {
+                        if m < 0.72 {
+                            let left_r = egui::Rect::from_min_max(
+                                Pos2::new(c.x - x_outer, c.y + yc - bar_h * 0.5),
+                                Pos2::new(c.x - x_inner, c.y + yc + bar_h * 0.5),
                             );
+                            let right_r = egui::Rect::from_min_max(
+                                Pos2::new(c.x + x_inner, c.y + yc - bar_h * 0.5),
+                                Pos2::new(c.x + x_outer, c.y + yc + bar_h * 0.5),
+                            );
+                            painter.rect_filled(left_r, cr, fg);
+                            painter.rect_filled(right_r, cr, fg);
+                        } else {
+                            let full_r = egui::Rect::from_min_max(
+                                Pos2::new(c.x - x_outer, c.y + yc - bar_h * 0.5),
+                                Pos2::new(c.x + x_outer, c.y + yc + bar_h * 0.5),
+                            );
+                            painter.rect_filled(full_r, cr, fg);
                         }
-                    } else {
-                        for dx in [-4.0_f32, 1.0] {
-                            for dy in [-4.0_f32, 1.0] {
-                                painter.rect_filled(
-                                    egui::Rect::from_min_size(
-                                        Pos2::new(c.x + dx, c.y + dy),
-                                        Vec2::splat(3.5),
-                                    ),
-                                    CornerRadius::same(1),
-                                    fg,
-                                );
-                            }
-                        }
+                    }
+
+                    // Middle list bar fades and grows out horizontally during morph.
+                    if m > 0.12 {
+                        let mid_t = ((m - 0.12) / 0.88).clamp(0.0, 1.0);
+                        let mid_hw = 5.0 * mid_t;
+                        let mid_alpha = (fg.a() as f32 * mid_t).round().clamp(0.0, 255.0) as u8;
+                        let mid_col =
+                            Color32::from_rgba_unmultiplied(fg.r(), fg.g(), fg.b(), mid_alpha);
+                        let mid_r = egui::Rect::from_min_max(
+                            Pos2::new(c.x - mid_hw, c.y - 0.8),
+                            Pos2::new(c.x + mid_hw, c.y + 0.8),
+                        );
+                        painter.rect_filled(mid_r, CornerRadius::same(1), mid_col);
                     }
                 })
                 .clicked()
                 {
                     let mut guard = lock_unpoisoned(shared);
+                    let next_kind = match spec.kind {
+                        FenceKind::FileList => FenceKind::IconGrid,
+                        _ => FenceKind::FileList,
+                    };
                     if let Some(f) = guard.config.fence_mut(fence_id) {
-                        f.kind = match f.kind {
-                            FenceKind::FileList => FenceKind::IconGrid,
-                            _ => FenceKind::FileList,
-                        };
+                        f.kind = next_kind;
                         guard.dirty_layout = true;
                         out.needs_immediate_save = true;
                     }
+                    guard.view_mode_anims.insert(
+                        fence_id,
+                        ViewModeAnimState {
+                            started_at: Instant::now(),
+                            duration_ms: 170,
+                            to_list: matches!(next_kind, FenceKind::FileList),
+                        },
+                    );
+                    ctx.request_repaint();
                 }
 
                 let collapsed = spec.collapsed;
@@ -1414,7 +1471,10 @@ pub fn render_fence_viewport(
                     mouse_wheel: true,
                 })
                 .show(ui, |ui| {
-                    ui.add_space(6.0);
+                    if view_content_mix < 0.999 {
+                        ui.set_opacity((0.22 + 0.78 * view_content_mix).clamp(0.0, 1.0));
+                    }
+                    ui.add_space(6.0 + (1.0 - view_content_mix) * 7.0);
                     let avail_w = ui.available_width().max(cell_w);
                     let sel_count = selected_set.len();
                     let mut rename_commit: Option<(usize, String, String)> = None;
@@ -1828,6 +1888,7 @@ pub fn render_fence_viewport(
                 target_h,
             );
             desklite_win32::post_reassert_all_fences_z();
+            desklite_win32::post_uncloak_after_swap(my_hwnd);
             ctx.request_repaint_of(ViewportId::ROOT);
         }
     }

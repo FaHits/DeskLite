@@ -1,6 +1,6 @@
 # DeskLite 技术 Bug 统计与根因复盘全录
 
-> 覆盖范围：`E:\Ai_Agent\DeskLite` 从初始化提交 `5424ebf` 至当前工作分支 `feat/route-b-desktop-takeover` 共计 **49 项**典型故障与架构级缺陷修复（含前置立项阶段逆向确认的原版 DeskGo 核心错位根因）。
+> 覆盖范围：`E:\Ai_Agent\DeskLite` 从初始化提交 `5424ebf` 至当前工作分支 `feat/route-b-desktop-takeover` 共计 **50 项**典型故障与架构级缺陷修复（含前置立项阶段逆向确认的原版 DeskGo 核心错位根因）。
 
 ---
 
@@ -62,6 +62,7 @@
   - [#47 全局排版联动抽搐/不动、`FreeDesktop` 坐标按比例漂移、参数框悬浮拉伸光标与拖拽预览悬于光标下方](#bug-47)
   - [#48 多格子全局参数重绘丢失、列表行高受残留独立覆写屏蔽、`FreeDesktop` 未合并同步导致改完点桌面卡顿 1s 与 `IDC_SIZENS` 残留](#bug-48)
   - [#49 格子/桌面切焦点高频闪烁、`Win+D` 剧烈闪烁与随机隐藏桌面及部分格子](#bug-49)
+  - [#50 启动与首次打开/切显设置页瞬间白窗闪烁（`HCBT_CREATEWND` 原生挂钩 + `DWMWA_CLOAK` + `SwapBuffers` 后显影）](#bug-50)
 - [5. 跨 Bug 提炼的四条核心工程经验](#sec-takeaways)
 
 ---
@@ -528,6 +529,19 @@ DeskLite 在 M1/M2 起即在 `desklite-core`（`TopologyKey`、`clamp.rs`、`sto
   - `apply_glass_dwm_chrome` 将 `DWMSBT_TRANSIENTWINDOW` 改为 `DWMSBT_NONE`，并对桌面格与 `FreeDesktop` 启用 `DWMWA_EXCLUDED_FROM_PEEK = true`，彻底消除切焦点时的 DWM 灰底/模糊跳变与 Aero Peek 隐身；
   - `focus_window_now` 增加 `GetForegroundWindow() != hwnd` 守卫；`main.rs` 移除格子 `WindowLevel::AlwaysOnBottom`；`bottom_subclass_proc` 的 `WM_WINDOWPOSCHANGING` 在 `already_ok && REASSERTING_HWND != hwnd` 时无条件设置 `SWP_NOZORDER`，内部切焦且桌面链合规时 `desktop_z_win_event_proc` 静默跳过重排；
   - 废除 `LAST_SELF_Z_MS` 60ms 冷却过滤，新增 `set_z_reassert_notify_target` 与串行协调器 `reassert_desktop_z_order_sync()`（RAII 重入保护 + `evaluate_z_chain_plan` 先行只读验证，已合规即 0 次 `SetWindowPos`，不合规则同步校正 `GWLP_HWNDPARENT` 并单链有序重排 `[Fence_1..k, FreeDesktop]` 于 `WorkerW`/可见 `Progman` 之上），由 `helper_wnd_proc` 在 `WM_APP_REASSERT_DESKTOP_Z` 后叠加 `50ms` + `170ms` 一次性收尾定时器兜底确认。
+
+<a id="bug-50"></a>
+### #50 启动与首次打开/切显设置页瞬间白窗闪烁（`HCBT_CREATEWND` 原生挂钩 + `DWMWA_CLOAK` + `SwapBuffers` 后显影）
+- **提交 / 模块**：`feat/route-b-desktop-takeover` · [window_attach.rs](file:///E:/Ai_Agent/DeskLite/crates/desklite-win32/src/window_attach.rs)、[lib.rs](file:///E:/Ai_Agent/DeskLite/crates/desklite-win32/src/lib.rs)、[state.rs](file:///E:/Ai_Agent/DeskLite/crates/desklite-ui/src/state.rs)、[fence_view.rs](file:///E:/Ai_Agent/DeskLite/crates/desklite-ui/src/fence_view.rs)、[inspector.rs](file:///E:/Ai_Agent/DeskLite/crates/desklite-ui/src/inspector.rs)、[main.rs](file:///E:/Ai_Agent/DeskLite/crates/desklite-app/src/main.rs)
+- **现象**：双击启动程序几乎每次都会先闪现一个空白矩形窗口才出现格子；首次打开（或再次显示）参数设置页（`Inspector`）时偶发闪现白框；取消“隐藏全部格子”时亦存在同源闪白风险。
+- **技术根因**：
+  1. `eframe`/`winit` 为子视口（`DeskLite#<id>`、`DeskLite 参数设置`）调用 `CreateWindowExW(..., with_visible(true))` 时，Windows 在 `ensure_fence_attached` / `style_floating_inspector_window` 执行 DWM 透明去边前即已生成未隐形 `HWND`；而 `DeskLite Host` 虽设为 `(-32000, -32000)` 仍被 `epi_integration::post_rendering` 设为 `WS_VISIBLE`；
+  2. `fence_view.rs` 在 `reveal_step == 0` 的 UI 渲染阶段（**`SwapBuffers` 提交前**）调用 `set_window_rect_no_z` 将已带 `WS_VISIBLE` 的 WGL 窗体从 `(-32000, -32000)` 移回桌面坐标，DWM 当帧先合成了未交换的原生白底缓冲区；
+  3. `desklite_inspector` 创建与复显时完全缺少离屏/Cloak 护栏与两帧显影等待，`open_param_editor_for_fence` 先 `Visible(true)` 再移动坐标且无 `DWMWA_CLOAK` 保护。
+- **修复方案**：
+  - `window_attach.rs` 新增线程级 `WH_CBT` 钩子 `install_ui_thread_cloak_hook()`（于 `main()` 在 `eframe::run_native` 前安装），在 `HCBT_CREATEWND` 阶段对所有 `DeskLite*` 顶层窗口同步设置 `DWMWA_CLOAK = true` 与 `DWMWA_TRANSITIONS_FORCEDISABLED = true`（`DeskLite Host` 在 `strip_alt_tab_from_host` 后保持永久 Cloak 零显影）；
+  - 新增 `set_window_cloaked` 与 `post_uncloak_after_swap`（投递 `WM_APP_UNCLOAK` 至子类化窗口队列，确保严格在 `SwapBuffers` 完成且 `IsWindowVisible` 为真后才解除 `DWMWA_CLOAK`）；
+  - `fence_view.rs`（含切换“隐藏全部格子”恢复时）与 `inspector.rs`（首开离屏创建 + 复开/关闭前均置 `DWMWA_CLOAK = true`、`reveal_frames = 1` + `needs_uncloak`）统一在完成到位排版与 WGL 首帧提交后再 `post_uncloak_after_swap`。
 
 ---
 

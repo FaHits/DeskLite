@@ -4,17 +4,17 @@ use std::sync::{Mutex, MutexGuard, OnceLock};
 
 use windows::Win32::Foundation::{HWND, LPARAM, LRESULT, POINT, RECT, WPARAM};
 use windows::Win32::Graphics::Dwm::{
-    DWMSBT_NONE, DWMWA_BORDER_COLOR, DWMWA_CLOAKED, DWMWA_COLOR_NONE, DWMWA_EXCLUDED_FROM_PEEK,
-    DWMWA_SYSTEMBACKDROP_TYPE, DWMWA_TRANSITIONS_FORCEDISABLED, DWMWA_USE_IMMERSIVE_DARK_MODE,
-    DWMWA_WINDOW_CORNER_PREFERENCE, DWMWCP_ROUND, DwmExtendFrameIntoClientArea,
-    DwmGetWindowAttribute, DwmSetWindowAttribute,
+    DWMSBT_NONE, DWMWA_BORDER_COLOR, DWMWA_CLOAK, DWMWA_CLOAKED, DWMWA_COLOR_NONE,
+    DWMWA_EXCLUDED_FROM_PEEK, DWMWA_SYSTEMBACKDROP_TYPE, DWMWA_TRANSITIONS_FORCEDISABLED,
+    DWMWA_USE_IMMERSIVE_DARK_MODE, DWMWA_WINDOW_CORNER_PREFERENCE, DWMWCP_ROUND,
+    DwmExtendFrameIntoClientArea, DwmGetWindowAttribute, DwmSetWindowAttribute,
 };
 use windows::Win32::Graphics::Gdi::{
     GetMonitorInfoW, MONITOR_DEFAULTTONEAREST, MONITORINFO, MonitorFromPoint, RDW_INTERNALPAINT,
     RDW_INVALIDATE, RDW_NOERASE, RedrawWindow,
 };
 use windows::Win32::System::LibraryLoader::{GetProcAddress, LoadLibraryW};
-use windows::Win32::System::Threading::GetCurrentProcessId;
+use windows::Win32::System::Threading::{GetCurrentProcessId, GetCurrentThreadId};
 use windows::Win32::UI::Accessibility::{HWINEVENTHOOK, SetWinEventHook, UnhookWinEvent};
 use windows::Win32::UI::Controls::MARGINS;
 use windows::Win32::UI::HiDpi::GetDpiForWindow;
@@ -23,29 +23,30 @@ use windows::Win32::UI::Input::KeyboardAndMouse::{
     VK_MENU, VK_PROCESSKEY, VK_SHIFT,
 };
 use windows::Win32::UI::WindowsAndMessaging::{
-    AllowSetForegroundWindow, CallWindowProcW, EVENT_OBJECT_REORDER, EVENT_SYSTEM_FOREGROUND,
-    EVENT_SYSTEM_MINIMIZEEND, EVENT_SYSTEM_MINIMIZESTART, FindWindowW, GW_HWNDNEXT, GWL_EXSTYLE,
-    GWL_STYLE, GWLP_HWNDPARENT, GWLP_WNDPROC, GetClassNameW, GetCursorPos, GetDesktopWindow,
-    GetForegroundWindow, GetTopWindow, GetWindow, GetWindowLongPtrW, GetWindowRect, HTBOTTOM,
-    HTBOTTOMLEFT, HTBOTTOMRIGHT, HTCLIENT, HTLEFT, HTRIGHT, HTTOP, HTTOPLEFT, HTTOPRIGHT,
-    HWND_BOTTOM, HWND_TOP, IDC_ARROW, IsIconic, IsWindow, IsWindowVisible, LoadCursorW,
-    PostMessageW, SC_MAXIMIZE, SC_MINIMIZE, SC_RESTORE, STYLESTRUCT, SW_HIDE, SWP_FRAMECHANGED,
-    SWP_NOACTIVATE, SWP_NOMOVE, SWP_NOSENDCHANGING, SWP_NOSIZE, SWP_NOZORDER, SetCursor,
-    SetForegroundWindow, SetWindowLongPtrW, SetWindowPos, ShowWindow, WINDOWPOS,
-    WINEVENT_OUTOFCONTEXT, WINEVENT_SKIPOWNPROCESS, WM_APP, WM_CANCELMODE, WM_CAPTURECHANGED,
-    WM_ENTERSIZEMOVE,
-    WM_ERASEBKGND, WM_EXITSIZEMOVE, WM_KEYDOWN, WM_LBUTTONDOWN, WM_MOVING, WM_NCACTIVATE,
-    WM_NCCALCSIZE, WM_NCDESTROY, WM_NCHITTEST, WM_NCPAINT, WM_RBUTTONDOWN, WM_SETCURSOR,
-    WM_SIZING, WM_STYLECHANGING, WM_SYSCOMMAND, WM_WINDOWPOSCHANGING, WNDPROC, WS_BORDER,
-    WS_CAPTION, WS_DLGFRAME, WS_EX_APPWINDOW, WS_EX_CLIENTEDGE, WS_EX_DLGMODALFRAME,
-    WS_EX_TOOLWINDOW, WS_EX_TOPMOST, WS_EX_WINDOWEDGE, WS_MAXIMIZE, WS_MAXIMIZEBOX, WS_MINIMIZE,
-    WS_MINIMIZEBOX, WS_POPUP, WS_SYSMENU,
+    AllowSetForegroundWindow, CBT_CREATEWNDW, CallNextHookEx, CallWindowProcW,
+    EVENT_OBJECT_REORDER, EVENT_SYSTEM_FOREGROUND, EVENT_SYSTEM_MINIMIZEEND,
+    EVENT_SYSTEM_MINIMIZESTART, FindWindowW, GW_HWNDNEXT, GWL_EXSTYLE, GWL_STYLE, GWLP_HWNDPARENT,
+    GWLP_WNDPROC, GetClassNameW, GetCursorPos, GetDesktopWindow, GetForegroundWindow, GetTopWindow,
+    GetWindow, GetWindowLongPtrW, GetWindowRect, HCBT_CREATEWND, HHOOK, HTBOTTOM, HTBOTTOMLEFT,
+    HTBOTTOMRIGHT, HTCLIENT, HTLEFT, HTRIGHT, HTTOP, HTTOPLEFT, HTTOPRIGHT, HWND_BOTTOM, HWND_TOP,
+    IDC_ARROW, IsIconic, IsWindow, IsWindowVisible, LoadCursorW, PostMessageW, SC_MAXIMIZE,
+    SC_MINIMIZE, SC_RESTORE, STYLESTRUCT, SW_HIDE, SWP_FRAMECHANGED, SWP_NOACTIVATE, SWP_NOMOVE,
+    SWP_NOSENDCHANGING, SWP_NOSIZE, SWP_NOZORDER, SetCursor, SetForegroundWindow,
+    SetWindowLongPtrW, SetWindowPos, SetWindowsHookExW, ShowWindow, UnhookWindowsHookEx, WH_CBT,
+    WINDOWPOS, WINEVENT_OUTOFCONTEXT, WINEVENT_SKIPOWNPROCESS, WM_APP, WM_CANCELMODE,
+    WM_CAPTURECHANGED, WM_ENTERSIZEMOVE, WM_ERASEBKGND, WM_EXITSIZEMOVE, WM_KEYDOWN,
+    WM_LBUTTONDOWN, WM_MOVING, WM_NCACTIVATE, WM_NCCALCSIZE, WM_NCDESTROY, WM_NCHITTEST, WM_NCPAINT,
+    WM_RBUTTONDOWN, WM_SETCURSOR, WM_SIZING, WM_STYLECHANGING, WM_SYSCOMMAND,
+    WM_WINDOWPOSCHANGING, WNDPROC, WS_BORDER, WS_CAPTION, WS_CHILD, WS_DLGFRAME, WS_EX_APPWINDOW,
+    WS_EX_CLIENTEDGE, WS_EX_DLGMODALFRAME, WS_EX_TOOLWINDOW, WS_EX_TOPMOST, WS_EX_WINDOWEDGE,
+    WS_MAXIMIZE, WS_MAXIMIZEBOX, WS_MINIMIZE, WS_MINIMIZEBOX, WS_POPUP, WS_SYSMENU,
 };
 use windows::core::{BOOL, HSTRING, PCSTR, w};
 
 use crate::desktop_listview::probe_desktop_window_tree;
 
 const WM_APP_ENSURE_DESKTOP_Z: u32 = WM_APP + 99;
+const WM_APP_UNCLOAK: u32 = WM_APP + 101;
 const DISALLOWED_STYLES: u32 = WS_CAPTION.0
     | WS_BORDER.0
     | WS_DLGFRAME.0
@@ -424,6 +425,98 @@ pub fn all_bucket_fence_hwnds() -> Vec<isize> {
         .collect()
 }
 
+unsafe fn set_window_cloaked_hwnd(hwnd: HWND, cloaked: bool) {
+    let val: BOOL = cloaked.into();
+    let _ = unsafe {
+        DwmSetWindowAttribute(
+            hwnd,
+            DWMWA_CLOAK,
+            (&raw const val).cast(),
+            size_of::<BOOL>() as u32,
+        )
+    };
+}
+
+/// Sets `DWMWA_CLOAK` on a window so DWM skips compositing it while initial WGL/DWM setup runs.
+pub fn set_window_cloaked(raw_hwnd: isize, cloaked: bool) {
+    if raw_hwnd == 0 {
+        return;
+    }
+    let hwnd = HWND(raw_hwnd as *mut _);
+    if unsafe { IsWindow(Some(hwnd)).as_bool() } {
+        unsafe { set_window_cloaked_hwnd(hwnd, cloaked) };
+    }
+}
+
+/// Queues `WM_APP_UNCLOAK` so a window is revealed strictly after the current `SwapBuffers` finishes.
+pub fn post_uncloak_after_swap(raw_hwnd: isize) {
+    if raw_hwnd != 0 {
+        unsafe {
+            let _ = PostMessageW(
+                Some(HWND(raw_hwnd as *mut _)),
+                WM_APP_UNCLOAK,
+                WPARAM(0),
+                LPARAM(0),
+            );
+        }
+    }
+}
+
+pub struct UiThreadCloakGuard(HHOOK);
+
+impl Drop for UiThreadCloakGuard {
+    fn drop(&mut self) {
+        if !self.0.is_invalid() {
+            unsafe {
+                let _ = UnhookWindowsHookEx(self.0);
+            }
+        }
+    }
+}
+
+unsafe extern "system" fn ui_cloak_cbt_proc(code: i32, wparam: WPARAM, lparam: LPARAM) -> LRESULT {
+    if code == HCBT_CREATEWND as i32 && wparam.0 != 0 && lparam.0 != 0 {
+        let cbt = unsafe { &*(lparam.0 as *const CBT_CREATEWNDW) };
+        if !cbt.lpcs.is_null() {
+            let cs = unsafe { &*cbt.lpcs };
+            let ptr = cs.lpszName.0;
+            if ((cs.style as u32) & WS_CHILD.0) == 0 && !ptr.is_null() && (ptr as usize) > 0xFFFF {
+                let mut matches_prefix = true;
+                for (idx, &want) in b"DeskLite".iter().enumerate() {
+                    let ch = unsafe { *ptr.add(idx) };
+                    if ch != u16::from(want) {
+                        matches_prefix = false;
+                        break;
+                    }
+                }
+                if matches_prefix {
+                    let hwnd = HWND(wparam.0 as *mut _);
+                    unsafe {
+                        set_window_cloaked_hwnd(hwnd, true);
+                        let no_trans: BOOL = true.into();
+                        let _ = DwmSetWindowAttribute(
+                            hwnd,
+                            DWMWA_TRANSITIONS_FORCEDISABLED,
+                            (&raw const no_trans).cast(),
+                            size_of::<BOOL>() as u32,
+                        );
+                    }
+                }
+            }
+        }
+    }
+    unsafe { CallNextHookEx(None, code, wparam, lparam) }
+}
+
+/// Installs a thread-local `WH_CBT` hook that cloaks every new `DeskLite*` top-level `HWND`
+/// synchronously on creation so Windows never composites an unpainted white frame before WGL swaps.
+pub fn install_ui_thread_cloak_hook() -> UiThreadCloakGuard {
+    let tid = unsafe { GetCurrentThreadId() };
+    let hook = unsafe { SetWindowsHookExW(WH_CBT, Some(ui_cloak_cbt_proc), None, tid) }
+        .unwrap_or_default();
+    UiThreadCloakGuard(hook)
+}
+
 /// Immediately hides all visible DeskLite bucket fences and inspector windows before
 /// tearing down OpenGL/DWM resources so exit never flashes opaque white rectangles.
 pub fn hide_all_fences_immediately() {
@@ -431,6 +524,7 @@ pub fn hide_all_fences_immediately() {
         let hwnd = HWND(raw as *mut _);
         if unsafe { IsWindow(Some(hwnd)).as_bool() } {
             unsafe {
+                set_window_cloaked_hwnd(hwnd, true);
                 let _ = ShowWindow(hwnd, SW_HIDE);
             }
         }
@@ -440,6 +534,7 @@ pub fn hide_all_fences_immediately() {
         let hwnd = HWND(insp as *mut _);
         if unsafe { IsWindow(Some(hwnd)).as_bool() } {
             unsafe {
+                set_window_cloaked_hwnd(hwnd, true);
                 let _ = ShowWindow(hwnd, SW_HIDE);
             }
         }
@@ -1155,6 +1250,12 @@ unsafe extern "system" fn bottom_subclass_proc(
     if msg == WM_NCPAINT {
         return LRESULT(0);
     }
+    if msg == WM_APP_UNCLOAK {
+        if !is_free_desktop_hwnd(hwnd.0 as isize) && unsafe { IsWindowVisible(hwnd).as_bool() } {
+            unsafe { set_window_cloaked_hwnd(hwnd, false) };
+        }
+        return LRESULT(0);
+    }
     if msg == WM_STYLECHANGING && lparam.0 != 0 {
         let ss = unsafe { &mut *(lparam.0 as *mut STYLESTRUCT) };
         if wparam.0 == GWL_STYLE.0 as usize {
@@ -1419,6 +1520,8 @@ pub fn strip_alt_tab_from_host(raw_hwnd: isize) -> bool {
             (&raw const no_trans).cast(),
             size_of::<BOOL>() as u32,
         );
+        // Host window is an invisible root owner for deferred viewports; keep it cloaked permanently.
+        set_window_cloaked_hwnd(hwnd, true);
         (GetWindowLongPtrW(hwnd, GWL_EXSTYLE) as u32 & WS_EX_TOOLWINDOW.0) != 0
     }
 }
@@ -1621,6 +1724,12 @@ unsafe extern "system" fn inspector_subclass_proc(
         return LRESULT(0);
     }
     if msg == WM_NCPAINT {
+        return LRESULT(0);
+    }
+    if msg == WM_APP_UNCLOAK {
+        if unsafe { IsWindowVisible(hwnd).as_bool() } {
+            unsafe { set_window_cloaked_hwnd(hwnd, false) };
+        }
         return LRESULT(0);
     }
     if msg == WM_STYLECHANGING && lparam.0 != 0 {
