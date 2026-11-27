@@ -226,10 +226,13 @@ struct PendingCommands {
     rename: Option<PendingRename>,
 }
 
+type FastMenuTargetSlot = Arc<Mutex<Option<(isize, u32, Arc<Mutex<Option<FreeDesktopEvent>>>)>>>;
+
 struct ControllerInner {
     hwnd: Arc<AtomicIsize>,
     pending: Arc<Mutex<PendingCommands>>,
     sync_queued: Arc<AtomicBool>,
+    fast_menu_target: FastMenuTargetSlot,
     shutdown_requested: AtomicBool,
     thread: Mutex<Option<JoinHandle<()>>>,
 }
@@ -292,9 +295,11 @@ impl FreeDesktopController {
         let (ready_tx, ready_rx) = std::sync::mpsc::sync_channel::<Result<isize, Win32Error>>(1);
         let pending = Arc::new(Mutex::new(PendingCommands::default()));
         let sync_queued = Arc::new(AtomicBool::new(false));
+        let fast_menu_target: FastMenuTargetSlot = Arc::new(Mutex::new(None));
         let hwnd_slot = Arc::new(AtomicIsize::new(0));
         let thread_pending = Arc::clone(&pending);
         let thread_sync_queued = Arc::clone(&sync_queued);
+        let thread_fast_menu_target = Arc::clone(&fast_menu_target);
         let thread_hwnd_slot = Arc::clone(&hwnd_slot);
 
         let handle = thread::Builder::new()
@@ -306,6 +311,7 @@ impl FreeDesktopController {
                     event_tx,
                     thread_pending,
                     thread_sync_queued,
+                    thread_fast_menu_target,
                     thread_hwnd_slot,
                     ready_tx,
                 );
@@ -335,10 +341,22 @@ impl FreeDesktopController {
             hwnd: hwnd_slot,
             pending,
             sync_queued,
+            fast_menu_target,
             shutdown_requested: AtomicBool::new(false),
             thread: Mutex::new(Some(handle)),
         });
         Ok((Self { inner }, event_rx))
+    }
+
+    /// Configures a direct helper target for `FreeDesktop` right-click context menus so they open
+    /// immediately without bouncing through the hidden `egui` root viewport.
+    pub fn set_fast_menu_target(
+        &self,
+        hwnd: isize,
+        msg: u32,
+        slot: Arc<Mutex<Option<FreeDesktopEvent>>>,
+    ) {
+        *lock_unpoisoned(&self.inner.fast_menu_target) = Some((hwnd, msg, slot));
     }
 
     /// Returns the native `HWND` handle of the `FreeDesktop` layered window (`0` after destroy).
@@ -1358,6 +1376,7 @@ struct WindowState {
     event_tx: std::sync::mpsc::Sender<FreeDesktopEvent>,
     pending: Arc<Mutex<PendingCommands>>,
     sync_queued: Arc<AtomicBool>,
+    fast_menu_target: FastMenuTargetSlot,
     snapshot: FreeDesktopSnapshot,
     renderer: DesktopRenderer,
     drag_state: MouseDragState,
@@ -1382,6 +1401,18 @@ impl Drop for WindowState {
 
 impl WindowState {
     fn emit(&self, event: FreeDesktopEvent) {
+        if matches!(
+            event,
+            FreeDesktopEvent::ContextMenuBlank { .. } | FreeDesktopEvent::ContextMenuIcon { .. }
+        ) && let Some((target_hwnd, target_msg, ref slot)) = *lock_unpoisoned(&self.fast_menu_target)
+            && target_hwnd != 0
+            && target_msg != 0
+        {
+            *lock_unpoisoned(slot) = Some(event);
+            let target = HWND(target_hwnd as *mut c_void);
+            let _ = unsafe { PostMessageW(Some(target), target_msg, WPARAM(0), LPARAM(0)) };
+            return;
+        }
         let _ = self.event_tx.send(event);
         if self.notify_hwnd != 0 && self.notify_msg != 0 {
             let target = HWND(self.notify_hwnd as *mut c_void);
@@ -1663,12 +1694,14 @@ fn read_edit_text(hwnd: HWND) -> String {
     String::from_utf16_lossy(&buf[..copied as usize])
 }
 
+#[allow(clippy::too_many_arguments)]
 fn run_window_thread(
     notify_hwnd: isize,
     notify_msg: u32,
     event_tx: std::sync::mpsc::Sender<FreeDesktopEvent>,
     pending: Arc<Mutex<PendingCommands>>,
     sync_queued: Arc<AtomicBool>,
+    fast_menu_target: FastMenuTargetSlot,
     hwnd_slot: Arc<AtomicIsize>,
     ready_tx: std::sync::mpsc::SyncSender<Result<isize, Win32Error>>,
 ) {
@@ -1710,6 +1743,7 @@ fn run_window_thread(
         event_tx,
         pending,
         sync_queued,
+        fast_menu_target,
         snapshot: FreeDesktopSnapshot::default(),
         renderer,
         drag_state: MouseDragState::None,

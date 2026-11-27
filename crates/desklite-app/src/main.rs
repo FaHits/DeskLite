@@ -42,7 +42,7 @@ use desklite_win32::{
     restore_all_desktop_icons, scan_portal_directory, set_external_foreground_notify_target,
     set_shell_desktop_icons_visible, set_window_cloaked, set_window_rect_no_z,
     set_z_reassert_notify_target, show_hybrid_shell_items_menu, strip_alt_tab_from_host,
-    unregister_power_and_session_notifications,
+    unregister_power_and_session_notifications, warmup_shell_context_menu,
 };
 use egui::{Pos2, Vec2, ViewportBuilder, ViewportCommand, ViewportId, WindowLevel};
 use raw_window_handle::{HasWindowHandle, RawWindowHandle};
@@ -81,6 +81,8 @@ const Z_REASSERT_TIMER_1: usize = 106;
 const Z_REASSERT_DELAY_1_MS: u32 = 50;
 const Z_REASSERT_TIMER_2: usize = 107;
 const Z_REASSERT_DELAY_2_MS: u32 = 170;
+const SHELL_WARMUP_TIMER: usize = 108;
+const SHELL_WARMUP_DELAY_MS: u32 = 1000;
 
 const WM_APP_SYNC_WATCHERS: u32 = WM_APP + 20;
 const WM_APP_SHUTDOWN: u32 = WM_APP + 21;
@@ -95,6 +97,7 @@ const WM_APP_REFRESH_FREE_DESKTOP: u32 = WM_APP + 29;
 const WM_APP_EXTERNAL_FOREGROUND: u32 = WM_APP + 30;
 const WM_APP_REASSERT_DESKTOP_Z: u32 = WM_APP + 31;
 const WM_APP_SHOW_FENCE_ITEM_MENU: u32 = WM_APP + 32;
+const WM_APP_FAST_FREE_MENU: u32 = WM_APP + 33;
 
 const TRAY_CMD_NEW_BLANK: u32 = 1001;
 const TRAY_CMD_NEW_PORTAL: u32 = 1003;
@@ -535,6 +538,7 @@ struct HelperState {
     free_desktop_ctrl: Arc<Mutex<Option<FreeDesktopController>>>,
     free_icon_menu_paths: Arc<Mutex<Vec<String>>>,
     fence_item_menu_req: Arc<Mutex<FenceItemMenuReq>>,
+    fast_free_menu_event: Arc<Mutex<Option<FreeDesktopEvent>>>,
     tx: Sender<BgEvent>,
     egui_ctx: egui::Context,
     tray: Option<TrayIcon>,
@@ -1627,6 +1631,43 @@ unsafe extern "system" fn helper_wnd_proc(
             st.egui_ctx.request_repaint_of(ViewportId::ROOT);
             LRESULT(0)
         }
+        WM_APP_FAST_FREE_MENU => {
+            if let Some(ev) = lock_unpoisoned(&st.fast_free_menu_event).take() {
+                let res = handle_free_desktop_event(ev, &st.shared);
+                if res.needs_snapshot_refresh {
+                    let snap = {
+                        let mut guard = lock_unpoisoned(&st.shared);
+                        guard.pending_repaint_free_desktop = false;
+                        build_free_desktop_snapshot(&guard)
+                    };
+                    if let Some(ctrl) = lock_unpoisoned(&st.free_desktop_ctrl).as_ref().cloned() {
+                        ctrl.update_snapshot(snap);
+                    }
+                }
+                if !res.repaint_fences.is_empty() {
+                    let guard = lock_unpoisoned(&st.shared);
+                    for fid in res.repaint_fences {
+                        guard.request_repaint_fence(&st.egui_ctx, fid);
+                    }
+                }
+                for cmd in res.commands {
+                    match cmd {
+                        FenceCommand::ShowFreeDesktopMenu { screen_x, screen_y } => {
+                            st.show_free_desktop_menu(screen_x, screen_y);
+                        }
+                        FenceCommand::ShowFreeIconMenu {
+                            paths,
+                            screen_x,
+                            screen_y,
+                        } => {
+                            st.show_free_icon_menu(paths, screen_x, screen_y);
+                        }
+                        _ => {}
+                    }
+                }
+            }
+            LRESULT(0)
+        }
         WM_APP_REFRESH_FREE_DESKTOP => {
             st.push_free_desktop_snapshot_if_dirty();
             LRESULT(0)
@@ -1680,6 +1721,7 @@ unsafe extern "system" fn helper_wnd_proc(
             let _ = unsafe { KillTimer(Some(hwnd), TRANSIENT_RETRY_TIMER) };
             let _ = unsafe { KillTimer(Some(hwnd), Z_REASSERT_TIMER_1) };
             let _ = unsafe { KillTimer(Some(hwnd), Z_REASSERT_TIMER_2) };
+            let _ = unsafe { KillTimer(Some(hwnd), SHELL_WARMUP_TIMER) };
             unsafe { PostQuitMessage(0) };
             LRESULT(0)
         }
@@ -1789,6 +1831,37 @@ unsafe extern "system" fn helper_wnd_proc(
             }
             LRESULT(0)
         }
+        WM_TIMER if wparam.0 == SHELL_WARMUP_TIMER => {
+            let _ = unsafe { KillTimer(Some(hwnd), SHELL_WARMUP_TIMER) };
+            if !st.shutting_down {
+                let sample_path = {
+                    let guard = lock_unpoisoned(&st.shared);
+                    guard
+                        .config
+                        .active_free_icons()
+                        .iter()
+                        .map(|ic| ic.id.clone())
+                        .chain(
+                            guard
+                                .config
+                                .fences
+                                .iter()
+                                .flat_map(|f| f.items.iter().map(|it| it.path.clone())),
+                        )
+                        .find(|p| Path::new(p).exists())
+                };
+                if let Some(sample) = sample_path {
+                    thread::spawn(move || {
+                        let hr = unsafe { CoInitializeEx(None, COINIT_APARTMENTTHREADED) };
+                        warmup_shell_context_menu(&sample);
+                        if hr.is_ok() {
+                            unsafe { CoUninitialize() };
+                        }
+                    });
+                }
+            }
+            LRESULT(0)
+        }
         WM_TIMER if wparam.0 == Z_REASSERT_TIMER_1 || wparam.0 == Z_REASSERT_TIMER_2 => {
             let _ = unsafe { KillTimer(Some(hwnd), wparam.0) };
             if !st.shutting_down {
@@ -1835,12 +1908,14 @@ unsafe extern "system" fn helper_wnd_proc(
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 fn spawn_win32_helper(
     layout_path: PathBuf,
     shared: Arc<Mutex<SharedFenceState>>,
     free_desktop_ctrl: Arc<Mutex<Option<FreeDesktopController>>>,
     free_icon_menu_paths: Arc<Mutex<Vec<String>>>,
     fence_item_menu_req: Arc<Mutex<FenceItemMenuReq>>,
+    fast_free_menu_event: Arc<Mutex<Option<FreeDesktopEvent>>>,
     tx: Sender<BgEvent>,
     egui_ctx: egui::Context,
 ) -> isize {
@@ -1889,6 +1964,7 @@ fn spawn_win32_helper(
             free_desktop_ctrl,
             free_icon_menu_paths,
             fence_item_menu_req,
+            fast_free_menu_event,
             tx,
             egui_ctx,
             tray: TrayIcon::new(hwnd, 1, "DeskLite 桌面整理").ok(),
@@ -1908,6 +1984,9 @@ fn spawn_win32_helper(
         set_external_foreground_notify_target(hwnd.0 as isize, WM_APP_EXTERNAL_FOREGROUND);
         set_z_reassert_notify_target(hwnd.0 as isize, WM_APP_REASSERT_DESKTOP_Z);
         let _z_hooks = install_desktop_z_win_event_hooks();
+        unsafe {
+            SetTimer(Some(hwnd), SHELL_WARMUP_TIMER, SHELL_WARMUP_DELAY_MS, None);
+        }
         let _ = hwnd_tx.send(hwnd.0 as isize);
 
         let mut msg = MSG::default();
@@ -2777,6 +2856,7 @@ fn main() {
     let free_desktop_ctrl_slot = Arc::new(Mutex::new(None));
     let free_icon_menu_paths = Arc::new(Mutex::new(Vec::new()));
     let fence_item_menu_req = Arc::new(Mutex::new(None));
+    let fast_free_menu_event = Arc::new(Mutex::new(None));
     let (tx, rx) = mpsc::channel();
 
     let mut native_options = eframe::NativeOptions {
@@ -2804,6 +2884,7 @@ fn main() {
                 Arc::clone(&free_desktop_ctrl_slot),
                 Arc::clone(&free_icon_menu_paths),
                 Arc::clone(&fence_item_menu_req),
+                Arc::clone(&fast_free_menu_event),
                 tx.clone(),
                 cc.egui_ctx.clone(),
             );
@@ -2826,6 +2907,11 @@ fn main() {
                     }
                 };
             {
+                free_desktop_ctrl.set_fast_menu_target(
+                    helper_hwnd,
+                    WM_APP_FAST_FREE_MENU,
+                    Arc::clone(&fast_free_menu_event),
+                );
                 *lock_unpoisoned(&free_desktop_ctrl_slot) = Some(free_desktop_ctrl.clone());
             }
             let initial_snapshot = {

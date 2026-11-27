@@ -9,8 +9,7 @@ use windows::Win32::UI::Controls::{DRAWITEMSTRUCT, MEASUREITEMSTRUCT, ODT_MENU};
 use windows::Win32::UI::Input::KeyboardAndMouse::{GetKeyState, VK_CONTROL, VK_SHIFT};
 use windows::Win32::UI::Shell::Common::ITEMIDLIST;
 use windows::Win32::UI::Shell::{
-    CMF_ASYNCVERBSTATE, CMF_CANRENAME, CMF_EXPLORE, CMF_EXTENDEDVERBS, CMF_NORMAL,
-    CMIC_MASK_CONTROL_DOWN, CMIC_MASK_PTINVOKE, CMIC_MASK_SHIFT_DOWN, CMINVOKECOMMANDINFO,
+    CMF_ASYNCVERBSTATE, CMF_CANRENAME, CMF_EXTENDEDVERBS, CMF_NORMAL, CMIC_MASK_CONTROL_DOWN, CMIC_MASK_PTINVOKE, CMIC_MASK_SHIFT_DOWN, CMINVOKECOMMANDINFO,
     CMINVOKECOMMANDINFOEX, GCS_VERBA, GCS_VERBW, IContextMenu, IContextMenu2, IContextMenu3,
     ILFindLastID, ILFree, IShellFolder, SEE_MASK_UNICODE, SHBindToParent, SHGetDesktopFolder,
     SHParseDisplayName,
@@ -543,7 +542,7 @@ pub fn show_hybrid_shell_items_menu(
     let mut ignored_menus = HashSet::new();
 
     if let Some(cm) = &cm_opt {
-        let mut flags = CMF_NORMAL | CMF_EXPLORE | CMF_ASYNCVERBSTATE;
+        let mut flags = CMF_NORMAL | CMF_ASYNCVERBSTATE;
         if paths.len() == 1 {
             flags |= CMF_CANRENAME;
         }
@@ -620,6 +619,27 @@ pub fn append_lazy_desktop_background_submenu(parent_menu: HMENU, label: &str) -
     }
     let _ = sub.release();
     Some(sub_h.0 as isize)
+}
+
+/// Pre-warms Windows Shell `IContextMenu` COM extensions in the background without displaying a menu
+/// so the user's first file right-click avoids cold DLL initialization stalls.
+pub fn warmup_shell_context_menu(sample_path: &str) {
+    let paths = [sample_path.to_string()];
+    let Some(cm) = acquire_items_context_menu(HWND::default(), &paths) else {
+        return;
+    };
+    let Some(menu) = OwnedMenu::new() else {
+        return;
+    };
+    let _ = unsafe {
+        cm.QueryContextMenu(
+            menu.0,
+            0,
+            SHELL_MENU_CMD_FIRST,
+            SHELL_MENU_CMD_LAST,
+            CMF_NORMAL | CMF_ASYNCVERBSTATE,
+        )
+    };
 }
 
 #[cfg(test)]

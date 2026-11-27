@@ -14,7 +14,7 @@ use windows::Win32::Graphics::Gdi::{
     RDW_INVALIDATE, RDW_NOERASE, RedrawWindow,
 };
 use windows::Win32::System::LibraryLoader::{GetProcAddress, LoadLibraryW};
-use windows::Win32::System::Threading::{AttachThreadInput, GetCurrentProcessId, GetCurrentThreadId};
+use windows::Win32::System::Threading::{GetCurrentProcessId, GetCurrentThreadId};
 use windows::Win32::UI::Accessibility::{HWINEVENTHOOK, SetWinEventHook, UnhookWinEvent};
 use windows::Win32::UI::Controls::MARGINS;
 use windows::Win32::UI::HiDpi::GetDpiForWindow;
@@ -28,13 +28,12 @@ use windows::Win32::UI::WindowsAndMessaging::{
     EVENT_SYSTEM_MINIMIZESTART, FindWindowW, GW_HWNDNEXT, GW_HWNDPREV, GWL_EXSTYLE, GWL_STYLE,
     GWLP_HWNDPARENT, GWLP_WNDPROC, GetClassNameW, GetCursorPos, GetDesktopWindow,
     GetForegroundWindow, GetTopWindow, GetWindow, GetWindowLongPtrW, GetWindowRect,
-    GetWindowThreadProcessId, HCBT_CREATEWND, HHOOK, HTBOTTOM, HTBOTTOMLEFT, HTBOTTOMRIGHT,
-    HTCLIENT, HTLEFT, HTRIGHT, HTTOP, HTTOPLEFT, HTTOPRIGHT, HWND_BOTTOM, HWND_TOP, IDC_ARROW,
-    IsIconic, IsWindow, IsWindowVisible, LoadCursorW, PostMessageW, SC_MAXIMIZE, SC_MINIMIZE,
-    SC_RESTORE, STYLESTRUCT, SW_HIDE, SWP_FRAMECHANGED, SWP_NOACTIVATE, SWP_NOMOVE,
-    SWP_NOSENDCHANGING, SWP_NOSIZE, SWP_NOZORDER, SetCursor, SetForegroundWindow,
-    SetWindowLongPtrW, SetWindowPos, SetWindowsHookExW, ShowWindow, UnhookWindowsHookEx,
-    WH_CALLWNDPROC, WH_CBT, WINDOWPOS, WINEVENT_OUTOFCONTEXT, WINEVENT_SKIPOWNPROCESS, WM_APP,
+    HCBT_CREATEWND, HHOOK, HTBOTTOM, HTBOTTOMLEFT, HTBOTTOMRIGHT, HTCLIENT, HTLEFT, HTRIGHT,
+    HTTOP, HTTOPLEFT, HTTOPRIGHT, HWND_BOTTOM, HWND_TOP, IDC_ARROW, IsIconic, IsWindow,
+    IsWindowVisible, LoadCursorW, PostMessageW, SC_MAXIMIZE, SC_MINIMIZE, SC_RESTORE, STYLESTRUCT,
+    SW_HIDE, SWP_FRAMECHANGED, SWP_NOACTIVATE, SWP_NOMOVE, SWP_NOSENDCHANGING, SWP_NOSIZE,
+    SWP_NOZORDER, SetCursor, SetForegroundWindow, SetWindowLongPtrW, SetWindowPos,
+    SetWindowsHookExW, ShowWindow, UnhookWindowsHookEx, WH_CALLWNDPROC, WH_CBT, WINDOWPOS, WINEVENT_OUTOFCONTEXT, WINEVENT_SKIPOWNPROCESS, WM_APP,
     WM_CANCELMODE, WM_CAPTURECHANGED, WM_CREATE, WM_ENTERSIZEMOVE, WM_ERASEBKGND, WM_EXITSIZEMOVE,
     WM_KEYDOWN, WM_LBUTTONDOWN, WM_MOVING, WM_NCACTIVATE, WM_NCCALCSIZE, WM_NCDESTROY,
     WM_NCHITTEST, WM_NCPAINT, WM_RBUTTONDOWN, WM_SETCURSOR, WM_SHOWWINDOW, WM_SIZING,
@@ -66,6 +65,8 @@ static FILE_DRAG_ACTIVE: std::sync::atomic::AtomicBool = std::sync::atomic::Atom
 static DEFERRED_Z_AFTER_SIZEMOVE: std::sync::atomic::AtomicBool =
     std::sync::atomic::AtomicBool::new(false);
 static REASSERTING_HWND: std::sync::atomic::AtomicIsize = std::sync::atomic::AtomicIsize::new(0);
+static PREFERRED_TOP_FENCE_HWND: std::sync::atomic::AtomicIsize =
+    std::sync::atomic::AtomicIsize::new(0);
 static SELF_Z_REORDER_IN_FLIGHT: std::sync::atomic::AtomicBool =
     std::sync::atomic::AtomicBool::new(false);
 static Z_REASSERT_NOTIFY_HWND: std::sync::atomic::AtomicIsize =
@@ -182,8 +183,8 @@ pub fn allow_foreground_self() {
     }
 }
 
-/// Reliably gives a Win32 helper window foreground activation before `TrackPopupMenuEx`,
-/// attaching to the current foreground window's input queue if cross-thread activation fails.
+/// Grants foreground activation permission cleanly within the current process without
+/// cross-thread `AttachThreadInput`, avoiding message-queue stalls and focus oscillation.
 pub fn force_foreground_for_popup(raw_hwnd: isize) {
     if raw_hwnd == 0 {
         return;
@@ -191,23 +192,8 @@ pub fn force_foreground_for_popup(raw_hwnd: isize) {
     allow_foreground_self();
     let hwnd = HWND(raw_hwnd as *mut _);
     unsafe {
-        let fg = GetForegroundWindow();
-        if fg == hwnd {
-            return;
-        }
-        if SetForegroundWindow(hwnd).as_bool() && GetForegroundWindow() == hwnd {
-            return;
-        }
-        if !fg.is_invalid() {
-            let fg_tid = GetWindowThreadProcessId(fg, None);
-            let cur_tid = GetCurrentThreadId();
-            if fg_tid != 0 && cur_tid != 0 && fg_tid != cur_tid {
-                let attached = AttachThreadInput(fg_tid, cur_tid, true).as_bool();
-                let _ = SetForegroundWindow(hwnd);
-                if attached {
-                    let _ = AttachThreadInput(fg_tid, cur_tid, false);
-                }
-            }
+        if GetForegroundWindow() != hwnd {
+            let _ = SetForegroundWindow(hwnd);
         }
     }
 }
@@ -676,12 +662,31 @@ struct DesktopZOrderAnalysis {
     chain: Vec<isize>,
 }
 
+#[cfg(test)]
 fn evaluate_z_chain_plan(
     above_owner_raws: &[isize],
     app_hwnds: &HashSet<isize>,
     expected_fences: &[isize],
     free_hwnd: Option<isize>,
     saw_owner: bool,
+) -> (bool, Vec<isize>) {
+    evaluate_z_chain_plan_with_preferred(
+        above_owner_raws,
+        app_hwnds,
+        expected_fences,
+        free_hwnd,
+        saw_owner,
+        None,
+    )
+}
+
+fn evaluate_z_chain_plan_with_preferred(
+    above_owner_raws: &[isize],
+    app_hwnds: &HashSet<isize>,
+    expected_fences: &[isize],
+    free_hwnd: Option<isize>,
+    saw_owner: bool,
+    preferred_top: Option<isize>,
 ) -> (bool, Vec<isize>) {
     let expected_set: HashSet<isize> = expected_fences.iter().copied().collect();
     let mut seen_fences: Vec<isize> = Vec::with_capacity(expected_fences.len());
@@ -715,9 +720,23 @@ fn evaluate_z_chain_plan(
         .collect();
     missing_fences.sort_unstable();
 
+    let preferred_valid = preferred_top.filter(|p| expected_set.contains(p));
+    let preferred_not_top = preferred_valid.is_some_and(|p| seen_fences.first().copied() != Some(p));
+
     let mut chain = Vec::with_capacity(expected_fences.len() + usize::from(free_hwnd.is_some()));
-    chain.extend(seen_fences);
-    chain.extend(missing_fences.iter().copied());
+    if let Some(pref) = preferred_valid {
+        chain.push(pref);
+    }
+    for raw in seen_fences {
+        if Some(raw) != preferred_valid {
+            chain.push(raw);
+        }
+    }
+    for raw in missing_fences.iter().copied() {
+        if Some(raw) != preferred_valid {
+            chain.push(raw);
+        }
+    }
     if let Some(free) = free_hwnd {
         chain.push(free);
     }
@@ -726,7 +745,8 @@ fn evaluate_z_chain_plan(
         && missing_fences.is_empty()
         && free_hwnd.is_none_or(|_| saw_free)
         && !free_before_fence
-        && !app_below_desklite;
+        && !app_below_desklite
+        && !preferred_not_top;
 
     (is_compliant, chain)
 }
@@ -823,12 +843,15 @@ unsafe fn analyze_desktop_z_order(live_owner: isize) -> DesktopZOrderAnalysis {
         };
     }
 
-    let (is_compliant, chain) = evaluate_z_chain_plan(
+    let pref = PREFERRED_TOP_FENCE_HWND.load(std::sync::atomic::Ordering::Acquire);
+    let preferred_top = (pref != 0).then_some(pref);
+    let (is_compliant, chain) = evaluate_z_chain_plan_with_preferred(
         &above_owner_raws,
         &app_hwnds,
         &expected_fences,
         visible_free,
         saw_owner,
+        preferred_top,
     );
 
     DesktopZOrderAnalysis {
@@ -957,8 +980,9 @@ fn has_sibling_fence_above(
     false
 }
 
-/// Raises a focused or dragged bucket fence above its sibling fences while keeping it strictly
-/// underneath all normal visible application windows (top slot of the Desktop layer).
+/// Marks a focused or dragged bucket fence as preferred top of the Desktop layer and
+/// asynchronously asks the helper Z-order coordinator to raise it above sibling fences.
+/// Lock-free wrt `Z_REASSERT_LOCK` and performs no cross-thread `SetWindowPos`, eliminating UI/helper AB-BA deadlocks.
 pub fn promote_fence_above_siblings(raw_hwnd: isize) {
     if raw_hwnd == 0 || is_free_desktop_hwnd(raw_hwnd) || raw_hwnd == inspector_hwnd() {
         return;
@@ -971,13 +995,10 @@ pub fn promote_fence_above_siblings(raw_hwnd: isize) {
     if !fence_hwnds.contains(&raw_hwnd) {
         return;
     }
+    PREFERRED_TOP_FENCE_HWND.store(raw_hwnd, std::sync::atomic::Ordering::Release);
     let free_raw = free_desktop_hwnd();
-    let live_owner = unsafe { resolve_live_owner(0) };
-    if live_owner == 0 {
-        return;
-    }
 
-    let mut sibling_fences: HashSet<isize> = fence_hwnds.clone();
+    let mut sibling_fences: HashSet<isize> = fence_hwnds;
     sibling_fences.remove(&free_raw);
 
     let mut ordered_above = Vec::new();
@@ -997,30 +1018,9 @@ pub fn promote_fence_above_siblings(raw_hwnd: isize) {
     }
     ordered_above.reverse();
 
-    let sibling_above = has_sibling_fence_above(&ordered_above, &sibling_fences, raw_hwnd);
-    let strictly_ok = unsafe { is_strictly_in_desktop_layer(hwnd, live_owner, &fence_hwnds) };
-    if !sibling_above && strictly_ok {
-        return;
+    if has_sibling_fence_above(&ordered_above, &sibling_fences, raw_hwnd) {
+        post_reassert_all_fences_z();
     }
-
-    let _serial_guard = lock_unpoisoned(Z_REASSERT_LOCK.get_or_init(|| Mutex::new(())));
-    let _in_flight = InFlightReorderGuard::enter();
-    let anchor = unsafe { find_desktop_layer_anchor(hwnd, live_owner, &fence_hwnds) };
-    if anchor == hwnd {
-        return;
-    }
-    let _hwnd_guard = ReassertingHwndGuard::enter(raw_hwnd);
-    let _ = unsafe {
-        SetWindowPos(
-            hwnd,
-            Some(anchor),
-            0,
-            0,
-            0,
-            0,
-            SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE | SWP_NOSENDCHANGING,
-        )
-    };
 }
 
 /// Walks top-down from `GetTopWindow(None)` down to `owner_hwnd` (or visible `Progman`) and
@@ -1207,7 +1207,7 @@ unsafe extern "system" fn desktop_z_win_event_proc(
             DEFERRED_Z_AFTER_SIZEMOVE.store(true, std::sync::atomic::Ordering::Release);
             return;
         }
-        if is_ours && unsafe { are_desktop_windows_in_layer() } {
+        if unsafe { are_desktop_windows_in_layer() } {
             return;
         }
         post_reassert_all_fences_z();
@@ -1562,11 +1562,7 @@ unsafe extern "system" fn bottom_subclass_proc(
         if let Some(e) = lock_unpoisoned(orig_procs()).get_mut(&(hwnd.0 as isize)) {
             e.pending_z = false;
         }
-        if is_in_size_move() {
-            DEFERRED_Z_AFTER_SIZEMOVE.store(true, std::sync::atomic::Ordering::Release);
-            return LRESULT(0);
-        }
-        reassert_desktop_z_order_sync();
+        post_reassert_all_fences_z();
         return LRESULT(0);
     }
 
@@ -2028,5 +2024,32 @@ mod tests {
         assert!(has_sibling_fence_above(&[10, 101, 102, 103], &siblings, 102));
         assert!(has_sibling_fence_above(&[10, 101, 102, 103], &siblings, 103));
         assert!(!has_sibling_fence_above(&[10, 999, 102], &siblings, 102));
+    }
+
+    #[test]
+    fn evaluate_z_chain_plan_promotes_preferred_fence_to_top() {
+        let apps: HashSet<isize> = [10].into_iter().collect();
+        let fences = [101, 102, 103];
+        let (ok, chain) = evaluate_z_chain_plan_with_preferred(
+            &[10, 101, 102, 103, 200],
+            &apps,
+            &fences,
+            Some(200),
+            true,
+            Some(102),
+        );
+        assert!(!ok);
+        assert_eq!(chain, vec![102, 101, 103, 200]);
+
+        let (ok2, chain2) = evaluate_z_chain_plan_with_preferred(
+            &[10, 102, 101, 103, 200],
+            &apps,
+            &fences,
+            Some(200),
+            true,
+            Some(102),
+        );
+        assert!(ok2);
+        assert_eq!(chain2, vec![102, 101, 103, 200]);
     }
 }
