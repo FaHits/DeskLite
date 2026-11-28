@@ -6,8 +6,8 @@ use windows::Win32::Foundation::{HWND, LPARAM, LRESULT, POINT, RECT, WPARAM};
 use windows::Win32::Graphics::Dwm::{
     DWMSBT_NONE, DWMWA_BORDER_COLOR, DWMWA_CLOAK, DWMWA_CLOAKED, DWMWA_COLOR_NONE,
     DWMWA_EXCLUDED_FROM_PEEK, DWMWA_SYSTEMBACKDROP_TYPE, DWMWA_TRANSITIONS_FORCEDISABLED,
-    DWMWA_USE_IMMERSIVE_DARK_MODE, DWMWA_WINDOW_CORNER_PREFERENCE, DWMWCP_ROUND,
-    DwmExtendFrameIntoClientArea, DwmGetWindowAttribute, DwmSetWindowAttribute,
+    DWMWA_USE_IMMERSIVE_DARK_MODE, DWMWA_WINDOW_CORNER_PREFERENCE, DWMWCP_DONOTROUND,
+    DWMWCP_ROUND, DwmGetWindowAttribute, DwmSetWindowAttribute,
 };
 use windows::Win32::Graphics::Gdi::{
     CreateRectRgn, DeleteObject, GetMonitorInfoW, MONITOR_DEFAULTTONEAREST, MONITORINFO,
@@ -16,7 +16,6 @@ use windows::Win32::Graphics::Gdi::{
 use windows::Win32::System::LibraryLoader::{GetProcAddress, LoadLibraryW};
 use windows::Win32::System::Threading::{GetCurrentProcessId, GetCurrentThreadId};
 use windows::Win32::UI::Accessibility::{HWINEVENTHOOK, SetWinEventHook, UnhookWinEvent};
-use windows::Win32::UI::Controls::MARGINS;
 use windows::Win32::UI::HiDpi::GetDpiForWindow;
 use windows::Win32::UI::Input::KeyboardAndMouse::{
     GetAsyncKeyState, GetKeyState, MAPVK_VSC_TO_VK_EX, MapVirtualKeyW, VK_CONTROL, VK_LBUTTON,
@@ -249,15 +248,25 @@ pub fn set_window_rect_no_z(raw_hwnd: isize, x: i32, y: i32, w: i32, h: i32) {
     };
 }
 
-/// Restricts a fence HWND to `[0, width) x [0, height)` during drawer animations so DWM
-/// never displays unrendered lower regions or mismatched drop-shadow rects while resizing.
+/// Restricts a fence HWND to `[0, width) x [0, height)` during drawer animations and
+/// disables DWM corner shadow so unrendered lower regions stay 100% invisible.
 pub fn set_window_clip_rect(raw_hwnd: isize, width: i32, height: i32) {
     if raw_hwnd == 0 {
         return;
     }
+    let hwnd = HWND(raw_hwnd as *mut _);
+    let corner = DWMWCP_DONOTROUND;
+    let _ = unsafe {
+        DwmSetWindowAttribute(
+            hwnd,
+            DWMWA_WINDOW_CORNER_PREFERENCE,
+            (&raw const corner).cast(),
+            size_of::<i32>() as u32,
+        )
+    };
     let hrgn = unsafe { CreateRectRgn(0, 0, width.max(1), height.max(1)) };
     if !hrgn.is_invalid() {
-        let ok = unsafe { SetWindowRgn(HWND(raw_hwnd as *mut _), Some(hrgn), true) };
+        let ok = unsafe { SetWindowRgn(hwnd, Some(hrgn), true) };
         if ok == 0 {
             unsafe {
                 let _ = DeleteObject(hrgn.into());
@@ -1770,14 +1779,6 @@ unsafe fn apply_transparent_canvas_chrome(hwnd: HWND, ex_extra: u32) {
 unsafe fn apply_glass_dwm_chrome(hwnd: HWND, ex_extra: u32) {
     unsafe {
         apply_transparent_canvas_chrome(hwnd, ex_extra);
-
-        let margins = MARGINS {
-            cxLeftWidth: -1,
-            cxRightWidth: -1,
-            cyTopHeight: -1,
-            cyBottomHeight: -1,
-        };
-        let _ = DwmExtendFrameIntoClientArea(hwnd, &margins);
 
         let dark: BOOL = true.into();
         let _ = DwmSetWindowAttribute(
