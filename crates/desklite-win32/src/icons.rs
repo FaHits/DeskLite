@@ -30,15 +30,25 @@ pub struct DecodedIcon {
 
 thread_local! {
     static TLS_WIC: RefCell<Option<IWICImagingFactory>> = const { RefCell::new(None) };
+    static TLS_COM_INIT: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
 }
 
-fn with_thread_wic<T>(f: impl FnOnce(&IWICImagingFactory) -> Option<T>) -> Option<T> {
-    TLS_WIC.with(|slot| {
-        let mut borrow = slot.borrow_mut();
-        if borrow.is_none() {
+fn ensure_thread_com_init() {
+    TLS_COM_INIT.with(|init| {
+        if !init.get() {
             unsafe {
                 let _ = CoInitializeEx(None, COINIT_APARTMENTTHREADED);
             }
+            init.set(true);
+        }
+    });
+}
+
+fn with_thread_wic<T>(f: impl FnOnce(&IWICImagingFactory) -> Option<T>) -> Option<T> {
+    ensure_thread_com_init();
+    TLS_WIC.with(|slot| {
+        let mut borrow = slot.borrow_mut();
+        if borrow.is_none() {
             let wic: IWICImagingFactory =
                 unsafe { CoCreateInstance(&CLSID_WICImagingFactory, None, CLSCTX_INPROC_SERVER) }
                     .ok()?;
@@ -48,7 +58,7 @@ fn with_thread_wic<T>(f: impl FnOnce(&IWICImagingFactory) -> Option<T>) -> Optio
     })
 }
 
-const DEFAULT_MAX_CACHE_ENTRIES: usize = 384;
+const DEFAULT_MAX_CACHE_ENTRIES: usize = 1024;
 
 #[derive(Debug, Clone)]
 struct CacheEntry {
@@ -133,6 +143,23 @@ impl IconCache {
         );
     }
 
+    pub fn get_cached_only(&mut self, path: &str) -> Option<&DecodedIcon> {
+        let key = normalize_cache_key(path);
+        if !self.cache.contains_key(&key) {
+            return None;
+        }
+        self.access_seq = self.access_seq.wrapping_add(1);
+        let seq = self.access_seq;
+        let entry = self.cache.get_mut(&key)?;
+        entry.last_used = seq;
+        Some(&entry.icon)
+    }
+
+    pub fn insert_predecoded(&mut self, path: &str, icon: DecodedIcon) {
+        let key = normalize_cache_key(path);
+        self.insert_lru(key, icon);
+    }
+
     pub fn get_or_load(&mut self, path: &str) -> Option<&DecodedIcon> {
         let key = normalize_cache_key(path);
         if !self.cache.contains_key(&key) {
@@ -154,6 +181,7 @@ impl IconCache {
 
 /// Extracts a 32bpp premultiplied BGRA (`PBGRA`) icon bitmap for `path` on the calling thread.
 pub fn extract_file_icon_pbgra(path: &Path) -> Option<DecodedIcon> {
+    ensure_thread_com_init();
     let raw = path.to_string_lossy();
     let path_str = raw.as_ref();
     if path.exists()

@@ -1528,7 +1528,7 @@ pub fn render_fence_viewport(
 
                     let item_textures = {
                         let mut guard = lock_unpoisoned(shared);
-                        guard.resolve_item_textures(&ctx, &spec.items)
+                        guard.resolve_item_textures(&ctx, fence_id, &spec.items)
                     };
 
                     match spec.kind {

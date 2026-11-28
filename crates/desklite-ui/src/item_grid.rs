@@ -60,16 +60,35 @@ pub fn handle_item_interactions(
     out_action: &mut Option<ItemUiAction>,
 ) -> bool {
     let focused_now = resp.ctx.input(|i| i.focused);
-    if resp.clicked() {
+    let mods = resp.ctx.input(|i| i.modifiers);
+    let ctrl = mods.command || is_ctrl_key_down();
+    let shift = mods.shift;
+    let primary_pressed_inside = !ctrl
+        && !shift
+        && !_is_selected
+        && resp.ctx.input(|i| {
+            i.pointer.primary_pressed()
+                && i.pointer
+                    .interact_pos()
+                    .or_else(|| i.pointer.latest_pos())
+                    .is_some_and(|p| resp.rect.intersect(clip_rect).contains(p))
+        });
+    if primary_pressed_inside {
         if !focused_now {
             focus_window_now(my_hwnd);
         }
-        let mods = resp.ctx.input(|i| i.modifiers);
         *out_action = Some(ItemUiAction::Select {
             idx,
-            ctrl: mods.command || is_ctrl_key_down(),
-            shift: mods.shift,
+            ctrl: false,
+            shift: false,
         });
+    } else if resp.clicked() {
+        if !focused_now {
+            focus_window_now(my_hwnd);
+        }
+        if !(_is_selected && _selected_count == 1 && !ctrl && !shift) {
+            *out_action = Some(ItemUiAction::Select { idx, ctrl, shift });
+        }
     }
     let mut opened_context_menu = false;
     if right_click_released_in(resp, clip_rect) {
@@ -219,10 +238,15 @@ pub fn paint_animated_item_bg(
     selected: bool,
     rounding: u8,
 ) {
-    let sel_t = ui.ctx().animate_bool_responsive(anim_id.with("sel"), selected);
+    let sel_t = if selected {
+        1.0
+    } else {
+        ui.ctx()
+            .animate_bool_with_time(anim_id.with("sel"), false, 0.045)
+    };
     let hov_t = ui
         .ctx()
-        .animate_bool_responsive(anim_id.with("hov"), hovered && !selected);
+        .animate_bool_with_time(anim_id.with("hov"), hovered && !selected, 0.06);
     if sel_t > 0.01 {
         let a = (76.0 * sel_t).round() as u8;
         let ba = (155.0 * sel_t).round() as u8;
@@ -310,16 +334,22 @@ pub fn paint_grid_item_in_rect(
             .round()
             .max(rect.min.y + 4.0);
 
+        let icon_rect = egui::Rect::from_min_size(
+            Pos2::new((rect.center().x - icon_sz * 0.5).round(), top_y),
+            Vec2::splat(icon_sz),
+        );
         if let Some(t) = tex {
-            let icon_rect = egui::Rect::from_min_size(
-                Pos2::new((rect.center().x - icon_sz * 0.5).round(), top_y),
-                Vec2::splat(icon_sz),
-            );
             ui.painter().image(
                 t.id(),
                 icon_rect,
                 egui::Rect::from_min_max(Pos2::ZERO, Pos2::new(1.0, 1.0)),
                 alpha_tint,
+            );
+        } else {
+            ui.painter().rect_filled(
+                icon_rect.shrink(icon_sz * 0.14),
+                CornerRadius::same(6),
+                Color32::from_rgba_unmultiplied(255, 255, 255, 16),
             );
         }
 
@@ -374,16 +404,22 @@ pub fn render_list_item(
         } else {
             Color32::WHITE
         };
+        let icon_rect = egui::Rect::from_min_size(
+            Pos2::new(rect.min.x + 8.0, (rect.center().y - icon_sz * 0.5).round()),
+            Vec2::splat(icon_sz),
+        );
         if let Some(t) = tex {
-            let icon_rect = egui::Rect::from_min_size(
-                Pos2::new(rect.min.x + 8.0, (rect.center().y - icon_sz * 0.5).round()),
-                Vec2::splat(icon_sz),
-            );
             ui.painter().image(
                 t.id(),
                 icon_rect,
                 egui::Rect::from_min_max(Pos2::ZERO, Pos2::new(1.0, 1.0)),
                 alpha_tint,
+            );
+        } else {
+            ui.painter().rect_filled(
+                icon_rect.shrink(2.0),
+                CornerRadius::same(4),
+                Color32::from_rgba_unmultiplied(255, 255, 255, 16),
             );
         }
         let text_x = rect.min.x + 8.0 + icon_sz + 8.0;

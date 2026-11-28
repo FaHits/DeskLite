@@ -461,6 +461,7 @@ pub fn execute_item_action(
                     });
                 }
             }
+            ctx.request_repaint();
         }
         ItemUiAction::OpenContextMenu {
             idx,

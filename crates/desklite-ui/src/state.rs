@@ -1,7 +1,7 @@
-use std::collections::{HashMap, HashSet};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::path::Path;
 use std::sync::mpsc::{Receiver, TryRecvError};
-use std::sync::{Arc, Mutex, MutexGuard};
+use std::sync::{Arc, Condvar, Mutex, MutexGuard};
 use std::time::{Duration, Instant};
 
 use desklite_core::{
@@ -10,11 +10,12 @@ use desklite_core::{
     clamp_rect_to_monitors, normalize_path_key,
 };
 use desklite_win32::{
-    AutostartStatus, DragTargetOutcome, FreeDesktopRenderItem, FreeDesktopSnapshot, IconCache,
-    all_desktop_dirs, foreground_window_handle, inspector_hwnd, invalidate_window_no_erase,
-    is_ctrl_key_down, is_directly_on_desktop, is_file_drag_active, is_popup_menu_hwnd,
-    paste_files_to_directory_detailed, post_window_message, resolve_dropped_item,
-    scan_portal_directory, set_window_rect_no_z, trash_files, user_desktop_dir,
+    AutostartStatus, DecodedIcon, DragTargetOutcome, FreeDesktopRenderItem, FreeDesktopSnapshot,
+    IconCache, all_desktop_dirs, extract_file_icon_pbgra, foreground_window_handle,
+    inspector_hwnd, invalidate_window_no_erase, is_ctrl_key_down, is_directly_on_desktop,
+    is_file_drag_active, is_popup_menu_hwnd, paste_files_to_directory_detailed,
+    post_window_message, resolve_dropped_item, scan_portal_directory, set_window_rect_no_z,
+    trash_files, user_desktop_dir,
 };
 use egui::{
     Color32, ColorImage, CornerRadius, Pos2, Stroke, TextureHandle, TextureOptions, Vec2,
@@ -318,12 +319,20 @@ pub struct ViewModeAnimState {
     pub to_list: bool,
 }
 
+type IconWorkQueue = (Mutex<(VecDeque<(String, String, i32)>, Option<egui::Context>)>, Condvar);
+type IconResultInbox = Mutex<Vec<(String, String, Option<DecodedIcon>, i32)>>;
+
 pub struct SharedFenceState {
     pub config: NativeLayoutConfig,
     pub topology: DisplayTopology,
     pub desktop_dirs: Vec<String>,
     pub icon_cache: IconCache,
     pub textures: HashMap<String, Option<TextureHandle>>,
+    pub pending_icon_keys: HashSet<String>,
+    pub failed_icon_keys: HashSet<String>,
+    pub icon_queue: Arc<IconWorkQueue>,
+    pub icon_inbox: Arc<IconResultInbox>,
+    pub icon_workers_started: bool,
     pub attached_hwnds: HashMap<i32, isize>,
     pub hwnd_to_fence: HashMap<isize, i32>,
     pub free_desktop_hwnd: isize,
@@ -398,6 +407,11 @@ impl SharedFenceState {
             desktop_dirs,
             icon_cache,
             textures: HashMap::new(),
+            pending_icon_keys: HashSet::new(),
+            failed_icon_keys: HashSet::new(),
+            icon_queue: Arc::new((Mutex::new((VecDeque::new(), None)), Condvar::new())),
+            icon_inbox: Arc::new(Mutex::new(Vec::new())),
+            icon_workers_started: false,
             attached_hwnds: HashMap::new(),
             hwnd_to_fence: HashMap::new(),
             free_desktop_hwnd: 0,
@@ -830,17 +844,22 @@ impl SharedFenceState {
         let key = normalize_path_key(path);
         if !key.is_empty() {
             self.textures.remove(&key);
+            self.pending_icon_keys.remove(&key);
+            self.failed_icon_keys.remove(&key);
         }
-        self.textures.remove(&path.to_ascii_lowercase());
+        let low = path.to_ascii_lowercase();
+        self.textures.remove(&low);
+        self.pending_icon_keys.remove(&low);
+        self.failed_icon_keys.remove(&low);
         self.icon_cache.invalidate_path(Path::new(path));
     }
 
-    pub fn get_or_load_texture(&mut self, ctx: &egui::Context, path: &str) -> Option<TextureHandle> {
-        let key = path.to_ascii_lowercase();
-        if let Some(Some(handle)) = self.textures.get(&key) {
-            return Some(handle.clone());
-        }
-        let decoded = self.icon_cache.get_or_load(path)?.clone();
+    fn upload_decoded_texture(
+        &mut self,
+        ctx: &egui::Context,
+        key: String,
+        decoded: DecodedIcon,
+    ) -> TextureHandle {
         let mut rgba = decoded.pbgra;
         for px in rgba.as_chunks_mut::<4>().0 {
             px.swap(0, 2);
@@ -850,22 +869,116 @@ impl SharedFenceState {
             &rgba,
         );
         let handle = ctx.load_texture(key.clone(), img, TextureOptions::LINEAR);
-        if self.textures.len() > 512 {
+        if self.textures.len() > 2048 {
             self.textures.clear();
         }
         self.textures.insert(key, Some(handle.clone()));
-        Some(handle)
+        handle
+    }
+
+    fn ensure_icon_workers(&mut self) {
+        if self.icon_workers_started {
+            return;
+        }
+        self.icon_workers_started = true;
+        for _ in 0..4 {
+            let queue = Arc::clone(&self.icon_queue);
+            let inbox = Arc::clone(&self.icon_inbox);
+            std::thread::spawn(move || {
+                let (lock, cvar) = &*queue;
+                loop {
+                    let (job, ctx_opt, is_last_in_batch) = {
+                        let mut guard = lock_unpoisoned(lock);
+                        while guard.0.is_empty() {
+                            guard = cvar.wait(guard).unwrap_or_else(|e| e.into_inner());
+                        }
+                        let item = guard.0.pop_front();
+                        let ctx = guard.1.clone();
+                        let empty_now = guard.0.is_empty();
+                        (item, ctx, empty_now)
+                    };
+                    let Some((path, key, fid)) = job else {
+                        continue;
+                    };
+                    let decoded = extract_file_icon_pbgra(Path::new(&path));
+                    let inbox_len = {
+                        let mut ib = lock_unpoisoned(&inbox);
+                        ib.push((path, key, decoded, fid));
+                        ib.len()
+                    };
+                    if (is_last_in_batch || inbox_len.is_multiple_of(8))
+                        && let Some(ctx) = ctx_opt
+                    {
+                        ctx.request_repaint_of(ViewportId::from_hash_of(("desklite_fence", fid)));
+                    }
+                }
+            });
+        }
+    }
+
+    pub fn drain_loaded_icons(&mut self, ctx: &egui::Context) {
+        let finished = {
+            let mut ib = lock_unpoisoned(&self.icon_inbox);
+            if ib.is_empty() {
+                return;
+            }
+            std::mem::take(&mut *ib)
+        };
+        for (path, key, decoded_opt, _fid) in finished {
+            self.pending_icon_keys.remove(&key);
+            if let Some(decoded) = decoded_opt {
+                self.icon_cache.insert_predecoded(&path, decoded.clone());
+                let _ = self.upload_decoded_texture(ctx, key, decoded);
+            } else {
+                self.failed_icon_keys.insert(key);
+            }
+        }
+    }
+
+    pub fn get_or_load_texture(&mut self, ctx: &egui::Context, path: &str) -> Option<TextureHandle> {
+        let key = path.to_ascii_lowercase();
+        if let Some(Some(handle)) = self.textures.get(&key) {
+            return Some(handle.clone());
+        }
+        let decoded = self.icon_cache.get_or_load(path)?.clone();
+        Some(self.upload_decoded_texture(ctx, key, decoded))
     }
 
     pub fn resolve_item_textures(
         &mut self,
         ctx: &egui::Context,
+        fence_id: i32,
         items: &[FenceItem],
     ) -> Vec<Option<TextureHandle>> {
-        items
-            .iter()
-            .map(|it| self.get_or_load_texture(ctx, &it.path))
-            .collect()
+        self.drain_loaded_icons(ctx);
+        let mut out = Vec::with_capacity(items.len());
+        let mut to_queue: Vec<(String, String, i32)> = Vec::new();
+        for it in items {
+            let key = it.path.to_ascii_lowercase();
+            if let Some(Some(handle)) = self.textures.get(&key) {
+                out.push(Some(handle.clone()));
+            } else if let Some(decoded) = self.icon_cache.get_cached_only(&it.path).cloned() {
+                let handle = self.upload_decoded_texture(ctx, key, decoded);
+                out.push(Some(handle));
+            } else {
+                if !self.pending_icon_keys.contains(&key) && !self.failed_icon_keys.contains(&key) {
+                    self.pending_icon_keys.insert(key.clone());
+                    to_queue.push((it.path.clone(), key, fence_id));
+                }
+                out.push(None);
+            }
+        }
+        if !to_queue.is_empty() {
+            self.ensure_icon_workers();
+            let (lock, cvar) = &*self.icon_queue;
+            let mut guard = lock_unpoisoned(lock);
+            guard.1 = Some(ctx.clone());
+            for item in to_queue {
+                guard.0.push_back(item);
+            }
+            cvar.notify_all();
+        }
+        out
     }
 
     pub fn sync_builder_rects_from_config(&mut self) {

@@ -88,6 +88,8 @@ const SHELL_WARMUP_TIMER: usize = 108;
 const SHELL_WARMUP_DELAY_MS: u32 = 1000;
 const PREFETCH_EXPIRE_TIMER: usize = 109;
 const PREFETCH_EXPIRE_DELAY_MS: u32 = 3000;
+const PREFETCH_DEBOUNCE_TIMER: usize = 112;
+const PREFETCH_DEBOUNCE_DELAY_MS: u32 = 150;
 
 const WM_APP_SYNC_WATCHERS: u32 = WM_APP + 20;
 const WM_APP_SHUTDOWN: u32 = WM_APP + 21;
@@ -1815,6 +1817,7 @@ unsafe extern "system" fn helper_wnd_proc(
             LRESULT(0)
         }
         WM_APP_SHOW_FENCE_ITEM_MENU => {
+            let _ = unsafe { KillTimer(Some(hwnd), PREFETCH_DEBOUNCE_TIMER) };
             let x = (lparam.0 & 0xFFFF) as i16 as i32;
             let y = ((lparam.0 >> 16) & 0xFFFF) as i16 as i32;
             if let Some((fid, paths, is_bucket)) =
@@ -1825,20 +1828,13 @@ unsafe extern "system" fn helper_wnd_proc(
             LRESULT(0)
         }
         WM_APP_PREFETCH_SHELL_MENU => {
-            if !st.shutting_down
-                && let Some((paths, owner_raw)) = lock_unpoisoned(&st.prefetch_menu_req).take()
-            {
-                let invoke_hwnd = if owner_raw != 0 {
-                    HWND(owner_raw as *mut _)
-                } else {
-                    hwnd
-                };
-                prefetch_shell_items_menu(invoke_hwnd, &paths);
+            if !st.shutting_down {
+                // Debounce rapid clicks so fast icon switching incurs zero COM Shell extension work.
                 unsafe {
                     SetTimer(
                         Some(hwnd),
-                        PREFETCH_EXPIRE_TIMER,
-                        PREFETCH_EXPIRE_DELAY_MS,
+                        PREFETCH_DEBOUNCE_TIMER,
+                        PREFETCH_DEBOUNCE_DELAY_MS,
                         None,
                     );
                 }
@@ -1937,6 +1933,25 @@ unsafe extern "system" fn helper_wnd_proc(
                     // Run directly on the persistent helper STA thread so third-party Shell COM
                     // extensions stay cached inside the exact apartment that pops context menus.
                     warmup_shell_context_menu(&sample);
+                }
+            }
+            LRESULT(0)
+        }
+        WM_TIMER if wparam.0 == PREFETCH_DEBOUNCE_TIMER => {
+            let _ = unsafe { KillTimer(Some(hwnd), PREFETCH_DEBOUNCE_TIMER) };
+            if !st.shutting_down
+                && let Some((paths, _owner_raw)) = lock_unpoisoned(&st.prefetch_menu_req).take()
+            {
+                // Always bind COM shell query to helper STA HWND so third-party extensions cannot
+                // block the egui UI thread via cross-thread SendMessage.
+                prefetch_shell_items_menu(hwnd, &paths);
+                unsafe {
+                    SetTimer(
+                        Some(hwnd),
+                        PREFETCH_EXPIRE_TIMER,
+                        PREFETCH_EXPIRE_DELAY_MS,
+                        None,
+                    );
                 }
             }
             LRESULT(0)
