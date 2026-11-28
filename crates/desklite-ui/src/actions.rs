@@ -21,10 +21,10 @@ use egui::{Key, Vec2, ViewportCommand};
 use crate::inspector::open_param_editor_for_fence;
 use crate::item_grid::ItemUiAction;
 use crate::state::{
-    AsyncDragSession, COLLAPSED_HEIGHT, CollapseAnimState, CollapsedMenuCommand, DragSourceState,
-    FenceCommand, FenceItemMenuCommand, FenceUiOutput, ItemRenamePrompt, RenamePrompt,
-    ReorderDragState, SelectionScope, SharedFenceState, UndoAction, duplicate_fence_with_style,
-    lock_unpoisoned,
+    AsyncDragSession, COLLAPSED_HEIGHT, CollapseAnimPhase, CollapseAnimState,
+    CollapsedMenuCommand, DragSourceState, FenceCommand, FenceItemMenuCommand, FenceUiOutput,
+    ItemRenamePrompt, RenamePrompt, ReorderDragState, SelectionScope, SharedFenceState,
+    UndoAction, duplicate_fence_with_style, lock_unpoisoned,
 };
 use crate::undo::execute_undo;
 
@@ -1374,31 +1374,64 @@ pub fn toggle_collapse(
 
     let mut guard = lock_unpoisoned(shared);
     let my_hwnd = guard.attached_hwnds.get(&fence_id).copied().unwrap_or(0);
-    let from_phys_h = if let Some(prev_anim) = guard.collapse_anims.get(&fence_id) {
-        let raw_t = prev_anim.started_at.elapsed().as_secs_f32()
-            / (prev_anim.duration_ms.max(1) as f32 / 1000.0);
-        let eased = ease_out_cubic(raw_t);
-        (prev_anim.from_phys_h as f32 + (prev_anim.to_phys_h - prev_anim.from_phys_h) as f32 * eased)
-            .round() as i32
-    } else if my_hwnd != 0
-        && let Some((_, t, _, b)) = desklite_win32::window_outer_rect(my_hwnd)
-    {
-        (b - t).max(collapsed_phys_h)
-    } else if spec.collapsed {
-        collapsed_phys_h
-    } else {
-        expanded_phys_h
-    };
+    let cur_w_phys = spec.rect.width().max(MIN_FENCE_WIDTH);
+    let (from_phys_h, existing_surface_h) =
+        if let Some(prev_anim) = guard.collapse_anims.get(&fence_id) {
+            let h = match prev_anim.phase {
+                CollapseAnimPhase::WaitExpandSurface => prev_anim.from_phys_h,
+                CollapseAnimPhase::WaitCollapseShrink => prev_anim.to_phys_h,
+                CollapseAnimPhase::Animating => {
+                    let raw_t = prev_anim.started_at.elapsed().as_secs_f32()
+                        / (prev_anim.duration_ms.max(1) as f32 / 1000.0);
+                    let eased = ease_out_cubic(raw_t);
+                    (prev_anim.from_phys_h as f32
+                        + (prev_anim.to_phys_h - prev_anim.from_phys_h) as f32 * eased)
+                        .round() as i32
+                }
+            };
+            (h, prev_anim.surface_phys_h.max(h))
+        } else if my_hwnd != 0
+            && let Some((_, t, _, b)) = desklite_win32::window_outer_rect(my_hwnd)
+        {
+            let h = (b - t).max(collapsed_phys_h);
+            (h, h)
+        } else if spec.collapsed {
+            (collapsed_phys_h, collapsed_phys_h)
+        } else {
+            (expanded_phys_h, expanded_phys_h)
+        };
 
     if my_hwnd != 0 {
+        let surface_phys_h = existing_surface_h.max(to_phys_h).max(from_phys_h);
+        let phase = if !new_collapsed && surface_phys_h > existing_surface_h + 2 {
+            // Clip first so growing the HWND to `surface_phys_h` never exposes an unrendered slab.
+            desklite_win32::set_window_clip_rect(my_hwnd, cur_w_phys, from_phys_h);
+            desklite_win32::set_window_rect_no_z(
+                my_hwnd,
+                spec.rect.left,
+                spec.rect.top,
+                cur_w_phys,
+                surface_phys_h,
+            );
+            ctx.send_viewport_cmd(ViewportCommand::InnerSize(Vec2::new(
+                target_w,
+                surface_phys_h as f32 / ppp,
+            )));
+            CollapseAnimPhase::WaitExpandSurface
+        } else {
+            desklite_win32::set_window_clip_rect(my_hwnd, cur_w_phys, from_phys_h);
+            CollapseAnimPhase::Animating
+        };
         guard.collapse_anims.insert(
             fence_id,
             CollapseAnimState {
                 started_at: Instant::now(),
-                duration_ms: 155,
+                duration_ms: 165,
                 from_phys_h,
                 to_phys_h,
+                surface_phys_h,
                 target_collapsed: new_collapsed,
+                phase,
             },
         );
     } else {

@@ -10,8 +10,8 @@ use windows::Win32::Graphics::Dwm::{
     DwmExtendFrameIntoClientArea, DwmGetWindowAttribute, DwmSetWindowAttribute,
 };
 use windows::Win32::Graphics::Gdi::{
-    GetMonitorInfoW, MONITOR_DEFAULTTONEAREST, MONITORINFO, MonitorFromPoint, RDW_INTERNALPAINT,
-    RDW_INVALIDATE, RDW_NOERASE, RedrawWindow,
+    CreateRectRgn, DeleteObject, GetMonitorInfoW, MONITOR_DEFAULTTONEAREST, MONITORINFO,
+    MonitorFromPoint, RDW_INTERNALPAINT, RDW_INVALIDATE, RDW_NOERASE, RedrawWindow, SetWindowRgn,
 };
 use windows::Win32::System::LibraryLoader::{GetProcAddress, LoadLibraryW};
 use windows::Win32::System::Threading::{GetCurrentProcessId, GetCurrentThreadId};
@@ -245,6 +245,41 @@ pub fn set_window_rect_no_z(raw_hwnd: isize, x: i32, y: i32, w: i32, h: i32) {
             w.max(1),
             h.max(1),
             SWP_NOZORDER | SWP_NOACTIVATE,
+        )
+    };
+}
+
+/// Restricts a fence HWND to `[0, width) x [0, height)` during drawer animations so DWM
+/// never displays unrendered lower regions or mismatched drop-shadow rects while resizing.
+pub fn set_window_clip_rect(raw_hwnd: isize, width: i32, height: i32) {
+    if raw_hwnd == 0 {
+        return;
+    }
+    let hrgn = unsafe { CreateRectRgn(0, 0, width.max(1), height.max(1)) };
+    if !hrgn.is_invalid() {
+        let ok = unsafe { SetWindowRgn(HWND(raw_hwnd as *mut _), Some(hrgn), true) };
+        if ok == 0 {
+            unsafe {
+                let _ = DeleteObject(hrgn.into());
+            }
+        }
+    }
+}
+
+/// Removes any temporary HRGN animation clip and re-enables Win11 native rounded corners.
+pub fn clear_window_clip_rect(raw_hwnd: isize) {
+    if raw_hwnd == 0 {
+        return;
+    }
+    let hwnd = HWND(raw_hwnd as *mut _);
+    let _ = unsafe { SetWindowRgn(hwnd, None, true) };
+    let corner = DWMWCP_ROUND;
+    let _ = unsafe {
+        DwmSetWindowAttribute(
+            hwnd,
+            DWMWA_WINDOW_CORNER_PREFERENCE,
+            (&raw const corner).cast(),
+            size_of::<i32>() as u32,
         )
     };
 }

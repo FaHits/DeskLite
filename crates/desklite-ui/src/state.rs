@@ -293,13 +293,22 @@ pub struct TitleDragState {
     pub height: i32,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CollapseAnimPhase {
+    WaitExpandSurface,
+    Animating,
+    WaitCollapseShrink,
+}
+
 #[derive(Debug, Clone, Copy)]
 pub struct CollapseAnimState {
     pub started_at: Instant,
     pub duration_ms: u64,
     pub from_phys_h: i32,
     pub to_phys_h: i32,
+    pub surface_phys_h: i32,
     pub target_collapsed: bool,
+    pub phase: CollapseAnimPhase,
 }
 
 #[derive(Debug, Clone, Copy)]

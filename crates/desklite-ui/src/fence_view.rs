@@ -31,7 +31,7 @@ use crate::item_grid::{
 };
 use crate::snap::snap_move_rect;
 use crate::state::{
-    MarqueeState, RESIZE_EDGE, TitleDragState, UndoAction, ViewModeAnimState,
+    CollapseAnimPhase, MarqueeState, RESIZE_EDGE, TitleDragState, UndoAction, ViewModeAnimState,
     flush_pending_repaints, lock_unpoisoned, resolve_fence_layout,
 };
 
@@ -694,18 +694,16 @@ pub fn render_fence_viewport(
             .get(&fence_id)
             .copied()
     };
-    let (is_collapse_animating, open_factor) = if let Some(anim) = collapse_anim_opt {
-        let raw_t = anim.started_at.elapsed().as_secs_f32()
-            / (anim.duration_ms.max(1) as f32 / 1000.0);
-        let eased = ease_out_cubic(raw_t);
-        let cur_anim_h = (anim.from_phys_h as f32
-            + (anim.to_phys_h - anim.from_phys_h) as f32 * eased)
-            .round() as i32;
-        let open_factor = if anim.target_collapsed {
-            (1.0 - eased).clamp(0.0, 1.0)
-        } else {
-            eased.clamp(0.0, 1.0)
-        };
+    let screen_phys_h = (ctx.content_rect().height() * ppp).round() as i32;
+    let collapsed_phys_h_for_anim = (COLLAPSED_HEIGHT * ppp).round() as i32;
+    let expanded_phys_h_for_anim = spec.rect.height().max(MIN_FENCE_HEIGHT);
+    let anim_span = (expanded_phys_h_for_anim - collapsed_phys_h_for_anim).max(1) as f32;
+    let open_factor_for_h =
+        |h: i32| ((h - collapsed_phys_h_for_anim) as f32 / anim_span).clamp(0.0, 1.0);
+
+    let (is_collapse_animating, open_factor, anim_draw_logical_h) = if let Some(mut anim) =
+        collapse_anim_opt
+    {
         let (pos_l, pos_t, cur_w) = live_phys_rect
             .map(|r| (r.left, r.top, r.width().max(MIN_FENCE_WIDTH)))
             .unwrap_or((
@@ -713,27 +711,84 @@ pub fn render_fence_viewport(
                 spec.rect.top,
                 spec.rect.width().max(MIN_FENCE_WIDTH),
             ));
-        if my_hwnd != 0 && reveal_step.is_none() {
-            let apply_h = if raw_t >= 1.0 {
-                anim.to_phys_h.max(1)
-            } else {
-                cur_anim_h.max(1)
-            };
-            desklite_win32::set_window_rect_no_z(my_hwnd, pos_l, pos_t, cur_w, apply_h);
-        }
-        if raw_t >= 1.0 {
-            lock_unpoisoned(shared).collapse_anims.remove(&fence_id);
-            ctx.send_viewport_cmd(ViewportCommand::InnerSize(Vec2::new(
-                cur_w as f32 / ppp,
-                anim.to_phys_h as f32 / ppp,
-            )));
-            (false, if spec.collapsed { 0.0 } else { 1.0 })
-        } else {
-            ctx.request_repaint();
-            (true, open_factor)
+        match anim.phase {
+            CollapseAnimPhase::WaitExpandSurface => {
+                let surface_ready = screen_phys_h >= anim.surface_phys_h - 2
+                    || anim.started_at.elapsed() >= Duration::from_millis(120);
+                if my_hwnd != 0 && reveal_step.is_none() {
+                    desklite_win32::set_window_clip_rect(my_hwnd, cur_w, anim.from_phys_h);
+                }
+                if surface_ready {
+                    anim.phase = CollapseAnimPhase::Animating;
+                    anim.started_at = Instant::now();
+                    lock_unpoisoned(shared).collapse_anims.insert(fence_id, anim);
+                }
+                ctx.request_repaint();
+                (
+                    true,
+                    open_factor_for_h(anim.from_phys_h),
+                    Some(anim.from_phys_h as f32 / ppp),
+                )
+            }
+            CollapseAnimPhase::Animating => {
+                let raw_t = anim.started_at.elapsed().as_secs_f32()
+                    / (anim.duration_ms.max(1) as f32 / 1000.0);
+                let eased = ease_out_cubic(raw_t);
+                let cur_anim_h = (anim.from_phys_h as f32
+                    + (anim.to_phys_h - anim.from_phys_h) as f32 * eased)
+                    .round() as i32;
+                let apply_h = if raw_t >= 1.0 {
+                    anim.to_phys_h.max(1)
+                } else {
+                    cur_anim_h.max(1)
+                };
+                if my_hwnd != 0 && reveal_step.is_none() {
+                    desklite_win32::set_window_clip_rect(my_hwnd, cur_w, apply_h);
+                }
+                if raw_t >= 1.0 {
+                    if anim.target_collapsed && my_hwnd != 0 && reveal_step.is_none() {
+                        desklite_win32::set_window_rect_no_z(my_hwnd, pos_l, pos_t, cur_w, apply_h);
+                        ctx.send_viewport_cmd(ViewportCommand::InnerSize(Vec2::new(
+                            cur_w as f32 / ppp,
+                            apply_h as f32 / ppp,
+                        )));
+                        anim.phase = CollapseAnimPhase::WaitCollapseShrink;
+                        anim.started_at = Instant::now();
+                        lock_unpoisoned(shared).collapse_anims.insert(fence_id, anim);
+                        ctx.request_repaint();
+                        (true, 0.0, Some(apply_h as f32 / ppp))
+                    } else {
+                        if my_hwnd != 0 {
+                            desklite_win32::clear_window_clip_rect(my_hwnd);
+                        }
+                        lock_unpoisoned(shared).collapse_anims.remove(&fence_id);
+                        (false, if spec.collapsed { 0.0 } else { 1.0 }, None)
+                    }
+                } else {
+                    ctx.request_repaint();
+                    (true, open_factor_for_h(apply_h), Some(apply_h as f32 / ppp))
+                }
+            }
+            CollapseAnimPhase::WaitCollapseShrink => {
+                let shrunk = screen_phys_h <= anim.to_phys_h + 2
+                    || anim.started_at.elapsed() >= Duration::from_millis(120);
+                if shrunk {
+                    if my_hwnd != 0 {
+                        desklite_win32::clear_window_clip_rect(my_hwnd);
+                    }
+                    lock_unpoisoned(shared).collapse_anims.remove(&fence_id);
+                    (false, 0.0, None)
+                } else {
+                    if my_hwnd != 0 && reveal_step.is_none() {
+                        desklite_win32::set_window_clip_rect(my_hwnd, cur_w, anim.to_phys_h);
+                    }
+                    ctx.request_repaint();
+                    (true, 0.0, Some(anim.to_phys_h as f32 / ppp))
+                }
+            }
         }
     } else {
-        (false, if spec.collapsed { 0.0 } else { 1.0 })
+        (false, if spec.collapsed { 0.0 } else { 1.0 }, None)
     };
 
     if let Some(cur_phys) = live_phys_rect
@@ -914,7 +969,7 @@ pub fn render_fence_viewport(
         .corner_radius(CornerRadius::same(8))
         .inner_margin(Margin::same(0));
 
-    egui::CentralPanel::default().frame(panel_frame).show(ui, |ui| {
+    let mut render_panel_body = |ui: &mut Ui| {
         let title_bar_frame = Frame::new()
             .fill(Color32::from_rgba_unmultiplied(32, 36, 46, title_alpha))
             .corner_radius(CornerRadius {
@@ -1870,7 +1925,27 @@ pub fn render_fence_viewport(
                 );
             }
         });
-    });
+    };
+
+    if let Some(anim_h_logical) = anim_draw_logical_h {
+        egui::CentralPanel::default().frame(Frame::NONE).show(ui, |ui| {
+            let full = ui.max_rect();
+            let draw_h = anim_h_logical.clamp(1.0, full.height().max(1.0));
+            let target_rect =
+                egui::Rect::from_min_size(full.min, Vec2::new(full.width(), draw_h));
+            ui.scope_builder(egui::UiBuilder::new().max_rect(target_rect), |ui| {
+                ui.set_clip_rect(target_rect);
+                panel_frame.show(ui, |ui| {
+                    ui.set_min_size(ui.available_size());
+                    render_panel_body(ui);
+                });
+            });
+        });
+    } else {
+        egui::CentralPanel::default()
+            .frame(panel_frame)
+            .show(ui, render_panel_body);
+    }
 
     if let Some(step) = reveal_step
         && my_hwnd != 0
